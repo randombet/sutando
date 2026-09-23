@@ -29,10 +29,16 @@ else
   fail "Node.js not found (brew install node)"
 fi
 
-if command -v claude &>/dev/null; then
-  pass "Claude Code CLI"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CORE_RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
+if command -v "$CORE_RUNTIME" &>/dev/null; then
+  if [ "$CORE_RUNTIME" = "codex" ] && ! codex login status >/dev/null 2>&1; then
+    fail "Codex CLI is not authenticated (run: codex login)"
+  else
+    pass "$CORE_RUNTIME core CLI"
+  fi
 else
-  fail "Claude Code CLI not found (npm install -g @anthropic-ai/claude-code)"
+  fail "$CORE_RUNTIME core CLI not found"
 fi
 
 if command -v fswatch &>/dev/null; then
@@ -55,7 +61,7 @@ if [ -f .env ]; then
   if grep -q "^GEMINI_API_KEY=" .env && ! grep -q "^GEMINI_API_KEY=$" .env; then
     pass "GEMINI_API_KEY set"
   else
-    fail "GEMINI_API_KEY not set in .env"
+    warn "GEMINI_API_KEY not set in .env (optional — voice disabled)"
   fi
   if grep -q "^GMAIL_ADDRESS=" .env && ! grep -q "^#.*GMAIL_ADDRESS" .env; then
     pass "Gmail configured"
@@ -67,12 +73,13 @@ if [ -f .env ]; then
   else
     warn "Twilio not configured (optional — phone features disabled)"
   fi
-  if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
+  _CHAN_BASE="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/sutando-config.sh" claude-home-path channels)"
+  if [ -f "$_CHAN_BASE/telegram/.env" ]; then
     pass "Telegram bot configured"
   else
     warn "Telegram not configured (optional — run /telegram:configure)"
   fi
-  if [ -f "$HOME/.claude/channels/discord/.env" ]; then
+  if [ -f "$_CHAN_BASE/discord/.env" ]; then
     if python3 -c "import discord" 2>/dev/null; then
       pass "Discord bot configured"
     else
@@ -81,8 +88,17 @@ if [ -f .env ]; then
   else
     warn "Discord not configured (optional — run /discord:configure)"
   fi
+  if [ -f "$_CHAN_BASE/slack/.env" ]; then
+    if python3 -c "import slack_bolt" 2>/dev/null; then
+      pass "Slack bot configured"
+    else
+      warn "Slack configured but slack_bolt missing (pip3 install slack_bolt)"
+    fi
+  else
+    warn "Slack not configured (optional — run /slack:configure)"
+  fi
 else
-  fail ".env file missing (cp .env.example .env and edit)"
+  warn ".env file missing (optional for text-only + core operation)"
 fi
 
 # 3. Dependencies

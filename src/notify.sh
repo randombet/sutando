@@ -13,28 +13,28 @@ if [ -z "$MSG" ]; then echo "Usage: bash src/notify.sh 'message'"; exit 1; fi
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TS=$(date +%s%3N)
 
-# Load tokens from channel configs
-DISCORD_TOKEN=$(grep DISCORD_BOT_TOKEN ~/.claude/channels/discord/.env 2>/dev/null | cut -d= -f2-)
-DISCORD_USER_ID=$(python3 -c "import json; print(json.load(open('$HOME/.claude/channels/discord/access.json')).get('allowFrom',[''])[0])" 2>/dev/null)
-
 # 1. Voice — write proactive message if voice agent is up
 if curl -s -o /dev/null -w "%{http_code}" http://localhost:9900 2>/dev/null | grep -q "426"; then
   echo "$MSG" > "$REPO_DIR/results/proactive-$TS.txt"
 fi
 
-# 2. Discord DM
-if [ -n "$DISCORD_TOKEN" ]; then
-  DM_CHANNEL=$(curl -s -X POST "https://discord.com/api/v10/users/@me/channels" \
-    -H "Authorization: Bot $DISCORD_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"recipient_id\":\"$DISCORD_USER_ID\"}" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
-  if [ -n "$DM_CHANNEL" ]; then
-    curl -s -X POST "https://discord.com/api/v10/channels/$DM_CHANNEL/messages" \
-      -H "Authorization: Bot $DISCORD_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "{\"content\":\"$MSG\"}" >/dev/null 2>&1
-  fi
-fi
+# 2. Discord DM — via dm-result.py's send_dm, which owns token/owner
+# resolution, chunking, and the send allowlist, and delivers through the
+# shared DiscordRestClient (the one Discord POST chokepoint). Best-effort:
+# a failed DM must not block the remaining channels.
+SUTANDO_REPO_DIR="$REPO_DIR" python3 - "$MSG" <<'PY' || true
+import importlib.util
+import os
+import sys
+
+repo = os.environ["SUTANDO_REPO_DIR"]
+sys.path.insert(0, os.path.join(repo, "src"))
+spec = importlib.util.spec_from_file_location(
+    "dm_result_notify", os.path.join(repo, "src", "dm-result.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+sys.exit(0 if mod.send_dm(sys.argv[1]) else 1)
+PY
 
 # 3. macOS notification
 osascript -e "display notification \"$MSG\" with title \"Sutando\"" 2>/dev/null

@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sutando — health-check FALLBACK launchd job (template).
+
+  Role: OS-level safety net for "all of Sutando is dead." Sutando.app's
+  in-process Timer (PR #613) is the primary 30min health-check while the
+  menu-bar app is alive. This launchd job is the redundant supervisor
+  that keeps running even when Sutando.app exits / crashes / is signed
+  out, closing the circular-dependency gap (a stuck proactive loop also
+  stops Sutando.app's Timer from being the only check).
+
+  Cadence: every 5min. Higher than #613's 30min so the stuck-loop and
+  task-queue checks (which require 5–10min thresholds before warning)
+  fire promptly. Lower than the original 60s — those underlying
+  thresholds make sub-5min polling redundant.
+
+  Installed by `bash src/install-health-check-launchd.sh` after the install
+  script substitutes __REPO__, __WORKSPACE__, __PYTHON__, __HOMEBREW_BIN__, and
+  __CLAUDE_CONFIG_DIR__ with the user's actual paths. Do NOT load this template
+  directly — paths must be expanded first.
+
+  Behavior:
+    - Fires every 300s (StartInterval).
+    - Runs `python3 src/health-check.py --emit-task --notify-on-fail
+      --notify-slack --notify-gateway --quiet`.
+    - Surfaces failures as tasks/task-health-*.txt, macOS notifications, and
+      direct Slack + gateway owner messages (remote-visible; fire even when the
+      core session is wedged but its heartbeat process still ticks). Each
+      remote sender no-ops cleanly when its credentials or owner target are
+      unavailable.
+    - FLAG-ENABLE GATE (#2160, Chi-authorized conversion 2026-08-28): re-adding
+      --recover-core here is what turns the dead-core relaunch ON. Before doing
+      so, a LIVE witness is REQUIRED: a real `start-cli.sh --restart` round trip
+      on this host proving the runtime comes back, a fresh local heartbeat is
+      written, and queued work resumes (CONTRIBUTING live-path rule). The merge
+      gate was converted to this enable gate on john-the-dev's argument; do not
+      flip the flag on unit tests alone.
+    - NOTE (#2246): --recover-core was REMOVED from the default args. It decided
+      "core wedged" almost entirely from core-status.json ts freshness — a
+      best-effort *voluntary* signal — and false-positived when the core was
+      legitimately busy on a long task, restart-looping: each restart killed the
+      tmux session (dropping the attached Core CLI) AND the in-flight task, which
+      then never drained, so it re-fired every cooldown. Alerting is kept; the
+      destructive auto-restart is not re-enabled until #2246 lands a durable fix
+      (require a 2nd independent *involuntary* signal — heartbeat process
+      alive/dead + transcript/obs-hook tool activity — and restart only when BOTH
+      say wedged; default destructive restart to opt-in/alert-only).
+    - ThrottleInterval=60 prevents crash-loop thrash.
+    - Exit-only job (KeepAlive omitted) — launchd waits StartInterval, fires
+      again, no zombie process between runs.
+    - All output goes to $WORKSPACE/logs/health-check-launchd.log for
+      postmortem (per PR #911 workspace-vs-repo split).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sutando.health-check-fallback</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/src/health-check.py</string>
+        <string>--emit-task</string>
+        <string>--notify-on-fail</string>
+        <string>--notify-slack</string>
+        <string>--notify-gateway</string>
+        <string>--quiet</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- launchd does NOT inherit the login-shell env, so the canonical
+             config dir must be baked in — otherwise claude_home_path() falls
+             back to the legacy default config dir and the gateway-notify path
+             can't find channels/ag2space/.env on a workspace-scoped install
+             (#2487 P1). -->
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>__CLAUDE_CONFIG_DIR__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/logs/health-check-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/logs/health-check-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

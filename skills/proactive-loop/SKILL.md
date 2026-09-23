@@ -6,97 +6,126 @@ user-invocable: true
 
 # Proactive Loop
 
-Start Sutando's autonomous loop. Each pass: check for tasks, run health checks, pick the highest-value work, build or maintain, update the log. Monitors voice tasks, context drops between passes.
+One pass = the numbered steps below, in order. Each step is a command, its exit codes, and what to
+do per code. The reasoning, measurements and incidents behind every step live in
+[`docs/proactive-loop-rationale.md`](../../docs/proactive-loop-rationale.md) under the same step
+number; read it when a step surprises you, never per pass. A rule belongs here only as a command a
+mechanism enforces; prose lessons go to the rationale doc (`tests/proactive-loop-skill-budget.test.py`
+caps this file and refuses date stamps in it).
 
-**Usage**: `/proactive-loop [interval]`
-
-ARGUMENTS: $ARGUMENTS
-
-## Parse arguments
-
-If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Otherwise default to 10m.
+**Usage**: `/proactive-loop [interval]` (default 10m).
 
 ## On activation
+1. `/schedule-crons` — registers the session crons and stamps them.
+2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `persistent: true`,
+   `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
+   Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
+3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
+   never add a second loop driver.
 
-Before starting the loop, immediately start the task watcher:
-```
-bash src/watch-tasks.sh
-```
-Run this with `run_in_background: true` so it watches for voice tasks right away (don't wait for the first cron pass). When the watcher fires, read its output — it lists ALL pending task files.
+## Per pass
+`WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` once; quote every `"$WORKSPACE/..."` path.
 
-## Start the loops
-
-Start TWO crons — reactive (fast, every 5min) and proactive (heavy, every 30min):
-
-### Reactive loop (5 min)
-
-```
-REACTIVE CHECK — fast, no heavy work.
-1. Check tasks/ for files. Process any found, write results, delete task files.
-2. Check context-drop.txt. Process if present.
-3. Ensure fswatch watcher is running (1 process). If dead, restart with run_in_background: true.
-4. Check Discord channels (reference_discord_channels.md) for new actionable messages. Forward to #dev.
-5. GUARDRAIL: Read core-status.json. If the last proactive pass was more than 45 minutes ago (check ts field) and status is idle, the proactive loop may have stalled. In that case, do one proactive action yourself: pick an item from notes/todo-launch.md and work on it.
-6. Signal core-status.json throughout.
-```
-
-### Proactive loop (30 min)
-
-```
-PROACTIVE WORK — you MUST do something useful every pass. No idle passes.
-1. Signal core-status.json: running.
-2. Run health check: python3 src/health-check.py. Fix issues with --fix.
-3. Read notes/todo-launch.md for open items.
-4. Pick ONE item and work on it.
-5. When done, update build_log.md with what you did.
-6. Signal core-status.json: idle.
-IMPORTANT: You MUST complete step 4. Every 30 minutes, something should change.
-```
-
----
-
-Below is the legacy combined prompt (kept for reference):
-
-You are Sutando — a personal AI agent running as this Claude Code session.
-
-**Build log:** `build_log.md`
-
-Each pass, in order:
-
-0. **Signal loop start.** Write `{"status":"running","step":"Starting pass...","ts":DATE_NOW}` to `core-status.json`. Update the `step` field as you progress through each step. Write `{"status":"idle","ts":DATE_NOW}` when the pass ends.
-
-1. **Check for tasks.** Look in `tasks/` for voice tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
-   - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent: `codex exec --sandbox read-only "Answer this question about Sutando: <task text>"`. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
-   - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
-
-2. **Check pending questions.** Read `pending-questions.md`. If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
-
-3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
-
-4. **Read the build log** (`build_log.md`) — understand what exists. Do not rebuild what works.
-
-5. **Pick the highest-value work.** Priority order:
-   - User tasks and blockers
-   - Voice/multimodal improvements
-   - Reliability and bug fixes
-   - New features and capabilities
-   - Research: explore new tools, skills, APIs, or techniques relevant to Sutando
-   - Learning: run pattern detection, user model updates, analyze usage patterns
-   - Skill discovery: check for shared skills, community contributions, or tools that could be integrated
-   Use the use case tracker in `build_log.md`.
-
-6. **Act on it.** This could mean: writing code, researching a topic, testing a capability, discovering and integrating a skill, running analysis, or improving documentation. Prefer action over idle passes.
-
-7. **Update `build_log.md`** — mark what changed, update statuses, note what's next.
-
-8. **If blocked, ask.** Write the question to `pending-questions.md`, send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — work on something else.
-
-9. **Ensure the watcher is running.** If no `fswatch` process on `tasks/`, start one with `bash src/watch-tasks.sh` (`run_in_background: true`). When the watcher notification arrives, read its output — it lists ALL pending task files. Process every one before restarting the watcher.
-
-10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages, Zoom invites, and messages already sent by you.
-
-11. **Meeting prep.** Check calendar for meetings starting in the next 30-45 minutes. If one is found and no `notes/meeting-prep-*` file exists for it yet, run `/meeting-prep` to auto-prepare attendee info + talking points.
-
-12. **Information radar.** Once daily (check `data/radar-topics.json` last_scan), run `/info-radar` to scan arXiv, GitHub trending, HN, and news for monitored topics. Include highlights in morning briefing.
-
-13. **Follow-up tracking.** Check `data/follow-ups.json` for overdue commitments. Nudge the owner via voice (results/) or Discord DM for items past due. Also scan recent conversation.log entries for new commitments (patterns: "I'll", "I will", "remind me", "by tomorrow", deadlines). Add new ones to follow-ups.json. Auto-resolve items when completion signals are detected. See `notes/proactive-followups-design.md` for full design.
+0. **Status.** `bash scripts/core-status.sh running "<what the owner is waiting on>"`; rewrite on every
+   pivot; `bash scripts/core-status.sh idle` at the end. Never `>` the JSON yourself.
+0.5. **Quota tier** (Claude core):
+   `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py | python3 skills/proactive-loop/scripts/quota-tier.py`
+   → `TIER <FULL|MEDIUM|LIGHT|MINIMAL> (bound by …)`. Then
+   `python3 skills/proactive-loop/scripts/claude-quota-cadence.py --json` → if `effective_cron` differs
+   from the `/proactive-loop` job in `CronList`: capture the old job id, `CronCreate` the new job with
+   `prompt: "/proactive-loop"` and `cron: <effective_cron>`, confirm it in `CronList`. Then `CronDelete`
+   the old id and confirm exactly one `/proactive-loop` job remains. If create or confirmation fails,
+   keep the old job and stop loudly. Codex core: `python3 skills/proactive-loop/scripts/codex-quota-gate.py --json`. Tier caps
+   step 6's depth (LIGHT/MINIMAL: no self-development); it never skips owner tasks, health or the log.
+0.7. **Reconstruct.** Invoke the `context-reconstruct` skill (a Skill-tool call, not a mention). It
+   reads `<workspace>/hosts/<host>/current-track.md` first, then the live thread
+   (`python3 src/discord-read.py <channel> --serving <channel>` when serving a task, `--operator` otherwise),
+   pending questions, relay, build log. Trust the record over recall; maintain `current-track.md`.
+1. **Tasks.** Process every file in `$WORKSPACE/tasks/`; `access_tier: team|other` → the sandboxed path.
+   Group a thread with `[deduped: task-<latest>]`, staged under its FINAL name and gated into
+   place — `results/` is claimed by a poller in under a second, and the checker reads the source
+   id from the BASENAME, so a generic temp name makes it pass everything:
+   `S="$WORKSPACE/state/dedup-staging/<file>"` then
+   `python3 skills/proactive-loop/scripts/check-dedup-targets.py "$S" && mv -f "$S" "$WORKSPACE/results/<file>"`
+   (0 clean · 1 the dedup delivers nothing · 2 cannot answer). All-notice groups use `[no-send]` on each.
+   Marker semantics belong to `src/result_markers.py`; never re-implement them.
+   When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
+   `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
+   archive their own claims.
+   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   (1 = a task got no result, so idle does not run).
+1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
+   any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
+2. **Questions.** Read `<workspace>/hosts/<host>/pending-questions.md`; surface via `results/question-<ts>.txt`
+   when voice is connected, plus a macOS notification.
+3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
+   record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/pending-questions.md" "$H/current-track.md"`
+   with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
+   token, then `grep -n '^## ' "$H"/*.md` before concluding absence. Extend a hit; never re-file it.
+3.45. **Duplicate issue gate**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/gh-duplicate-check.py --repo <owner/name> --title "<title>" && gh issue create --repo <owner/name> --title "..." --body-file <f>`
+   (0 no candidate · 1 do not file, candidates named · 2 cannot answer).
+3.5. **Policy.** `python3 skills/proactive-loop/scripts/self-development-enabled.py` → `disabled` skips
+   4–8, 10, 11. Owner-requested tasks, pending questions, health/service recovery and the watcher remain
+   active. Manual `/proactive-loop` invocation does not override the policy.
+3.6. **Tool suites.** `python3 skills/proactive-loop/scripts/tool-suites-check.py --workspace "$WORKSPACE" --repo "$PWD"`
+   (0 pass · 1 a suite failed · 2 cannot answer). Extra suites are declared in
+   `$WORKSPACE/hosts/<host>/tool-suites-extra.json`. It passes no argv to a suite.
+4. **Build log.** Read `$WORKSPACE/build_log.md`; do not rebuild what works.
+5. **Pick** the highest-ROI unblocked item: owner tasks and blockers, then peer `opinion-requested` /
+   `review-requested` claims in #bot2bot, then voice reliability, then regressions, then the menu.
+   Write the pick into the status `step`.
+6. **Act.** A blocked primary is a cue to switch lanes, never to idle. Before pivoting from the owner's
+   latest ask, read `state/last-owner-activity.json` and announce the pivot in the bot-to-bot channel
+   per `PERSONAL_CLAUDE.md`. Skip this step only for: MINIMAL tier; owner active in the last ~5 min;
+   `state/presenter-mode.sentinel` (`bash scripts/presenter-mode.sh`); `state/loop-paused-until.sentinel`;
+   `python3 src/shutdown.py check` exiting 0 (finish in hand, write idle, do not relaunch).
+6.5. **Idle surface.** Record the pass:
+   `python3 skills/proactive-loop/scripts/idle-surface-hash.py --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop`.
+   The held set is edited only through
+   `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
+   (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
+   retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
+   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run the same
+   pipe with `--write` on `idle-held.py` AND `--commit` on `idle-surface-hash.py` — each flag belongs
+   to its own side, and `--commit` alone leaves added holds, removal reasons and notes unpersisted, so
+   the next pass re-posts the stale hold. Never commit before the send; never build the list from
+   recall.
+   `quiet` + owner active in the last ~30 min → still drop a one-line activity signal.
+6.7. **Failure closure.** Every reported failure ends with the mechanism that prevents its recurrence,
+   linked, or the sentence "no mechanism exists, because X". A filed lesson is not a third option.
+7. **Build log write.** Append with `O_APPEND` and a random marker; assert `count(MARK) == 1` by reading
+   the file back. Never read-modify-replace. Then decide whether a `relay/relay-<ts>.md` note is owed
+   (a PR event, a resolved question, a lifted or new blocker, a judgment) — most passes owe none.
+7.5. **Memory index**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
+   (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
+   from its hub before removing it; which rows go is the owner's call.
+8. **Ask.** Insert the question ABOVE the `# Resolved` divider of the per-host `pending-questions.md`,
+   placed by importance (only the top 5 render anywhere), and assert with the reader:
+   `python3 -c "…src/check-pending-questions.py…get_waiting_questions()"` — count went up, title matches,
+   position ≤ `VISIBLE_PREFIX`. macOS notification; `results/question-<ts>.txt` when voice is connected.
+   Then pivot; never block.
+9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
+   "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
+   (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
+   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
+   if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
+   duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →
+   change nothing and say so. A re-arm that prints `WATCHER_HELD:` on stdout did not start: it names
+   the holder (pid, role, whether its output is read) and the `--force-restart` command; report that
+   line and do not re-arm again. `--force-restart` replaces a holder; use it only on the owner's word.
+   Stop pids only when the `task-watcher` probe from step 3 presents owned and ownerless as two separately
+   labelled groups; one undifferentiated list means change nothing. Never start the watcher untagged: an
+   untagged watcher is invisible to the verdict above and to the supervisor.
+9.5. **PR thread gate**, chained so a refusal cannot be skipped:
+   `python3 skills/proactive-loop/scripts/pr-monologue-check.py <PR url|number --repo owner/name> --me <your-login> && gh pr comment <number> --repo <owner/name> --body-file <f>`
+   (0 safe · 1 refuse, run and span named · 2 cannot answer). On refuse, re-solicit through a stand.
+10. **Discord.** Check the channels in `reference_discord_channels.md`; forward actionable public items to
+    the dev channel. #bot2bot tags: `claim:` `blocked:` `done:` `ping:` `nack:` `opinion-requested:`.
+    First PR opened wins a claim. Bots never merge. Three unresolved round-trips → both positions to
+    `pending-questions.md`, proceed with the cheaper-to-reverse option.
+11. **Heartbeat.** Substantive pass + #bot2bot configured + other bot active → `done: <one line>` via the
+    `bot2bot-post` skill. Never fall back to `results/proactive-*.txt`. Never write `contextual-chips.json`.

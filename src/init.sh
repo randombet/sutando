@@ -1,0 +1,420 @@
+#!/bin/bash
+# Sutando init — idempotent first-run + every-start bootstrap.
+# Usage:
+#   bash src/init.sh             # Tier 1 + Tier 2 (verbose)
+#   bash src/init.sh --auto      # Tier 1 only (silent, called from startup.sh)
+#   bash src/init.sh --preflight # Tier 2 only (env + perms + tools)
+#
+# Tier 1: create-if-missing files and dirs. Never clobbers existing content.
+# Tier 2: preflight checks. Warns loudly but never blocks startup.
+
+set -e
+
+REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODE="${1:-full}"
+
+# Validate mode BEFORE workspace resolution so a usage error doesn't get
+# masked by a workspace-resolution failure (which would surface a less
+# actionable message for the caller).
+case "$MODE" in
+  --auto|--preflight|--full|full) ;;
+  *) echo "Usage: bash src/init.sh [--auto | --preflight]"; exit 2;;
+esac
+
+# Resolve runtime workspace via the shared post-M0 helper (PR #1395).
+# Single source for the resolution pattern lives in src/workspace_resolve.sh
+# — replaces the previously-duplicated 3-way block in 5 scripts (Lucy's #1399
+# review nit). Defensive fallback to the env var for the rare case where the
+# helper file isn't reachable (non-checkout / extracted-tarball install /
+# minimized test fixture). Runtime state files (logs, state, tasks, results,
+# notes, data, pending-questions.md, …) live under the workspace; loose
+# status .json files (core-status.json, voice-state.json, …) live under state/.
+# Helper lives at $REPO/src/workspace_resolve.sh in normal layout. Fall back
+# to script-sibling for cross-checkout safety: when $SUTANDO_REPO_DIR points
+# to a different checkout (e.g. owner's sutando-plus submodule pin) that
+# doesn't yet contain this newly-added file, the script-local copy is
+# always reachable. Caught by an E2E pass against PR #1399 before merge.
+__HELPER="$REPO/src/workspace_resolve.sh"
+[ -f "$__HELPER" ] || __HELPER="$(cd "$(dirname "$0")" && pwd)/workspace_resolve.sh"
+if [ -f "$__HELPER" ]; then
+  # shellcheck source=workspace_resolve.sh
+  source "$__HELPER"
+  resolve_workspace_or_die
+else
+  echo "init.sh: cannot resolve workspace — workspace_resolve.sh not found at \$REPO/src/ or alongside this script." >&2
+  exit 1
+fi
+unset __HELPER
+
+# v0.8 deprecation nag (init.sh-side belt-and-suspenders for the resolver
+# warning). If `.env` declares a SUTANDO_WORKSPACE line, it's no longer
+# honored — surface once per init.sh run so the operator cleans up. The
+# resolver fires its own bold-red warning when the env var is set in the
+# process environment; this catches the `.env` declaration case for boot
+# paths that don't source .env into the env (launchd, cron, direct invokes).
+if [ -f "$REPO/.env" ]; then
+  _env_val=$(grep -E '^SUTANDO_WORKSPACE=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" -e "s|^~|$HOME|")
+  if [ -n "$_env_val" ]; then
+    # PR #1440 B4: honor NO_COLOR; drop literal path values from the warning
+    # text (parity with Python's c58270d safety pass — a caller-side `2>&1`
+    # capture followed by `mkdir -p "$captured"` previously tokenized embedded
+    # / chars into a rogue folder tree).
+    _msg="workspace: .env declares SUTANDO_WORKSPACE but the env var is no longer honored (removed in v0.8). Delete the .env line, and if needed move the value to sutando.config.local.json under workspace.path."
+    if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+      printf '\033[1;31m%s\033[0m\n' "$_msg" >&2
+    else
+      printf '%s\n' "$_msg" >&2
+    fi
+    unset _msg
+  fi
+  unset _env_val
+fi
+
+log() {
+  # Quiet under --auto unless we're actually creating something
+  if [ "$MODE" != "--auto" ]; then echo "$@"; fi
+}
+
+# Workspace-rooted helpers — runtime state (logs, state, tasks, results, …).
+create_file_if_missing() {
+  local path="$1"; local body="$2"
+  if [ ! -f "$WORKSPACE/$path" ]; then
+    mkdir -p "$(dirname "$WORKSPACE/$path")"
+    printf '%s' "$body" > "$WORKSPACE/$path"
+    echo "  ✓ created $path"
+  fi
+}
+
+create_dir_if_missing() {
+  local path="$1"
+  if [ ! -d "$WORKSPACE/$path" ]; then
+    mkdir -p "$WORKSPACE/$path"
+    echo "  ✓ created $path/"
+  fi
+}
+
+# Repo-rooted copy helper — for shipping example configs from the checkout
+# into a stable location. Used today only for skills/schedule-crons/crons.json
+# which lives in the repo, NOT the workspace.
+copy_if_missing() {
+  local src="$1"; local dst="$2"
+  if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
+    cp "$REPO/$src" "$REPO/$dst"
+    echo "  ✓ created $dst (from $src)"
+  fi
+}
+
+# One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
+# only when the migration sentinel is absent — same idempotent posture as
+# workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
+# collision: if a workspace copy already exists at the destination, the repo
+# copy is left in place (so a partial migration on a prior pass never
+# clobbers fresh workspace writes).
+#
+# Surfaces a single stderr line per moved item + writes a sentinel
+# `$WORKSPACE/.legacy-migrated-911` after a successful sweep. Second run
+# sees the sentinel and bails — no log noise on every startup.
+#
+# Triggered by Susan's PR #913 review (2026-05-19). Without this, installs
+# that pre-date #911 keep two copies: stale repo-root logs/state/tasks/...
+# alongside the new workspace copies. git status pollution + future
+# debugging confusion.
+migrate_legacy_runtime_state() {
+  local sentinel="$WORKSPACE/.legacy-migrated-911"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  # Only migrate when the legacy repo actually has runtime state. New
+  # installs (post-#911) skip this path entirely.
+  local have_evidence=0
+  for d in logs state tasks results notes data; do
+    if [ -d "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      have_evidence=1
+      break
+    fi
+  done
+  if [ "$have_evidence" -eq 0 ]; then
+    # Nothing to migrate; write sentinel so we don't re-check every run.
+    mkdir -p "$WORKSPACE"
+    : > "$sentinel"
+    return 0
+  fi
+  mkdir -p "$WORKSPACE"
+  local moved_any=0
+  # Dirs: move whole tree iff workspace target doesn't already exist.
+  for d in logs state tasks results notes data; do
+    local src="$REPO/$d"
+    local dst="$WORKSPACE/$d"
+    if [ -d "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $d/ from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  # Top-level state files: move iff workspace target absent.
+  for f in pending-questions.md core-status.json contextual-chips.json voice-state.json build_log.md; do
+    local src="$REPO/$f"
+    local dst="$WORKSPACE/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f from repo to workspace" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ legacy runtime state migrated (sentinel: $sentinel)" >&2
+  fi
+}
+
+# One-time sweep of loose workspace-root status .json files into state/.
+# Bash twin of workspace_default.py's _migrate_root_status — shares the
+# `.status-migrated` sentinel so whichever runs first does the move and the
+# other short-circuits. init.sh runs before the Python services (startup.sh),
+# so without this sweep the create_file_if_missing calls below would seed a
+# fresh state/ file and strand a real workspace-root copy. Non-destructive on
+# collision; file list matches _STATUS_FILES.
+migrate_root_status_to_state() {
+  local sentinel="$WORKSPACE/.status-migrated"
+  if [ -f "$sentinel" ]; then
+    return 0
+  fi
+  mkdir -p "$WORKSPACE/state"
+  local moved_any=0
+  # Single source of truth for this list is `_STATUS_FILES` in
+  # src/workspace_default.py — keep the two in sync. Adding a 6th status
+  # file there without adding it here (or vice versa) silently drifts the
+  # Python and bash migrator twins.
+  for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
+    local src="$WORKSPACE/$f"
+    local dst="$WORKSPACE/state/$f"
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+      if mv "$src" "$dst" 2>/dev/null; then
+        echo "  → migrated $f into state/" >&2
+        moved_any=1
+      fi
+    fi
+  done
+  : > "$sentinel"
+  if [ "$moved_any" -eq 1 ]; then
+    echo "  ✓ workspace-root status files swept into state/" >&2
+  fi
+}
+
+# One-time stderr notice when legacy repo-root state is detected. Replaces
+# the auto-fire of migrate_legacy_runtime_state / migrate_root_status_to_state
+# from tier1() — see #1169 / #1170 (option B: auto-migration disabled).
+#
+# Scans for evidence the bash twins would have moved (a) on a fresh
+# install or (b) on a populated-workspace collision where the old
+# migrator would have skipped the move silently. Both cases now require
+# explicit invocation of `bash scripts/sutando-migrate.sh`.
+legacy_state_notice() {
+  # Under state/: the workspace root is reserved for top-level directories.
+  local notice_sentinel="$WORKSPACE/state/.legacy-notice-printed"
+  local legacy_sentinel="$WORKSPACE/.legacy-notice-printed"
+  # Migrate an already-printed install rather than only honouring it: leaving the
+  # root file in place keeps workspace-root-tidy warning forever (review, #3205).
+  if [ -f "$legacy_sentinel" ] && [ ! -f "$notice_sentinel" ]; then
+    mkdir -p "$(dirname "$notice_sentinel")" 2>/dev/null && : > "$notice_sentinel" 2>/dev/null
+  fi
+  if [ -f "$notice_sentinel" ]; then
+    rm -f "$legacy_sentinel" 2>/dev/null   # best-effort; metadata only
+    return 0
+  fi
+  if [ -f "$legacy_sentinel" ]; then
+    return 0
+  fi
+  local found=()
+  for d in logs state tasks results notes data; do
+    if [ -d "$REPO/$d" ] && [ ! -L "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      found+=("$REPO/$d/")
+    fi
+  done
+  for f in pending-questions.md core-status.json contextual-chips.json voice-state.json build_log.md conversation.log; do
+    if [ -f "$REPO/$f" ]; then
+      found+=("$REPO/$f")
+    fi
+  done
+  for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
+    if [ -f "$WORKSPACE/$f" ]; then
+      found+=("$WORKSPACE/$f (should be in state/)")
+    fi
+  done
+  if [ "${#found[@]}" -gt 0 ]; then
+    mkdir -p "$WORKSPACE"
+    {
+      echo "  ⚠ legacy state detected: ${found[*]}"
+      echo "    Auto-migration is disabled as of #1169 (option B)."
+      echo "    Run \`bash scripts/sutando-migrate.sh --dry-run\` to preview, then \`--commit\` to relocate."
+    } >&2
+    mkdir -p "$(dirname "$notice_sentinel")" && : > "$notice_sentinel"
+  fi
+}
+
+# --- Tier 1: auto-bootstrap (always safe to run) ---
+tier1() {
+  log "Tier 1 — auto-bootstrap..."
+
+  # Auto-migration disabled (closes #1169 option B, 2026-05-26).
+  # The two migrate_* functions above are kept defined so a future
+  # `scripts/sutando-migrate.sh` CLI can invoke them explicitly, but they
+  # are no longer dispatched on every startup. One-time stderr notice
+  # below points users at the CLI when legacy state is detected.
+  legacy_state_notice
+
+  # Directories — canonical list lives in `scripts/sutando-config.sh subdirs`
+  # so the layout is a single source of truth across init.sh tier1 +
+  # `bootstrap` subcommand + docs. Falls back to the historical hardcoded
+  # set if the helper isn't reachable (non-checkout install). Convergent
+  # feedback from Mini + Lucy on PR #1399.
+  if [ -f "$REPO/scripts/sutando-config.sh" ]; then
+    while IFS= read -r _d; do
+      [ -n "$_d" ] && create_dir_if_missing "$_d"
+    done < <(bash "$REPO/scripts/sutando-config.sh" subdirs)
+    unset _d
+  else
+    for _d in logs state tasks results results/archive results/calls notes data; do
+      create_dir_if_missing "$_d"
+    done
+    unset _d
+  fi
+
+  # Files — placeholders only, content added by the agent later.
+  # build_log.md lives under $SUTANDO_WORKSPACE per workspace contract; seeded
+  # there by workspace_default.py + dashboard/health-check readers expect it
+  # at WORKSPACE_DIR / "build_log.md". Not seeded here.
+
+  create_file_if_missing "pending-questions.md" \
+    "# Pending Questions
+
+_(none open)_
+"
+
+  # Status files live under state/ (the workspace root is structural —
+  # directories only). create_file_if_missing mkdir's the parent.
+  create_file_if_missing "state/contextual-chips.json" \
+    "{\"chips\":[],\"ts\":$(date +%s)}
+"
+
+  create_file_if_missing "state/core-status.json" \
+    "{\"status\":\"idle\",\"ts\":$(date +%s)}
+"
+
+  create_file_if_missing "state/voice-state.json" \
+    "{\"connected\":false,\"ts\":$(date +%s)}
+"
+
+  # crons.json — copy from the example if present
+  copy_if_missing "skills/schedule-crons/crons.example.json" "skills/schedule-crons/crons.json"
+}
+
+# --- Tier 2: preflight (warn, don't block) ---
+preflight() {
+  log "Tier 2 — preflight checks..."
+
+  local required_ok=0
+  local required_total=0
+  local optional_ok=0
+  local optional_total=0
+  local cli_missing=()
+
+  # .env required keys
+  required_total=$((required_total + 1))
+  if [ -f "$REPO/.env" ]; then
+    if grep -qE '^GEMINI_API_KEY=.+' "$REPO/.env"; then
+      required_ok=$((required_ok + 1))
+    else
+      log "  ✗ GEMINI_API_KEY missing from .env (required for voice)"
+    fi
+  else
+    log "  ✗ .env missing (cp .env.example .env if it exists)"
+  fi
+
+  # .env optional keys — count what's set in the repo .env
+  local optional_keys="TWILIO_ACCOUNT_SID NGROK_DOMAIN CARTESIA_API_KEY X_API_KEY ANTHROPIC_API_KEY GOOGLE_APPLICATION_CREDENTIALS"
+  for key in $optional_keys; do
+    optional_total=$((optional_total + 1))
+    if [ -f "$REPO/.env" ] && grep -qE "^${key}=.+" "$REPO/.env"; then
+      optional_ok=$((optional_ok + 1))
+    fi
+  done
+
+  # External channel envs — Discord / Telegram bot tokens live outside the repo .env
+  # Resolve via BASH_SOURCE (not $REPO) so the helper invocation works even
+  # when tests/callers override $REPO to a scratch dir that doesn't contain
+  # the helper. Init.sh is always co-located with scripts/sutando-config.sh
+  # in the canonical Sutando checkout.
+  _CHAN_BASE="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/sutando-config.sh" claude-home-path channels)"
+  optional_total=$((optional_total + 1))
+  if [ -f "$_CHAN_BASE/discord/.env" ] && grep -qE '^DISCORD_BOT_TOKEN=.+' "$_CHAN_BASE/discord/.env"; then
+    optional_ok=$((optional_ok + 1))
+  fi
+  optional_total=$((optional_total + 1))
+  if [ -f "$_CHAN_BASE/telegram/.env" ] && grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$_CHAN_BASE/telegram/.env"; then
+    optional_ok=$((optional_ok + 1))
+  fi
+
+  # CLI tools
+  for tool in node npx python3 fswatch claude gh; do
+    if ! command -v "$tool" > /dev/null 2>&1; then
+      cli_missing+=("$tool")
+    fi
+  done
+
+  # macOS permissions — non-fatal, just a hint.
+  # macOS 15+ silently writes a tiny PNG when perm is denied (exit 0).
+  # Denied artifacts are <2KB; real captures are hundreds-of-KB to MB.
+  # Black 5120x2880 PNG compresses to ~43KB, so 5KB is the safe floor.
+  local perms_warn=0
+  local permcheck_ok=1
+  screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || permcheck_ok=0
+  if [ "$permcheck_ok" -eq 1 ]; then
+    # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
+    local permcheck_size
+    permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
+    if [ "${permcheck_size:-0}" -lt 5000 ]; then permcheck_ok=0; fi
+  fi
+  rm -f /tmp/sutando-permcheck.png
+  if [ "$permcheck_ok" -eq 0 ]; then
+    log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
+    perms_warn=1
+  fi
+  # $REPO is overridable (tests point it at a scratch dir), so fall back to
+  # alongside this script — an unguarded source under `set -e` aborts the run.
+  local __probe="$REPO/src/accessibility_probe.sh"
+  [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+  # 125 = could not check. acc_rc=0 here would BE the granted verdict, which
+  # is exactly the invention the old comment claimed to avoid.
+  local acc_rc=125
+  if [ -f "$__probe" ]; then
+    # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
+    # abort init.sh before it ever emits its [Preflight] summary.
+    source "$__probe"
+    acc_rc=0; accessibility_probe || acc_rc=$?
+  fi
+  case $acc_rc in
+    0)   : ;;
+    125) log "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked"
+         perms_warn=1 ;;
+    124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
+         perms_warn=1 ;;
+    *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
+         perms_warn=1 ;;
+  esac
+
+  # One-line summary regardless of mode (this is the value-add)
+  local cli_str="all-ok"
+  if [ ${#cli_missing[@]} -gt 0 ]; then cli_str="missing: ${cli_missing[*]}"; fi
+  local perms_str="ok"
+  if [ "$perms_warn" -eq 1 ]; then perms_str="incomplete"; fi
+  echo "[Preflight] required=${required_ok}/${required_total}  optional=${optional_ok}/${optional_total}  cli=${cli_str}  perms=${perms_str}"
+}
+
+case "$MODE" in
+  --auto)       tier1 ;;
+  --preflight)  preflight ;;
+  *)            tier1; preflight ;;
+esac

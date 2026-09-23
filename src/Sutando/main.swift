@@ -1,0 +1,2788 @@
+import Cocoa
+import Carbon
+import UserNotifications
+import ApplicationServices
+
+// MARK: - Sutando Drop Menu Bar App
+// Replaces Automator Quick Action for context drops.
+// Global hotkey (Ctrl+Shift+D) captures selected text, clipboard image, or Finder file.
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    // Hotkeys are configurable via ~/.config/sutando/hotkeys.json.
+    // Hotkey defaults are published in state/hotkeys.json (see PR #1920/#1924).
+    var hotKeyRefs: [EventHotKeyRef?] = []  // one entry per registered hotkey
+    var hotKeyActions: [UInt32: String] = [:]  // hotkey id → action name
+    var lastDropTime: Date = .distantPast
+    var isRecordingVideo: Bool = false  // ⌃R start/stop toggle state
+    var videoClipMenuItem: NSMenuItem?  // menu row that shows 🔴 while recording
+    var screencaptureInFlight: Bool = false  // guards against stacked crosshair launches
+    // Runtime state lives under the per-user workspace dir, not the repo
+    // checkout. **Delegates to SutandoConfig.resolveWorkspace()** as of the
+    // M0 cutover (was inline env-check + hardcoded ~/.sutando/workspace
+    // fallback). The Swift loader twin lives at
+    // src/Sutando/SutandoConfig.swift and matches src/sutando_config.{py,ts}
+    // byte-for-byte. Resolution order:
+    //   1. sutando.config.local.json -> workspace.path (per-clone override)
+    //   2. sutando.config.json -> workspace.path (tracked defaults)
+    //   3. ${REPO_DIR}/workspace baked-in default
+    // $SUTANDO_WORKSPACE is NOT in the order — removed in v0.8; a set env var
+    // only warns. This comment claims to match sutando_config.{py,ts}
+    // byte-for-byte, so it has to track that removal too.
+    //
+    // Pre-#762 main.swift wrote tasks/logs/state under the repo checkout via
+    // CLAUDE.md walk-up. Post-#762 that dir no longer exists, so writeTask
+    // silently failed — the bug Chi hit 2026-05-18 where context-drop
+    // notified + logged but the bridge never saw the task.
+    let workspace: String = SutandoConfig.resolveWorkspace()
+
+    // Repo checkout for skills-adjacent paths (assets, src/*.py, scripts/*.sh)
+    // that ship alongside the code. Same CLAUDE.md walk-up used before #762.
+    let repoRoot: String = {
+        var url = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
+        for _ in 0..<8 {
+            url = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: url.appendingPathComponent("CLAUDE.md").path) {
+                return url.path
+            }
+        }
+        let fallback = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).resolvingSymlinksInPath()
+        return fallback.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
+    }()
+
+    var resultWatchSource: DispatchSourceFileSystemObject?
+    var lastResultCount = 0
+    // Pointer Teacher overlay (Clicky-style flying marker). A persistent
+    // screenSaver-level click-through window; the triangle stays invisible
+    // (alpha 0) until a Target arrives via <workspace>/state/pointer-cmd.json
+    // — written by the `point_at` inline tool, watched with the same
+    // DispatchSource idiom as watchResults(). Lives inside the real menubar
+    // app's GUI session, which the standalone tracer binary could not reach.
+    var pointerWindow: NSWindow?
+    let pointerView = PointerOverlayView()
+    var pointerWatchSource: DispatchSourceFileSystemObject?
+    var pointerAnim: Timer?
+    var pointerPulseTimer: Timer?
+    var pointerHoldTimer: Timer?
+    var pointerFadeTimer: Timer?
+    var pointerLastTS: Double = 0
+    // Avatar animation state (PR #418 plumbing → PR #419 consumer).
+    // `currentAgentState` caches the last state from /sse-status so
+    // `startAnimation`/`stopAnimation` only fire on transitions, not every poll.
+    var currentAgentState: String = "idle"
+    var animationTimer: Timer?
+    var animationPhase: CGFloat = 1.0
+    // Presenter-mode state mirrored from iclr-highlight server (port 7877).
+    // Updated every 1s in pollPresenterMode; nil-safe if server is down.
+    var presenterModeActive: Bool = false
+    weak var presenterMenuItem: NSMenuItem?
+    // Voice-agent mode state from state/voice-mode.txt sentinel (written by
+    // voice-agent.ts on switch_mode / zoom-auto-flip). "active" or "meeting".
+    // Combined with presenterModeActive for the composite 3-mode radio —
+    // clicking any of {modeActiveMenuItem, modeMeetingMenuItem,
+    // modePresenterMenuItem} requests the switch via state/voice-mode.request
+    // (for active/meeting) or POST :7877/presenter/on (for presenter).
+    var voiceMode: String = "active"
+    var modelSubmenu: NSMenu?
+    weak var modeActiveMenuItem: NSMenuItem?
+    weak var modeMeetingMenuItem: NSMenuItem?
+    weak var modePresenterMenuItem: NSMenuItem?
+
+    /// Fixed tmux socket path for the sutando-core session. The shell
+    /// (via startup.sh -S flag) and the app (launched by macOS with a
+    /// different TMPDIR due to sandboxing) must target the same socket
+    /// to find the same server. Without this, tmux has-session fails
+    /// app-side even when the session is alive shell-side.
+    /// Honors SUTANDO_TMUX_SOCKET (the env var start-cli.sh + the desktop
+    /// private-socket runtime set) so the app's state-detection / wakeup /
+    /// pane-capture target the SAME tmux server as a private-socket core;
+    /// falls back to the /tmp default when unset. Without this, a private-
+    /// socket core is invisible to all four control paths below.
+    let sutandoTmuxSocket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Self-preventive single-instance: if another Sutando.app is already
+        // running (e.g. manual double-launch or leftover from restartSelf()),
+        // quit immediately. Prevents the menu-bar-icon ghost stack that
+        // plagued 2026-04-21 morning (3 instances accumulated + user saw
+        // duplicate icons). Matches path via pgrep $-anchored pattern — same
+        // pattern used by health-check.py per feedback_pkill_then_open_race.
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        let myPath = ProcessInfo.processInfo.arguments[0]
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-f", "Sutando/Sutando$"]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        pgrep.standardError = FileHandle.nullDevice
+        try? pgrep.run()
+        pgrep.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let pids = out.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        let others = pids.filter { $0 != myPid }
+        if !others.isEmpty {
+            NSLog("Sutando: another instance already running (\(others.map(String.init).joined(separator: ","))) — exiting to prevent duplicate menu-bar icons. Path: \(myPath)")
+            exit(0)
+        }
+        // Request notification permission — only when running as .app bundle
+        // (UNUserNotificationCenter crashes when run as raw binary)
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+                NSLog("Sutando: notification permission granted=\(granted) error=\(String(describing: error))")
+            }
+        }
+        DispatchQueue.main.async { [self] in
+            setupMenuBar()
+            // Check Accessibility trust at startup. AX-related features
+            // (kAXSelectedTextAttribute reads in dropContext, synthetic Cmd+C
+            // via CGEventPost) silently fail when the bundle's TCC entry is
+            // stale — usually after a codesign identity change. Empirical
+            // case 2026-05-19: dropContext started returning "Nothing
+            // selected" for every app (Discord and TextEdit both) after
+            // Sutando.app was re-signed (ad-hoc Identifier=Sutando →
+            // cert-signed Identifier=com.sutando.menubar). The Accessibility
+            // TCC entry from the prior signature didn't transfer to the new
+            // binary; macOS silently returned AX errors without re-prompting.
+            // AXIsProcessTrustedWithOptions with prompt=true forces a
+            // re-bind: if the running binary's signature doesn't match any
+            // granted TCC row, the standard "Sutando wants Accessibility"
+            // dialog opens, and on Allow the TCC entry is recreated against
+            // the current signature. Idempotent when already trusted
+            // (returns true, no dialog). The result is also logged so future
+            // drift surfaces in the debug log on session 0.
+            let axOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            let axTrusted = AXIsProcessTrustedWithOptions(axOpts)
+            logToFile("startup: AXIsProcessTrusted=\(axTrusted)")
+            registerHotKey()
+            watchResults()
+            setupPointerOverlay()
+            logToFile("App started, workspace=\(workspace)")
+            // Startup smoke: ensure the runtime dirs exist so the silent-
+            // write class can't recur (Mini nit #3). mkdir is idempotent;
+            // missing-dir is logged so an unexpected absence is visible.
+            for sub in ["tasks", "logs", "state", "results"] {
+                let dir = workspace + "/" + sub
+                if !FileManager.default.fileExists(atPath: dir) {
+                    logToFile("startup-smoke: \(sub)/ missing under \(workspace) — creating")
+                }
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
+        }
+    }
+
+    // MARK: - Result notifications (when voice is not connected)
+    func watchResults() {
+        let resultsPath = workspace + "/results"
+        let fd = open(resultsPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: DispatchQueue.global(qos: .utility))
+        source.setEventHandler { [weak self] in self?.checkNewResults() }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        resultWatchSource = source
+        lastResultCount = countResults()
+    }
+
+    func countResults() -> Int {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: workspace + "/results")
+            .filter { $0.hasPrefix("task-") && $0.hasSuffix(".txt") }) ?? []
+        return files.count
+    }
+
+    func checkNewResults() {
+        let newCount = countResults()
+        guard newCount > lastResultCount else { lastResultCount = newCount; return }
+        lastResultCount = newCount
+        // Only notify if voice is NOT connected
+        if !isVoiceConnected() {
+            let resultsPath = workspace + "/results"
+            if let files = try? FileManager.default.contentsOfDirectory(atPath: resultsPath)
+                .filter({ $0.hasPrefix("task-") && $0.hasSuffix(".txt") })
+                .sorted(by: >),
+               let latest = files.first,
+               let content = try? String(contentsOfFile: resultsPath + "/" + latest, encoding: .utf8) {
+                let preview = String(content.prefix(120)).replacingOccurrences(of: "\n", with: " ")
+                DispatchQueue.main.async { [weak self] in self?.notify("Sutando", preview) }
+            }
+        }
+    }
+
+    func isVoiceConnected() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/lsof")
+        proc.arguments = ["-i", ":9900", "-sTCP:ESTABLISHED"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out.contains("ESTABLISHED")
+    }
+
+    // MARK: - Menu Bar
+
+    /// Recording indicator on the Drop Video Clip MENU ROW (Susan 2026-07-02
+    /// asked for the indicator on this exact row, not elsewhere): while
+    /// recording, the row reads "🔴 Drop Video Clip — recording…"; back to the
+    /// plain label once stopped. The toggle notifications alone weren't
+    /// enough — a missed notification left no way to tell whether the
+    /// recorder was still rolling.
+    func setRecordingIndicator(_ on: Bool) {
+        // Keep the ⌃R toggle state in lockstep with the indicator so a recording
+        // started/stopped externally (observed via the Darwin notification) also
+        // updates behavioral state — otherwise the next ⌃R mis-computes `starting`
+        // and needs a double-press to stop. Written on the main queue alongside the
+        // menu update so notification callbacks never touch it off-main. (CR: john-the-dev)
+        DispatchQueue.main.async {
+            self.isRecordingVideo = on
+            guard let item = self.videoClipMenuItem else { return }
+            let glyph = (item.representedObject as? String) ?? ""
+            // Same leading-marker convention as the Mode rows (● = active):
+            // the Drop Video Clip row itself says whether the recorder rolls.
+            item.title = on ? "🔴 Drop Video Clip — recording… \(glyph)"
+                            : "Drop Video Clip \(glyph)"
+        }
+    }
+
+    /// Darwin-notification observers for recording state (push, not poll).
+    /// The capture server posts com.sutando.recording.on/.off via notifyutil
+    /// whenever recording starts or stops, whoever started it.
+    func registerRecordingStateObservers() {
+        let dn = CFNotificationCenterGetDarwinNotifyCenter()
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(true)
+        }, "com.sutando.recording.on" as CFString, nil, .deliverImmediately)
+        CFNotificationCenterAddObserver(dn, me, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            Unmanaged<AppDelegate>.fromOpaque(observer).takeUnretainedValue().setRecordingIndicator(false)
+        }, "com.sutando.recording.off" as CFString, nil, .deliverImmediately)
+    }
+
+    func setupMenuBar() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
+            if let image = NSImage(contentsOfFile: avatarPath) {
+                image.size = NSSize(width: 18, height: 18)
+                image.isTemplate = false
+                button.image = image
+            } else {
+                button.title = "S"
+                button.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+            }
+        }
+
+        let menu = NSMenu()
+        // Build menu items from the loaded hotkey config so labels stay in sync
+        // with whatever's actually registered (config or defaults).
+        let hotkeys = loadHotkeyConfig()
+        let actionToSelector: [String: (String, Selector)] = [
+            "drop_context":    ("Drop Context",    #selector(dropContext)),
+            "drop_screenshot": ("Drop Screenshot", #selector(dropScreenshot)),
+            "drop_video_clip": ("Drop Video Clip", #selector(dropVideoClip)),
+            "toggle_voice":    ("Toggle Voice",    #selector(toggleVoice)),
+            "toggle_mute":     ("Toggle Mute",     #selector(toggleMute)),
+        ]
+        for hk in hotkeys {
+            guard let (label, sel) = actionToSelector[hk.action] else { continue }
+            let glyph = displayLabel(key: hk.key, modifiers: hk.modifiers)
+            let item = NSMenuItem(title: "\(label) (\(glyph))", action: sel, keyEquivalent: "")
+            if hk.action == "drop_video_clip" {
+                // Recording indicator lives ON this row (Susan 2026-07-02
+                // on this exact row): stash the hotkey glyph so
+                // setRecordingIndicator can rebuild both title states.
+                item.representedObject = "(\(glyph))"
+                videoClipMenuItem = item
+            }
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Core CLI", action: #selector(openCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        // Three-mode radio: Active / Meeting / Presenter. Exactly one has
+        // ● at a time (the current composite mode). Clicking switches.
+        // Active & Meeting → write state/voice-mode.request, voice-agent
+        // polls+applies in ~1s. Presenter → POST :7877/presenter/on.
+        let activeItem = NSMenuItem(title: "  Mode: Active", action: #selector(switchToActive), keyEquivalent: "")
+        activeItem.target = self
+        menu.addItem(activeItem)
+        modeActiveMenuItem = activeItem
+
+        let meetingItem = NSMenuItem(title: "  Mode: Meeting", action: #selector(switchToMeeting), keyEquivalent: "")
+        meetingItem.target = self
+        menu.addItem(meetingItem)
+        modeMeetingMenuItem = meetingItem
+
+        let presenterItem = NSMenuItem(title: "  Mode: Presenter", action: #selector(switchToPresenter), keyEquivalent: "")
+        presenterItem.target = self
+        menu.addItem(presenterItem)
+        modePresenterMenuItem = presenterItem
+        // Back-compat: presenterMenuItem still referenced by avatar-badge
+        // re-render path. Point it at the presenter radio item so its
+        // title toggle still works, though the composite update is handled
+        // by updateModeMenuItem() now.
+        presenterMenuItem = presenterItem
+        menu.addItem(NSMenuItem.separator())
+        // Loop pause/resume — proactive-loop's skip-conditions check
+        // `state/loop-paused-until.sentinel` (per skills/proactive-loop/SKILL.md
+        // Skip Conditions §(d)). Pause writes a future-dated sentinel; Resume
+        // deletes it. Sentinel format: ISO-8601 expiry timestamp (UTC).
+        // Auto-expires so a forgotten pause re-enables itself.
+        // Pause submenu — 30min auto-expire (default), 1hr auto-expire,
+        // or Indefinite (writes a year-2099 expiry so the sentinel-check
+        // in proactive-loop SKILL.md still works without code change).
+        let pauseSubmenu = NSMenu()
+        pauseSubmenu.addItem(NSMenuItem(title: "30 minutes", action: #selector(pauseLoop30), keyEquivalent: ""))
+        pauseSubmenu.addItem(NSMenuItem(title: "1 hour", action: #selector(pauseLoop1h), keyEquivalent: ""))
+        pauseSubmenu.addItem(NSMenuItem(title: "Indefinite (Resume to re-enable)", action: #selector(pauseLoopIndefinite), keyEquivalent: ""))
+        let pauseItem = NSMenuItem(title: "Pause Loop", action: nil, keyEquivalent: "")
+        pauseItem.submenu = pauseSubmenu
+        menu.addItem(pauseItem)
+        menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
+        // Model submenu — items are read from skills/model-switch/manifest.json on every
+        // open, so the choices change with the skill and never need an app rebuild.
+        let modelSubmenu = NSMenu()
+        modelSubmenu.delegate = self
+        self.modelSubmenu = modelSubmenu
+        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
+        modelItem.submenu = modelSubmenu
+        menu.addItem(modelItem)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop Core CLI", action: #selector(stopCore), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Restart All Services", action: #selector(restartServices), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "Stop All Services", action: #selector(stopServices), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Restart Sutando App", action: #selector(restartSelf), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+        statusItem.menu = menu
+
+        // Poll mute/voice state every 1 second. Previously 3s, but the seeing
+        // flash is a transient tool state (TTL ~3s) and a 3s poll has <50%
+        // probability of landing inside the TTL window — Chi saw seeing
+        // "happen long after" because the first flash was missed entirely.
+        // 1s makes the catch deterministic.
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollMuteState()
+        }
+
+        // Recording-indicator sync (Susan 2026-07-22, push not poll): the
+        // capture server Darwin-notifies com.sutando.recording.on/.off on
+        // every state change (⌃R, watcher-started sessions, watchdog
+        // auto-stop) — observe those and mirror onto the Drop Video Clip row.
+        registerRecordingStateObservers()
+
+        // Watcher health: every 5 min, verify the task watcher is running.
+        // Bumped from 30s → 300s on 2026-05-14 (Chi greenlit) — with Claude
+        // Code's `Monitor` tool now driving `watch-tasks-stream.sh` as the
+        // canonical persistent watcher, the menu-bar Timer is purely a
+        // safety net (catches Monitor crash / session-restart race / tmux
+        // pane death). 30s polling was overkill; 5 min keeps recovery in
+        // human-interactive territory (worst-case lag = ~5 min stale before
+        // auto-restart) while cutting 12× the wake-ups.
+        //
+        // Recovery shells out to the launcher dispatcher rather than typing a
+        // keystroke into the pane — see checkWatcher() below.
+        Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
+            self?.checkWatcher()
+        }
+
+        // Contextual chips: every 120s, refresh contextual-chips.json from
+        // cheap mechanical sources (open PRs, top pending question, recent
+        // results). No LLM round-trip. Replaces the (never-shipped) draft
+        // /personal-reactive-loop skill — the cadence is purely mechanical
+        // polling, so the natural home is the menu-bar app that already
+        // does watcher liveness. Per Chi's review 2026-05-05: "if it's only
+        // scripts, can it be merged with the sutando app?"
+        Timer.scheduledTimer(withTimeInterval: 120.0, repeats: true) { [weak self] _ in
+            self?.refreshContextualChips()
+        }
+        // Also fire once at startup so the chip set isn't stale-from-yesterday
+        // until the first 120s tick.
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            self?.refreshContextualChips()
+        }
+
+        // Health-check: every 30min, run health-check.py --fix and append
+        // to logs/health-check.log. Same pattern as watcher-liveness +
+        // chips. Replaces ~/Library/LaunchAgents/com.sutando.health-check
+        // .plist (retired in the same change set per trio-design-current
+        // .md "Health-check ownership"). After this binary ships:
+        //   launchctl bootout gui/$UID/com.sutando.health-check
+        //   rm ~/Library/LaunchAgents/com.sutando.health-check.plist
+        Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
+            self?.runHealthCheck()
+        }
+        // Fire once at startup so a fresh check is captured immediately
+        // rather than waiting 30min.
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            self?.runHealthCheck()
+        }
+
+        // Easy-restart intent poller (sonichi#2401): every 5s, consume
+        // <workspace>/state/core-restart-requested.json (written by a bridge
+        // on the owner's "restart core" / "stop core" chat command — bridges
+        // survive core death, which is exactly when this matters) and run the
+        // action HERE, in the GUI login session, so the relaunch comes up
+        // authenticated (no SSH keychain wall — the 2026-07-29 outage class).
+        // Human-triggered only: nothing writes this file autonomously, and a
+        // consumed "stop" has no auto-restart anywhere. Consume-before-act +
+        // 10-min staleness drop mirror core_restart_intent.py exactly.
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollRestartIntent()
+        }
+
+        // Presenter mode: poll iclr-highlight server for on/off state.
+        // Keeps menu item + tooltip fresh; silent if server is down.
+        // Also rechecks voice-agent mode sentinel on the same tick.
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollPresenterMode()
+            self?.pollVoiceMode()
+        }
+        // Render the initial mode bullet on the dropdown. Without this, the
+        // first pollVoiceMode() tick bails early when sentinel matches the
+        // default `voiceMode = "active"`, leaving the menu items at their
+        // creation-time titles ("  Mode: Active") with no `●` marker. Caught
+        // 2026-05-05 — Chi reported the dot-next-to-Active was gone after a
+        // restart that landed in active mode (the common case). Calling
+        // updateModeMenuItem() once at end-of-launch makes the bullet appear
+        // immediately regardless of whether mode ever changes.
+        updateModeMenuItem()
+    }
+
+    // Write state/voice-mode.request for voice-agent to pick up on its 1s
+    // poll (see voice-agent.ts applyModeRequest). Nil-safe if workspace
+    // derivation failed — the app just logs and the user retries.
+    func requestVoiceMode(_ mode: String) {
+        let path = workspace + "/state/voice-mode.request"
+        let dir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        do {
+            try mode.write(toFile: path, atomically: true, encoding: .utf8)
+        } catch {
+            NSLog("Sutando: requestVoiceMode(\(mode)) write failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func switchToActive() {
+        // If currently in presenter, clear presenter first so the mode radio
+        // reflects the click immediately (otherwise presenter wins composite).
+        if presenterModeActive { setPresenter(on: false) }
+        requestVoiceMode("active")
+    }
+
+    @objc func switchToMeeting() {
+        if presenterModeActive { setPresenter(on: false) }
+        requestVoiceMode("meeting")
+    }
+
+    @objc func switchToPresenter() {
+        setPresenter(on: true)
+    }
+
+    func setPresenter(on: Bool) {
+        let target = on ? "on" : "off"
+        guard let url = URL(string: "http://localhost:7877/presenter/\(target)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 1.0
+        URLSession.shared.dataTask(with: req) { _, _, err in
+            if let err = err {
+                NSLog("Sutando: presenter toggle failed: \(err.localizedDescription)")
+            }
+        }.resume()
+    }
+
+    @objc func togglePresenterMode() {
+        // Flip server-side state; the 1s pollPresenterMode tick will refresh
+        // menu title + avatar badge once the POST returns.
+        let target = presenterModeActive ? "off" : "on"
+        guard let url = URL(string: "http://localhost:7877/presenter/\(target)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 1.0
+        URLSession.shared.dataTask(with: req) { _, _, err in
+            if let err = err {
+                NSLog("Sutando: presenter toggle failed: \(err.localizedDescription)")
+            }
+        }.resume()
+    }
+
+    func pollPresenterMode() {
+        guard let url = URL(string: "http://localhost:7877/presenter") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 0.8
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+            guard let self = self else { return }
+            var active = false
+            if let data = data, error == nil,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                active = (json["active"] as? Bool) ?? false
+            }
+            DispatchQueue.main.async {
+                guard self.presenterModeActive != active else { return }
+                self.presenterModeActive = active
+                self.presenterMenuItem?.title = active ? "● Presenter: ON (click to turn off)" : "Presenter: OFF (click to turn on)"
+                self.updateModeMenuItem()
+                // Avatar badge re-renders on next pollMuteState tick (≤1s).
+            }
+        }
+        task.resume()
+    }
+
+    func pollVoiceMode() {
+        // Read state/voice-mode.txt sentinel written by voice-agent.ts.
+        // Falls back to "active" if file missing (first boot / voice-agent down).
+        let sentinel = workspace + "/state/voice-mode.txt"
+        var newMode = "active"
+        if let contents = try? String(contentsOfFile: sentinel, encoding: .utf8) {
+            let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "meeting" || trimmed == "active" {
+                newMode = trimmed
+            }
+        }
+        DispatchQueue.main.async {
+            guard self.voiceMode != newMode else { return }
+            self.voiceMode = newMode
+            self.updateModeMenuItem()
+        }
+    }
+
+    func updateModeMenuItem() {
+        // Composite: presenter > meeting > active (higher priority wins).
+        // Radio-style marker: ● on the active item, "  " (two spaces) on
+        // the others to keep titles aligned.
+        let active: String
+        if presenterModeActive { active = "presenter" }
+        else if voiceMode == "meeting" { active = "meeting" }
+        else { active = "active" }
+        modeActiveMenuItem?.title    = (active == "active"    ? "● " : "  ") + "Mode: Active"
+        modeMeetingMenuItem?.title   = (active == "meeting"   ? "● " : "  ") + "Mode: Meeting"
+        modePresenterMenuItem?.title = (active == "presenter" ? "● " : "  ") + "Mode: Presenter"
+    }
+
+    /// The sole liveness probe. A prior `pgrep -f watch-tasks` primary probe
+    /// fail-opened on any argv merely mentioning the substring (review #4269,
+    /// 2026-09-16) — removed rather than re-anchored, so there is exactly one
+    /// boundary check (`watcherLineMatches`) to keep correct, not two.
+    func watcherProcessSeen() -> Bool? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        // pid,command (not bare command): excluding OUR OWN pid needs it, since
+        // "ugrep ... watch-tasks-stream.sh" is itself a process whose argv mentions the marker.
+        ps.arguments = ["-axo", "pid,command"]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = FileHandle.nullDevice
+        do { try ps.run() } catch { return nil }
+        // Drain BEFORE waiting: this listing exceeds the 64 KiB pipe buffer, so
+        // waiting first deadlocks ps on write against a main thread that never reads.
+        let out = psPipe.fileHandleForReading.readDataToEndOfFile()
+        ps.waitUntilExit()
+        // A failed ps must read as unknown -- an empty listing from a
+        // non-zero exit is not a clean "no match" (the sysmond-unreachable
+        // case this whole probe exists to not misread as "dead", #4269).
+        if ps.terminationStatus != 0 {
+            logToFile("checkWatcher: ps unavailable (rc=\(ps.terminationStatus)) — not alerting on an unknown")
+            return nil
+        }
+        let listing = String(data: out, encoding: .utf8) ?? ""
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        let myInbox = canonicalInbox(ProcessInfo.processInfo.environment["SUTANDO_TASKS_DIR"] ?? workspace + "/tasks")
+        // A tagged line answers by its inbox: this core's own is alive, another
+        // instance's is foreign. A bare two-token line has no operand, so it is a
+        // pre-upgrade watcher of this core, not a worker's: alive, never a relaunch.
+        var sawUndecidable = false
+        var sawForeignWatcher = false
+        for line in listing.split(separator: "\n") {
+            switch watcherLineMatches(line, excluding: selfPID) {
+            case .some(true): return true
+            case .none:
+                guard let tagged = sessionWatcherInboxTag(line) else {
+                    sawUndecidable = true
+                    continue
+                }
+                if tagged == myInbox { return true }
+                sawForeignWatcher = true
+            case .some(false): continue
+            }
+        }
+        if sawUndecidable { return nil }
+        if sawForeignWatcher {
+            logToFile("checkWatcher: session watcher(s) seen for other inboxes only, none for \(myInbox) -- not this core's")
+        }
+        return false
+    }
+
+    /// True when `s` contains the watcher script's name at a path/whitespace
+    /// boundary on both sides.
+    private func matchesWatcherScriptAtBoundary(_ s: Substring) -> Bool {
+        let marker = "watch-tasks-stream.sh"
+        var searchRange = s.startIndex..<s.endIndex
+        while let r = s.range(of: marker, range: searchRange) {
+            let before = r.lowerBound == s.startIndex || s[s.index(before: r.lowerBound)] == " " || s[s.index(before: r.lowerBound)] == "/"
+            let after = r.upperBound == s.endIndex || s[r.upperBound] == " "
+            if before && after { return true }
+            searchRange = r.upperBound..<s.endIndex
+        }
+        return false
+    }
+
+    /// Confirms the argv EXECUTES the watcher script (shell + script at argv[1]),
+    /// returning `nil` rather than `false` when extra tokens make that undecidable.
+    /// A bare-`true` here says a watcher with no operand runs; which inbox a
+    /// tagged (multi-token) line serves is `watcherProcessSeen`'s question.
+    private func watcherLineMatches(_ line: Substring, excluding selfPID: Int32) -> Bool? {
+        let watcherShells: Set<String> = ["sh", "bash", "zsh", "ksh"]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return false }
+        guard let linePID = Int32(trimmed[trimmed.startIndex..<spaceIdx]), linePID != selfPID else { return false }
+        let command = trimmed[trimmed.index(after: spaceIdx)...]
+        let parts = command.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return false }
+        guard watcherShells.contains(String(parts[0].split(separator: "/").last ?? parts[0])) else { return false }
+        guard !parts[1].hasPrefix("-") else { return false }
+        // A match here is definite only at exactly 2 tokens -- more tokens could
+        // be a real pathname continuing past a space, so that's undecidable.
+        if matchesWatcherScriptAtBoundary(parts[1]) {
+            return parts.count == 2 ? true : nil
+        }
+        if parts.count == 2 { return false }
+        // A spaced script path is indistinguishable from a script plus arguments.
+        return matchesWatcherScriptAtBoundary(command) ? nil : false
+    }
+
+    /// The `--inbox` of a line tagged `--role session`, canonicalized, or nil when
+    /// either tag is absent. The value runs to the next `--flag` or the end of the
+    /// line, so a directory with a space in its path survives the flattened argv.
+    private func sessionWatcherInboxTag(_ line: Substring) -> String? {
+        let text = String(line)
+        guard let role = flagValue("role", in: text), role == "session" else { return nil }
+        guard let inbox = flagValue("inbox", in: text), !inbox.isEmpty else { return nil }
+        return canonicalInbox(inbox)
+    }
+
+    /// `--name value` or `--name=value` out of a flattened argv; nil when absent.
+    private func flagValue(_ name: String, in text: String) -> String? {
+        let pattern = "--" + name + "(?:=|\\s+)(.+?)(?=\\s+--[a-z]|\\s*$)"
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let r = Range(m.range(at: 1), in: text) else { return nil }
+        return text[r].trimmingCharacters(in: .whitespaces)
+    }
+
+    /// One spelling per inbox: symlinks resolved, trailing and doubled slashes gone,
+    /// so the same directory written two ways never reads as two inboxes.
+    private func canonicalInbox(_ path: String) -> String {
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
+    }
+
+    /// Both halves are Claude-only. Dispatching against a live non-Claude
+    /// session isn't a no-op like the old keystroke — the launcher's healing
+    /// path would spawn a second core window.
+    func checkWatcher() {
+        guard let rt = sessionCoreRuntime() else {
+            logToFile("checkWatcher: session runtime unresolved — not repairing a session whose runtime is unknown")
+            return
+        }
+        if rt != "claude" { return }
+
+        switch watcherProcessSeen() {
+        case .some(true): return  // watcher alive
+        case .none:
+            logToFile("checkWatcher: ps could not answer — not alerting on an unknown")
+            return
+        case .some(false): break
+        }
+
+        // Pinned to the runtime `rt` just confirmed, so the dispatcher's own
+        // config-drift check can't force a --restart on top of this.
+        logToFile("checkWatcher: watcher dead — repairing via start-cli.sh")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh",
+                      args: ["--runtime", "claude"],
+                      okMessage: "Task watcher was down — repaired via the core launcher.",
+                      failVerb: "Task watcher repair")
+    }
+
+    /// Per-host label for `hosts/<host>/` paths. Lockstep with `_host_label()`
+    /// (src/util_paths.py) and `_host()` (scripts/sync-workspace.sh):
+    /// $SUTANDO_HOST_LABEL > scutil LocalHostName (stable) > short hostname
+    /// (a raw hostname can DHCP-drift, e.g. Comcast → Chis-MBP, splitting
+    /// per-host paths from the scutil-named Chis-MacBook-Pro subtree; #1745).
+    func perHostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        // `!v.isEmpty` is false for "   ", so a blank-but-set override became the
+        // label and produced `hosts/   /`. Trim first; blank means unset, same as
+        // the scutil branch below already does. Lockstep with util_paths.py/.ts.
+        if let v = (env["SUTANDO_HOST_LABEL"] ?? env["SUTANDO_HOST_OVERRIDE"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+            return v
+        }
+        if let lhn = runShell("/usr/sbin/scutil", ["--get", "LocalHostName"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !lhn.isEmpty {
+            return lhn
+        }
+        let host = ProcessInfo.processInfo.hostName
+        return host.split(separator: ".").first.map(String.init) ?? host
+    }
+
+    /// Resolve a per-host workspace file: prefer `<workspace>/hosts/<host>/<name>`
+    /// (the #1717 per-host home the writers target), fall back to the flat
+    /// `<workspace>/<name>` for un-migrated layouts. Mirrors personal_path()'s
+    /// read-side probe order (#1718).
+    func perHostPath(_ name: String) -> String {
+        let perHost = workspace + "/hosts/" + perHostLabel() + "/" + name
+        if FileManager.default.fileExists(atPath: perHost) { return perHost }
+        return workspace + "/" + name
+    }
+
+    /// Refresh `contextual-chips.json` from cheap mechanical sources. No LLM
+    /// round-trip — just shell-out to `gh pr list`, read top `## Title` line
+    /// of `pending-questions.md`, scan `results/` for unread items. Atomic
+    /// write via tmp + replaceItem. Fires every 120s + once at startup. The
+    /// web UI polls the file and pins matching chips at the top of the
+    /// starter tab.
+    func refreshContextualChips() {
+        // Skip when loop is paused — quiets the menu bar during a meeting /
+        // dinner break. Guard at the function body (not just Timer
+        // callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
+        var chips: [[String: String]] = []
+
+        // 1. Open PRs authored by sonichi (both bots commit under this account).
+        // Resolve gh path explicitly — apps launched via `open` inherit a
+        // minimal PATH (no /opt/homebrew or /usr/local) so `/usr/bin/env gh`
+        // wouldn't find the binary. Fall through Apple-Silicon then Intel.
+        let ghPath: String? = {
+            for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+                if FileManager.default.fileExists(atPath: p) { return p }
+            }
+            return nil
+        }()
+        if let gh = ghPath,
+           // Pass --repo explicitly: the app's CWD when launched via `open`
+           // is the user's home directory (not a git repo), so without
+           // --repo, gh fails with "fatal: not a git repository".
+           // No --author filter — community PRs (e.g. #594 Jason, #593 Vasiliy)
+           // are also chip-worthy. Both bots commit as sonichi so this still
+           // surfaces fleet PRs, plus catches external contributions for triage.
+           let prJSON = runShell(gh, ["pr", "list", "--repo", "sonichi/sutando", "--state", "open", "--limit", "5", "--json", "number,title"]),
+           let prData = prJSON.data(using: .utf8),
+           let prs = try? JSONSerialization.jsonObject(with: prData) as? [[String: Any]] {
+            for pr in prs.prefix(3) {
+                let n = (pr["number"] as? NSNumber)?.intValue
+                if let n = n, let t = pr["title"] as? String {
+                    let title = t.count > 60 ? String(t.prefix(57)) + "..." : t
+                    chips.append(["label": "Review PR #\(n)", "desc": title])
+                }
+            }
+        }
+
+        // 2. Top pending question (read first `## Title` line of pending-questions.md).
+        // pending-questions.md is per-host (hosts/<host>/, #1717 F1) — probe there
+        // first so the chip reflects THIS host's questions, not a stale flat-root copy.
+        let pqPath = perHostPath("pending-questions.md")
+        if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
+            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
+            for line in pq.split(separator: "\n") {
+                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
+                    let title = String(line.dropFirst(3))
+                    let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
+                    chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
+                    break
+                }
+            }
+        }
+
+        // 3. Most recent unread result (results/task-*.txt newest mtime).
+        let resultsDir = workspace + "/results"
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: resultsDir) {
+            let taskResults = entries
+                .filter { $0.hasPrefix("task-") && $0.hasSuffix(".txt") }
+                .compactMap { name -> (String, Date)? in
+                    let path = resultsDir + "/" + name
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                          let mtime = attrs[.modificationDate] as? Date else { return nil }
+                    return (name, mtime)
+                }
+                .sorted { $0.1 > $1.1 }
+            if let latest = taskResults.first {
+                // Only show if it landed in the last 10 minutes — older
+                // results are no longer "unread" by reasonable definition.
+                if Date().timeIntervalSince(latest.1) < 600 {
+                    chips.append(["label": "Recent result", "desc": latest.0])
+                }
+            }
+        }
+
+        // Serialize + atomic write via tmp+replaceItem. Status files live under
+        // <workspace>/state/ (the workspace root is structural — directories only).
+        let payload: [String: Any] = ["chips": chips, "ts": Int(Date().timeIntervalSince1970)]
+        guard let json = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/contextual-chips.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/contextual-chips.json.tmp")
+        do {
+            try json.write(to: tmp, options: [.atomic])
+            _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+        } catch {
+            // Best-effort. Cleanup tmp if rename failed.
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
+    /// Run an executable, capture stdout as String. Returns nil on failure
+    /// or non-zero exit. Used by refreshContextualChips for `gh` / `gws` /
+    /// other CLI shell-outs that are mechanical and need no LLM judgment.
+    func runShell(_ path: String, _ args: [String]) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        // Inherit parent env; also force PATH to include homebrew so child
+        // tools that themselves shell-out (e.g. `gh` invoking `git`) find
+        // their own deps. Apps launched via `open` get a minimal PATH
+        // that excludes /opt/homebrew/bin → gh can't find git → exits non-zero.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        proc.environment = env
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return nil }
+        proc.waitUntilExit()
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        // errData is intentionally read to drain the pipe (avoid SIGPIPE)
+        // even though we don't surface it on success.
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if proc.terminationStatus != 0 { return nil }
+        return String(data: outData, encoding: .utf8)
+    }
+
+    /// Thin caller: the resolution itself lives in SutandoConfig beside
+    /// `resolveCoreRuntime`, so one type owns "which runtime" and it is testable.
+    func sessionCoreRuntime() -> String? {
+        SutandoConfig.sessionCoreRuntime(socket: sutandoTmuxSocket, repoRoot: repoRoot)
+    }
+
+    /// Return the avatar image, badged per composite mode:
+    ///   presenter  → purple dot (#6a1b9a), matches web UI presenter badge
+    ///   meeting    → amber dot  (#b26a00), matches web UI meeting badge
+    ///   active     → no badge
+    /// Composited onto the top-right corner of the 18×18 avatar so the
+    /// menu bar continuously signals mode without taking an extra slot.
+    func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
+        let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
+        guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
+        base.size = NSSize(width: 18, height: 18)
+        base.isTemplate = false
+        // Composite priority: presenter > meeting > active (none).
+        let dotColor: NSColor?
+        if presenterActive {
+            dotColor = NSColor(red: 0.416, green: 0.106, blue: 0.604, alpha: 1.0)  // purple
+        } else if meetingActive {
+            dotColor = NSColor(red: 0.698, green: 0.416, blue: 0.0, alpha: 1.0)  // amber
+        } else {
+            dotColor = nil
+        }
+        guard let color = dotColor else { return base }
+        let result = NSImage(size: base.size)
+        result.lockFocus()
+        base.draw(in: NSRect(origin: .zero, size: base.size))
+        let dotR: CGFloat = 4.5
+        let dotRect = NSRect(x: base.size.width - dotR * 2 - 0.5, y: base.size.height - dotR * 2 - 0.5, width: dotR * 2, height: dotR * 2)
+        color.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        NSColor.white.setStroke()
+        let stroke = NSBezierPath(ovalIn: dotRect)
+        stroke.lineWidth = 0.8
+        stroke.stroke()
+        result.unlockFocus()
+        result.isTemplate = false
+        return result
+    }
+
+    func pollMuteState() {
+        guard let url = URL(string: "http://localhost:8080/sse-status") else { return }
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            guard let data = data, error == nil,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let isMuted = json["muted"] as? Bool ?? false
+            let isVoiceConnected = json["voiceConnected"] as? Bool ?? false
+            // `state` added by PR #418. Absent on pre-#418 servers → default 'idle'.
+            let agentState = (json["state"] as? String) ?? "idle"
+            // `label` added 2026-04-18 per Chi's "running a tool is not precise":
+            // optional specific tool name or core-status step.
+            let label = (json["label"] as? String) ?? ""
+            DispatchQueue.main.async {
+                guard let self = self, let button = self.statusItem.button else { return }
+                if isVoiceConnected && isMuted {
+                    // Voice active + muted: show mute indicator; stop any animation.
+                    // Reset cache so un-mute re-triggers animation if agent is
+                    // still non-idle (otherwise the transition guard below would
+                    // skip startAnimation() and leave the menu bar statically
+                    // dim until the NEXT semantic state change).
+                    button.title = "🔇"
+                    button.image = nil
+                    button.toolTip = "Sutando — muted"
+                    self.stopAnimation()
+                    self.currentAgentState = "idle"
+                } else {
+                    // Default state (disconnected or unmuted): show avatar
+                    // (badged with a purple dot when presenter mode is active).
+                    if let image = self.avatarImage(presenterActive: self.presenterModeActive, meetingActive: self.voiceMode == "meeting") {
+                        button.image = image
+                        button.title = ""
+                    } else {
+                        button.title = "S"
+                    }
+                    button.toolTip = self.tooltipFor(state: agentState, muted: isMuted, voiceConnected: isVoiceConnected, label: label)
+                    // When voice is disconnected, only tool-track states
+                    // (working / seeing) keep animating — those come from
+                    // server-side tool code and mean the core loop or a
+                    // screen capture is genuinely doing something. Browser-
+                    // track states (listening / speaking) depend on a live
+                    // WebSocket and would otherwise animate on stale cached
+                    // state. Keeps "the agent is working" visible when
+                    // voice is off while fixing the "disconnected but
+                    // blinking on stale listening" bug.
+                    let effectiveState: String
+                    if !isVoiceConnected && (agentState == "listening" || agentState == "speaking") {
+                        effectiveState = "idle"
+                    } else {
+                        effectiveState = agentState
+                    }
+                    if self.currentAgentState != effectiveState {
+                        self.currentAgentState = effectiveState
+                        if effectiveState == "idle" {
+                            self.stopAnimation()
+                        } else {
+                            self.startAnimation(for: effectiveState)
+                        }
+                    }
+                }
+            }
+        }
+        task.resume()
+    }
+
+    /// Start an opacity pulse with timing tuned to the current agent state.
+    /// Each non-idle state gets a distinct signature — interval (speed) +
+    /// low opacity (swing depth) — so the menu bar conveys what the agent
+    /// is doing without tab-switching.
+    ///
+    ///   listening  — 0.30s tick, 0.45↔1.00 (gentle slow pulse)
+    ///   speaking   — 0.15s tick, 0.70↔1.00 (rapid subtle pulse)
+    ///   working    — 0.50s tick, 0.25↔1.00 (slow deep swing, "thinking")
+    ///   seeing     — 0.10s tick, 0.55↔1.00 (very fast, "scanning")
+    ///
+    /// Called on every non-idle state transition (including non-idle →
+    /// different non-idle), so the timer is rebuilt with the new signature
+    /// whenever the agent state changes.
+    func startAnimation(for state: String) {
+        animationTimer?.invalidate()
+        animationPhase = 1.0
+
+        let interval: TimeInterval
+        let lowAlpha: CGFloat
+        switch state {
+        case "speaking":
+            interval = 0.15
+            lowAlpha = 0.70
+        case "working":
+            interval = 0.50
+            lowAlpha = 0.25
+        case "seeing":
+            interval = 0.10
+            lowAlpha = 0.55
+        default: // "listening" and any future non-idle state
+            interval = 0.30
+            lowAlpha = 0.45
+        }
+
+        animationTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self, let button = self.statusItem.button else { return }
+            let midpoint = (lowAlpha + 1.0) / 2.0
+            self.animationPhase = self.animationPhase > midpoint ? lowAlpha : 1.0
+            button.alphaValue = self.animationPhase
+        }
+    }
+
+    /// Human-readable tooltip for the menu bar icon. Shows the current
+    /// semantic state on hover so the user can verify the visual without
+    /// guessing which pulse they're seeing.
+    func tooltipFor(state: String, muted: Bool, voiceConnected: Bool, label: String = "") -> String {
+        // Tool-track states (working / seeing) describe real server-side
+        // activity and apply whether voice is up or not. Showing "voice
+        // disconnected" while the icon is pulsing working is misleading —
+        // the pulse and the tooltip must tell the same story. When a
+        // specific label is provided (tool name or core-status step),
+        // it replaces the generic "a tool" text per Chi's "running a
+        // tool is not precise" ask.
+        let voiceSuffix = voiceConnected ? "" : " (voice off)"
+        switch state {
+        case "working":
+            let what = label.isEmpty ? "a tool" : label
+            return "Sutando — running \(what)\(voiceSuffix)"
+        case "seeing":
+            let what = label.isEmpty ? "your screen" : label
+            return "Sutando — reading \(what)\(voiceSuffix)"
+        default: break
+        }
+        if !voiceConnected { return "Sutando — voice disconnected" }
+        if muted { return "Sutando — muted" }
+        switch state {
+        case "listening": return "Sutando — listening"
+        case "speaking":  return "Sutando — speaking"
+        case "idle":      return "Sutando — idle"
+        default:          return "Sutando — \(state)"
+        }
+    }
+
+    /// Stop the pulse and restore full opacity. Idempotent.
+    func stopAnimation() {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        animationPhase = 1.0
+        statusItem?.button?.alphaValue = 1.0
+    }
+
+    // MARK: - Configurable Global Hotkeys
+
+    /// Map a single-letter key name to a Carbon kVK_* virtual keycode.
+    /// Add more entries as needed.
+    private static let keyNameToCode: [String: Int] = [
+        "A": kVK_ANSI_A, "B": kVK_ANSI_B, "C": kVK_ANSI_C, "D": kVK_ANSI_D,
+        "E": kVK_ANSI_E, "F": kVK_ANSI_F, "G": kVK_ANSI_G, "H": kVK_ANSI_H,
+        "I": kVK_ANSI_I, "J": kVK_ANSI_J, "K": kVK_ANSI_K, "L": kVK_ANSI_L,
+        "M": kVK_ANSI_M, "N": kVK_ANSI_N, "O": kVK_ANSI_O, "P": kVK_ANSI_P,
+        "Q": kVK_ANSI_Q, "R": kVK_ANSI_R, "S": kVK_ANSI_S, "T": kVK_ANSI_T,
+        "U": kVK_ANSI_U, "V": kVK_ANSI_V, "W": kVK_ANSI_W, "X": kVK_ANSI_X,
+        "Y": kVK_ANSI_Y, "Z": kVK_ANSI_Z,
+    ]
+
+    /// Map a modifier name to its Carbon mask.
+    private static let modifierNameToMask: [String: Int] = [
+        "control": controlKey, "ctrl": controlKey, "⌃": controlKey,
+        "option":  optionKey,  "alt":  optionKey,  "⌥": optionKey,
+        "command": cmdKey,     "cmd":  cmdKey,     "⌘": cmdKey,
+        "shift":   shiftKey,   "⇧": shiftKey,
+    ]
+
+    /// Default hotkey config used when ~/.config/sutando/hotkeys.json is missing.
+    /// Keys: action name → (key letter, modifier names).
+    private static let defaultHotkeys: [(action: String, key: String, modifiers: [String])] = [
+        // ⌃C / ⌃R avoided: they shadow terminal SIGINT and reverse-i-search.
+        // Use ⌃⇧C / ⌃⇧R so plain ⌃C/⌃R still reach the terminal (global
+        // hotkeys match the exact modifier mask, so the shifted variants
+        // never swallow the unshifted keys).
+        ("drop_context",     "C", ["control", "shift"]),
+        ("drop_screenshot",  "S", ["control"]),
+        ("drop_video_clip",  "R", ["control", "shift"]),
+        ("toggle_voice",     "V", ["control"]),
+        ("toggle_mute",      "M", ["control"]),
+    ]
+
+    private func loadHotkeyConfig() -> [(action: String, key: String, modifiers: [String])] {
+        let configPath = NSString(string: "~/.config/sutando/hotkeys.json").expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            logToFile("loadHotkeyConfig: no config at \(configPath), using defaults")
+            return AppDelegate.defaultHotkeys
+        }
+        var result: [(String, String, [String])] = []
+        for (action, value) in json {
+            guard let entry = value as? [String: Any],
+                  let key = entry["key"] as? String,
+                  let mods = entry["modifiers"] as? [String] else {
+                logToFile("loadHotkeyConfig: skipping malformed entry for action=\(action)")
+                continue
+            }
+            result.append((action, key.uppercased(), mods))
+        }
+        if result.isEmpty {
+            logToFile("loadHotkeyConfig: empty/unreadable config, using defaults")
+            return AppDelegate.defaultHotkeys
+        }
+        logToFile("loadHotkeyConfig: loaded \(result.count) hotkeys from \(configPath)")
+        return result
+    }
+
+    private func modifierMask(from names: [String]) -> UInt32 {
+        var mask = 0
+        for n in names {
+            if let m = AppDelegate.modifierNameToMask[n.lowercased()] {
+                mask |= m
+            }
+        }
+        return UInt32(mask)
+    }
+
+    private func displayLabel(key: String, modifiers: [String]) -> String {
+        let modSymbols = modifiers.map { name -> String in
+            switch name.lowercased() {
+            case "control", "ctrl": return "⌃"
+            case "option", "alt":   return "⌥"
+            case "command", "cmd":  return "⌘"
+            case "shift":           return "⇧"
+            default: return name
+            }
+        }.joined()
+        return "\(modSymbols)\(key)"
+    }
+
+    /// Publish the resolved hotkeys to `<workspace>/state/hotkeys.json` so the
+    /// web UI + dashboard render the real bindings instead of hardcoding their
+    /// own copies (which drifted — this is the single source they read). Same
+    /// atomic tmp+replace as the status-file writers above.
+    private func publishHotkeys(_ hotkeys: [(action: String, key: String, modifiers: [String])]) {
+        let entries = hotkeys.map { hk in
+            ["action": hk.action,
+             "label": displayLabel(key: hk.key, modifiers: hk.modifiers),
+             "key": hk.key,
+             "modifiers": hk.modifiers] as [String: Any]
+        }
+        guard let json = try? JSONSerialization.data(withJSONObject: entries, options: [.prettyPrinted]) else { return }
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let dst = URL(fileURLWithPath: stateDir + "/hotkeys.json")
+        let tmp = URL(fileURLWithPath: stateDir + "/hotkeys.json.tmp")
+        do {
+            try json.write(to: tmp, options: [.atomic])
+            _ = try FileManager.default.replaceItemAt(dst, withItemAt: tmp)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+
+    func registerHotKey() {
+        let hotkeys = loadHotkeyConfig()
+        publishHotkeys(hotkeys)
+        var statuses: [String] = []
+        for (idx, hk) in hotkeys.enumerated() {
+            guard let keyCode = AppDelegate.keyNameToCode[hk.key] else {
+                logToFile("registerHotKey: unknown key '\(hk.key)' for action=\(hk.action)")
+                continue
+            }
+            let id = UInt32(idx + 1)
+            var hotKeyID = EventHotKeyID()
+            hotKeyID.signature = OSType(0x5355_5444) // "SUTD"
+            hotKeyID.id = id
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(
+                UInt32(keyCode),
+                modifierMask(from: hk.modifiers),
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &ref
+            )
+            if status != noErr {
+                let label = displayLabel(key: hk.key, modifiers: hk.modifiers)
+                notify("Sutando", "Failed to register \(label) hotkey for \(hk.action) (error \(status))")
+                statuses.append("\(hk.action)=\(status)")
+                continue
+            }
+            hotKeyRefs.append(ref)
+            hotKeyActions[id] = hk.action
+            statuses.append("\(hk.action)=ok")
+        }
+        logToFile("registerHotKey: \(statuses.joined(separator: " "))")
+
+        // Install handler — dispatch by action name from the config map.
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event!, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            let appDelegate = NSApplication.shared.delegate as! AppDelegate
+            let action = appDelegate.hotKeyActions[hotKeyID.id] ?? "unknown"
+            appDelegate.logToFile("HOTKEY FIRED: id=\(hotKeyID.id) action=\(action)")
+            switch action {
+            case "drop_context":    appDelegate.dropContext()
+            case "drop_screenshot": appDelegate.dropScreenshot()
+            case "drop_video_clip": appDelegate.dropVideoClip()
+            case "toggle_voice":    appDelegate.toggleVoice()
+            case "toggle_mute":     appDelegate.toggleMute()
+            default: break
+            }
+            return noErr
+        }, 1, &eventType, nil, nil)
+    }
+
+    // MARK: - Context Drop Logic
+
+    /// Capture frontmost-app context to enrich the dropped task with what the user was looking at.
+    /// Returns three fields: app name, frontmost-window title (via Accessibility API), and Chrome
+    /// active-tab URL when Chrome is the target. Same skip-Zoom heuristic as the fullscreen tool —
+    /// during screen share, Zoom can be frontmost while the user is interacting with another window;
+    /// we walk back to the next non-Zoom visible app so the captured context matches user intent.
+    private func getFrontmostContext() -> (app: String?, windowTitle: String?, chromeURL: String?) {
+        var targetApp: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+        let frontName = targetApp?.localizedName?.lowercased() ?? ""
+        if frontName.contains("zoom") {
+            // Skip Zoom; pick the next visible regular (non-background) app.
+            let candidates = NSWorkspace.shared.runningApplications.filter { app in
+                app.activationPolicy == .regular &&
+                !(app.localizedName?.lowercased().contains("zoom") ?? false) &&
+                app.localizedName != nil
+            }
+            // Order by launch date descending — the user's most recent non-Zoom app is the best guess.
+            targetApp = candidates.max(by: { ($0.launchDate ?? Date.distantPast) < ($1.launchDate ?? Date.distantPast) })
+        }
+        let appName = targetApp?.localizedName
+
+        // Window title via Accessibility API. Requires PID; cheap if granted, silent fail otherwise.
+        var windowTitle: String? = nil
+        if let pid = targetApp?.processIdentifier {
+            let axApp = AXUIElementCreateApplication(pid)
+            var focusedRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+               let axWindow = focusedRef {
+                var titleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let title = titleRef as? String, !title.isEmpty {
+                    windowTitle = title
+                }
+            }
+        }
+
+        // Chrome active-tab URL via AppleScript — only when Chrome is the target. ~200ms.
+        var chromeURL: String? = nil
+        if appName == "Google Chrome" {
+            let script = "tell application \"Google Chrome\" to return URL of active tab of front window"
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let url = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let url = url, !url.isEmpty { chromeURL = url }
+                }
+            } catch {}
+        }
+
+        return (appName, windowTitle, chromeURL)
+    }
+
+    /// Format the frontmost-context fields as YAML-style header lines for the task file.
+    /// Empty if no fields captured. Lines are intentionally outside the `---` separator so
+    /// downstream readers can grep them as task metadata, not message body.
+    private func formatFrontmostContext(_ ctx: (app: String?, windowTitle: String?, chromeURL: String?)) -> String {
+        var lines: [String] = []
+        if let a = ctx.app { lines.append("top_app: \(a)") }
+        if let w = ctx.windowTitle { lines.append("top_window_title: \(w)") }
+        if let u = ctx.chromeURL { lines.append("top_url: \(u)") }
+        return lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    }
+
+    @objc func dropContext() {
+        // Debounce: ignore if less than 1 second since last drop
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropContext: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+        let epoch = Int(Date().timeIntervalSince1970 * 1000)
+        let dropImage = tasksDir + "/image-\(epoch).png"
+
+        // Capture frontmost-app context once, before the type-specific branches. Adds top_app /
+        // top_window_title / top_url (Chrome only) header lines so the core agent knows what the
+        // user was looking at when they dropped.
+        let ctx = getFrontmostContext()
+        let ctxHeader = formatFrontmostContext(ctx)
+
+        // 1. Check Finder selection (only if Finder is frontmost)
+        if let frontApp = NSWorkspace.shared.frontmostApplication,
+           frontApp.bundleIdentifier == "com.apple.finder" {
+            let finderFiles = getFinderSelection()
+            if finderFiles.count == 1 {
+                let finderFile = finderFiles[0]
+                let content = """
+                timestamp: \(timestamp)
+                type: file
+                path: \(finderFile)
+                \(ctxHeader)---
+                [File selected in Finder: \(finderFile)]
+                """
+                appendLog(logFile, "[\(timestamp)] Dropped: file (\(finderFile))")
+                writeTask(tasksDir, timestamp: timestamp, content: content)
+                notify("Sutando", "File dropped: \(URL(fileURLWithPath: finderFile).lastPathComponent)")
+                return
+            } else if finderFiles.count > 1 {
+                // Emit JSON-array on the `paths:` line for unambiguous parsing
+                // (handles paths with spaces, colons, etc. without YAML lib).
+                // Body trailer keeps a human-readable multi-line list.
+                let pathsJSON: String = {
+                    let data = try? JSONSerialization.data(withJSONObject: finderFiles, options: [])
+                    return data.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+                }()
+                let humanList = finderFiles.map { "  - \($0)" }.joined(separator: "\n")
+                let content = """
+                timestamp: \(timestamp)
+                type: files
+                paths: \(pathsJSON)
+                \(ctxHeader)---
+                [Files selected in Finder: \(finderFiles.count) files]
+                \(humanList)
+                """
+                appendLog(logFile, "[\(timestamp)] Dropped: \(finderFiles.count) files")
+                writeTask(tasksDir, timestamp: timestamp, content: content)
+                notify("Sutando", "\(finderFiles.count) files dropped")
+                return
+            }
+        }
+
+        // Drop-resolution chain. All text paths run before any image path so
+        // lingering clipboard screenshots don't pre-empt selected-text drops.
+        //
+        // Text-emit helper — captures the AX/clipboard metadata block if
+        // present, writes the task, notifies. Returns true on success.
+        let emitText: (String, String?, String?, String?, String?, String) -> Void = {
+            [self] (selected, app, windowTitle, urlVal, axPath, source) in
+            var meta: [String] = []
+            if let a = app, !a.isEmpty { meta.append("app: \(a)") }
+            if let w = windowTitle, !w.isEmpty { meta.append("window: \(w)") }
+            if let u = urlVal, !u.isEmpty { meta.append("url: \(u)") }
+            if let p = axPath, !p.isEmpty { meta.append("ax_path: \(p)") }
+            let metaBlock = meta.isEmpty ? "" : meta.joined(separator: "\n") + "\n"
+            let content = """
+            timestamp: \(timestamp)
+            type: text
+            \(metaBlock)\(ctxHeader)---
+            \(selected)
+            """
+            appendLog(logFile, "[\(timestamp)] Dropped: \(selected.count) chars (\(source))")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            let snippet = String(selected.prefix(80)).replacingOccurrences(of: "\n", with: " ")
+            notify("Sutando", "Dropped: \(snippet)\(selected.count > 80 ? "…" : "")")
+        }
+
+        // 2. ax-read (preferred text path; subprocess, has changeCount-safe
+        //    clipboard fallback + restores prior pasteboard).
+        if let axRead = invokeAxRead() {
+            let selected = (axRead["selected"] as? String) ?? ""
+            if !selected.isEmpty {
+                emitText(selected,
+                         axRead["app"] as? String,
+                         axRead["window_title"] as? String,
+                         axRead["url"] as? String,
+                         axRead["path"] as? String,
+                         "ax-read")
+                return
+            }
+        }
+
+        // 3. Legacy in-process AX (fallback when ax-read binary missing).
+        if let selected = getSelectedText(), !selected.isEmpty {
+            emitText(selected, nil, nil, nil, nil, "legacy-ax")
+            return
+        }
+
+        // 4. Legacy Cmd+C simulation with changeCount guard. Async wait so the
+        //    main run loop is free to deliver the synthetic event. If still no
+        //    text after the wait, fall through to image branches and finally
+        //    the interactive screencapture fallback.
+        let pb = NSPasteboard.general
+        let priorChangeCount = pb.changeCount
+        simulateCopy()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+            if pb.changeCount > priorChangeCount,
+               let text = pb.string(forType: .string), !text.isEmpty {
+                emitText(text, nil, nil, nil, nil, "legacy-cmd+c")
+                return
+            }
+
+            // 5. Clipboard PNG.
+            if let imageData = pb.data(forType: .png) {
+                do {
+                    try imageData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(imageData.count) bytes, clipboard-png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(imageData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 6. Clipboard TIFF (some screenshot tools).
+            if let tiffData = pb.data(forType: .tiff),
+               let bitmapRep = NSBitmapImageRep(data: tiffData),
+               let pngData = bitmapRep.representation(using: .png, properties: [:]) {
+                do {
+                    try pngData.write(to: URL(fileURLWithPath: dropImage))
+                    let content = """
+                    timestamp: \(timestamp)
+                    type: image
+                    path: \(dropImage)
+                    \(ctxHeader)---
+                    [Image dropped from clipboard]
+                    """
+                    appendLog(logFile, "[\(timestamp)] Dropped: image (\(pngData.count) bytes, clipboard-tiff→png)")
+                    writeTask(tasksDir, timestamp: timestamp, content: content)
+                    notify("Sutando", "Image dropped (\(pngData.count / 1024)KB)")
+                    return
+                } catch {}
+            }
+
+            // 7. Last resort: interactive region capture. Esc cancels. Run on
+            //    a background queue so the main run loop stays responsive
+            //    while the user drags (waitUntilExit can take many seconds).
+            //    In-flight guard prevents stacked crosshairs from rapid ⌃C.
+            if self.screencaptureInFlight {
+                appendLog(logFile, "[\(timestamp)] screencapture already in flight, skipping")
+                return
+            }
+            self.screencaptureInFlight = true
+            appendLog(logFile, "[\(timestamp)] launching screencapture -i -c")
+            let priorPbChange = pb.changeCount
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { DispatchQueue.main.async { self.screencaptureInFlight = false } }
+                let cap = Process()
+                cap.launchPath = "/usr/sbin/screencapture"
+                cap.arguments = ["-i", "-c"]
+                cap.standardOutput = Pipe()
+                cap.standardError = Pipe()
+                do {
+                    try cap.run()
+                    cap.waitUntilExit()
+                } catch {
+                    DispatchQueue.main.async { [self] in
+                        appendLog(logFile, "[\(timestamp)] screencapture failed: \(error.localizedDescription)")
+                        notify("Sutando", "Nothing selected — screencapture unavailable")
+                    }
+                    return
+                }
+                DispatchQueue.main.async { [self] in
+                    if pb.changeCount > priorPbChange {
+                        if let png = pb.data(forType: .png) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                        if let tiff = pb.data(forType: .tiff),
+                           let rep = NSBitmapImageRep(data: tiff),
+                           let png = rep.representation(using: .png, properties: [:]) {
+                            do {
+                                try png.write(to: URL(fileURLWithPath: dropImage))
+                                let content = """
+                                timestamp: \(timestamp)
+                                type: image
+                                path: \(dropImage)
+                                \(ctxHeader)---
+                                [Image dropped via screen-region capture]
+                                """
+                                appendLog(logFile, "[\(timestamp)] Dropped: image (\(png.count) bytes, screencapture-region tiff→png)")
+                                writeTask(tasksDir, timestamp: timestamp, content: content)
+                                notify("Sutando", "Region captured (\(png.count / 1024)KB)")
+                                return
+                            } catch {}
+                        }
+                    }
+                    notify("Sutando", "Cancelled — nothing dropped")
+                    appendLog(logFile, "[\(timestamp)] cancelled (screencapture esc / no clipboard change)")
+                }
+            }
+        }
+    }
+
+    // MARK: - ax-read subprocess (voice agent's read_selection primitive)
+    //
+    // Resolution order for the binary path:
+    //   1. $SUTANDO_MEMORY_DIR/skills/personal-deictic/ax-read  (private, richer
+    //      — includes screenshot + cursor for deictic phrases)
+    //   2. $SUTANDO_PRIVATE_DIR/skills/personal-deictic/ax-read (legacy alias, PR #876)
+    //   3. <repo>/skills/context-drop/ax-read                    (public fallback,
+    //      text-only — ships in this repo so public-repo installs get the same
+    //      ⌃C experience without needing the private personal-deictic skill)
+    //
+    // Post-v0.3.0 (#1440 + Mini opinion-requested 2026-06-06): the pre-v0.3.0
+    // `~/.sutando/memory-sync/skills/personal-deictic/ax-read` default-private
+    // path is gone — the legacy `.sutando/memory-sync/` clone is deprecated
+    // (sync-memory.sh removed in v0.4.0). $SUTANDO_MEMORY_DIR is honored
+    // explicitly via candidate 1 when set.
+    //
+    // Returns nil when no binary is found; callers fall back to the in-process
+    // legacy AX path.
+
+    func resolveAxReadPath() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        let privateSuffix = "/skills/personal-deictic/ax-read"
+        let candidates = [
+            env["SUTANDO_MEMORY_DIR"].map { $0 + privateSuffix },
+            env["SUTANDO_PRIVATE_DIR"].map { $0 + privateSuffix },
+            repoRoot + "/skills/context-drop/ax-read",
+        ].compactMap { $0 }
+        let fm = FileManager.default
+        for path in candidates {
+            if fm.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    func invokeAxRead() -> [String: Any]? {
+        guard let binPath = resolveAxReadPath() else { return nil }
+        let task = Process()
+        task.launchPath = binPath
+        task.arguments = []
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = errPipe
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+        // 3s deadline matches ax-read's max screencapture timeout (1s) plus
+        // headroom for Cmd+C fallback wait (120ms). Anything longer means the
+        // subprocess is stuck — fall back to legacy.
+        let deadline = Date().addingTimeInterval(3.0)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if task.isRunning {
+            task.terminate()
+            return nil
+        }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+
+    // MARK: - Screenshot Drop (⌥C)
+
+    @objc func dropScreenshot() {
+        // Debounce — share lastDropTime with text drop to avoid rapid triggers
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropScreenshot: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Call screen-capture-server to capture the screen and get the file path back.
+        // Server runs at localhost:7845, default capture is the main display.
+        guard let url = URL(string: "http://localhost:7845/capture") else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        // /capture requires a shared token (same gate as /capture-video).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Screenshot drop failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = json["path"] as? String else {
+                notify("Sutando", "Screenshot drop failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropScreenshot: bad server response")
+                return
+            }
+
+            let content = """
+            timestamp: \(timestamp)
+            type: image
+            path: \(path)
+            ---
+            [Screenshot dropped via ⌥C]
+            """
+            appendLog(logFile, "[\(timestamp)] dropScreenshot: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Screenshot dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
+    }
+
+    @objc func dropVideoClip() {
+        // Records a few seconds of screen and drops the .mov as a task — a short
+        // video repro is far easier to act on than a single still. Mirrors
+        // dropScreenshot but hits /capture-video, which runs `screencapture -v`
+        // on the capture server that holds the Screen Recording permission.
+        let now = Date()
+        if now.timeIntervalSince(lastDropTime) < 1.0 {
+            logToFile("dropVideoClip: debounced (too fast)")
+            return
+        }
+        lastDropTime = now
+
+        let timestamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime, .withSpaceBetweenDateAndTime, .withColonSeparatorInTime])
+        let logFile = workspace + "/logs/context-drop.log"
+        let tasksDir = workspace + "/tasks"
+
+        // Toggle: first ⌃R starts an open-ended recording, second ⌃R stops it and
+        // drops the .mov. User-controlled length beats a fixed duration.
+        let starting = !isRecordingVideo
+        let action = starting ? "start" : "stop"
+        notify("Sutando", starting ? "● Recording screen + mic — press ⌃⇧R again to stop" : "Stopping recording…")
+
+        // User-stopped recordings get the server's 4h cap, not the 600s default (#2279 added ?max; this caller never sent it).
+        let maxParam = starting ? "&max=14400" : ""
+        guard let url = URL(string: "http://localhost:7845/capture-video?action=\(action)\(maxParam)") else { return }
+        var req = URLRequest(url: url)
+        // /capture-video requires a shared token (the server writes it to a 0600
+        // file a web page can't read; a browser also can't set a custom header on
+        // a no-cors/<img> request — so this gate blocks drive-by triggering).
+        let tokenPath = NSString(string: "~/.config/sutando/screen-capture-token").expandingTildeInPath
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Sutando-Capture-Token")
+        }
+        // start returns at once; stop waits for the encoder flush — allow headroom.
+        req.timeoutInterval = 60
+        URLSession.shared.dataTask(with: req) { [self] data, _, error in
+            if let error = error {
+                notify("Sutando", "Video \(action) failed: \(error.localizedDescription)")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): error \(error.localizedDescription)")
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let status = json["status"] as? String else {
+                notify("Sutando", "Video \(action) failed: bad server response")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(\(action)): bad server response")
+                return
+            }
+
+            if starting {
+                // Recording began — flip state; nothing to drop until stop.
+                if status == "recording" || status == "already_recording" {
+                    setRecordingIndicator(true)
+                    appendLog(logFile, "[\(timestamp)] dropVideoClip: recording started")
+                } else {
+                    notify("Sutando", "Couldn't start recording (\(status))")
+                }
+                return
+            }
+
+            // Stopping — flip state and drop the produced clip.
+            setRecordingIndicator(false)
+            guard status == "ok", let path = json["path"] as? String else {
+                notify("Sutando", "Recording stopped, no clip (\(status))")
+                appendLog(logFile, "[\(timestamp)] dropVideoClip(stop): \(status)")
+                return
+            }
+            let content = """
+            timestamp: \(timestamp)
+            type: video
+            path: \(path)
+            ---
+            [Video clip dropped]
+            """
+            appendLog(logFile, "[\(timestamp)] dropVideoClip: \(path)")
+            writeTask(tasksDir, timestamp: timestamp, content: content)
+            notify("Sutando", "Video clip dropped (\(URL(fileURLWithPath: path).lastPathComponent))")
+        }.resume()
+    }
+
+    // MARK: - Voice Toggle
+
+    @objc func toggleVoice() {
+        NSLog("Sutando: toggleVoice called")
+        // NativeMic path is parked — see NativeMic.swift header. Echo cancellation
+        // via voice-processing IO unit fails to initialize the output node on
+        // this hardware (-10875). Re-enable once that's resolved.
+        httpToggle(endpoint: "toggle")
+        openWebUI()
+    }
+
+    @objc func toggleMute() {
+        NSLog("Sutando: toggleMute called")
+        httpToggle(endpoint: "mute")
+    }
+
+    func httpToggle(endpoint: String) {
+        guard let url = URL(string: "http://localhost:8080/\(endpoint)") else { return }
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error {
+                NSLog("Sutando: \(endpoint) failed: \(error.localizedDescription)")
+                // Fallback: open the web UI so user can toggle manually
+                DispatchQueue.main.async {
+                    self.notify("Sutando", "Web client not reachable — open localhost:8080")
+                }
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                NSLog("Sutando: \(endpoint) OK")
+            }
+        }
+        task.resume()
+        NSSound.beep()
+    }
+
+    @objc func openWebUI() {
+        NSLog("Sutando: openWebUI called")
+        // Switch to existing localhost:8080 tab or open new one
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            activate
+            set found to false
+            repeat with w in windows
+                set tabList to tabs of w
+                repeat with i from 1 to count of tabList
+                    if URL of item i of tabList contains "localhost:8080" then
+                        set active tab index of w to i
+                        set index of w to 1
+                        set found to true
+                        exit repeat
+                    end if
+                end repeat
+                if found then exit repeat
+            end repeat
+            if not found then
+                open location "http://localhost:8080"
+            end if
+        end tell
+        """)
+        var error: NSDictionary?
+        script?.executeAndReturnError(&error)
+        if let error = error {
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "unknown error"
+            if msg.contains("not allowed") || msg.contains("permission") {
+                notify("Sutando", "Open Web UI needs: System Settings → Privacy & Security → Automation → allow Sutando to control Chrome")
+            } else {
+                // Fallback: just open the URL directly
+                if let url = URL(string: "http://localhost:8080") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
+    }
+
+    @objc func openCore() {
+        // Open a Terminal window ATTACHED to the core tmux session via a
+        // generated .command file + `open -a Terminal` — the TCC-free path
+        // (sonichi#2410). The old AppleScript raise-by-title was a no-op with
+        // the core detached (no window to find, title never matched, and it
+        // required an Automation grant most installs never made).
+        let socket = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SOCKET"] ?? "/tmp/sutando-tmux.sock"
+        let session = ProcessInfo.processInfo.environment["SUTANDO_TMUX_SESSION"] ?? "sutando-core"
+        let cmdPath = workspace + "/state/attach-core.command"
+        let body = """
+        #!/bin/bash
+        # Auto-generated by Sutando.app Open Core CLI (sonichi#2410) — attaches
+        # this Terminal window to the core session. Safe to re-run; delete freely.
+        exec tmux -S '\(socket)' attach -t '\(session)'
+        """
+        do {
+            try FileManager.default.createDirectory(atPath: workspace + "/state",
+                                                    withIntermediateDirectories: true)
+            try body.write(toFile: cmdPath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cmdPath)
+        } catch {
+            notify("Sutando", "Open Core CLI failed to prepare attach script: \(error.localizedDescription)")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-a", "Terminal", cmdPath]
+        do { try proc.run() } catch {
+            notify("Sutando", "Open Core CLI failed to open Terminal: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func openDashboard() {
+        let script = NSAppleScript(source: """
+        tell application "Google Chrome"
+            activate
+            set found to false
+            repeat with w in windows
+                set tabList to tabs of w
+                repeat with i from 1 to count of tabList
+                    if URL of item i of tabList contains "localhost:7844" then
+                        set active tab index of w to i
+                        set index of w to 1
+                        set found to true
+                        exit repeat
+                    end if
+                end repeat
+                if found then exit repeat
+            end repeat
+            if not found then
+                open location "http://localhost:7844"
+            end if
+        end tell
+        """)
+        script?.executeAndReturnError(nil)
+    }
+
+    // MARK: - Helpers
+
+    func getFinderSelection() -> [String] {
+        let script = """
+        tell application "Finder"
+            try
+                set sel to selection
+                set out to ""
+                repeat with anItem in sel
+                    set out to out & POSIX path of (anItem as alias) & "\n"
+                end repeat
+                return out
+            on error
+                return ""
+            end try
+        end tell
+        """
+        guard let appleScript = NSAppleScript(source: script) else { return [] }
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard let raw = result.stringValue, !raw.isEmpty else { return [] }
+        return raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) }
+    }
+
+    func getSelectedText() -> String? {
+        let systemElement = AXUIElementCreateSystemWide()
+        var focusedElement: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemElement, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
+            return nil
+        }
+        var selectedText: AnyObject?
+        guard AXUIElementCopyAttributeValue(focusedElement as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedText) == .success else {
+            return nil
+        }
+        return selectedText as? String
+    }
+
+    func simulateCopy() {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true) // C key
+        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
+        keyDown?.flags = .maskCommand
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
+    }
+
+    func writeFile(_ path: String, _ content: String) {
+        try? content.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    func appendLog(_ path: String, _ line: String) {
+        // mkdir -p parent so the write doesn't silently drop when the log
+        // dir is missing — same defensive pattern as writeTask (Mini nit #2).
+        let parent = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write((line + "\n").data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            do {
+                try (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                // Last-resort log so disk-full / permission failures aren't
+                // silent (Mini nit #1). logToFile writes to a different dir
+                // so a single-dir failure doesn't cascade.
+                logToFile("appendLog: write failed for \(path) — \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func writeTask(_ tasksDir: String, timestamp: String, content: String) {
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let taskContent = """
+        id: task-\(ts)
+        timestamp: \(ISO8601DateFormatter().string(from: Date()))
+        source: context-drop
+        interaction_type: system_event
+        task: User dropped context via hotkey. Process this:
+        \(content)
+        """
+        let taskPath = tasksDir + "/task-\(ts).txt"
+        // mkdir -p the parent dir to prevent the silent-failure class where
+        // try?-write returns nil and the dropped context vanishes. This was
+        // the bug Chi hit 2026-05-18: workspace var pointed at repo, but
+        // tasks/ had been moved to the workspace dir by PR #762, so
+        // try? write to <repo>/tasks/task-X.txt silently dropped the data.
+        try? FileManager.default.createDirectory(atPath: tasksDir, withIntermediateDirectories: true)
+        do {
+            try taskContent.write(toFile: taskPath, atomically: true, encoding: .utf8)
+        } catch {
+            // disk-full / permission fail (Mini nit #1) — don't lose the
+            // signal silently. Surface to debug log.
+            logToFile("writeTask: write failed for \(taskPath) — \(error.localizedDescription)")
+        }
+    }
+
+    var lastHealthCheckStart: Date = .distantPast
+    func runHealthCheck() {
+        // Skip when loop is paused — health pings during a paused window
+        // would just produce noise. Guard at the function body (not just
+        // Timer callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
+        // Throttle: never more than once per 60s, even if the Timer +
+        // startup-fire happen to align.
+        let now = Date()
+        if now.timeIntervalSince(lastHealthCheckStart) < 60 { return }
+        lastHealthCheckStart = now
+
+        let logPath = workspace + "/logs/health-check.log"
+        let scriptPath = repoRoot + "/src/health-check.py"
+        // $SUTANDO_PY -> bundled runtime -> system python3 only when the
+        // developer tools are present; skip rather than raise a modal dialog.
+        guard let pythonPath = SutandoConfig.resolvePython(repoRoot: repoRoot) else {
+            logToFile("runHealthCheck: no runnable python3 "
+                + "(no $SUTANDO_PY, no bundled runtime, no developer tools) — skipping")
+            return
+        }
+        // `--emit-task` writes tasks/task-health-{ts}.txt on failure (with
+        // built-in dedup: 1h cooldown per failure-set hash). The agent picks
+        // it up via the bridge as a regular owner task — gives the trio's
+        // surface_owner path a redundant peer in the file-bridge layer, so
+        // health failures the trio's coverage scanner suppresses by cooldown
+        // (or the LLM step archives by judgment) still reach the agent. Per
+        // Chi 2026-05-07 PT.
+        // resolvePython returns a real interpreter path, so argv no longer
+        // needs the "python3" prepend the `/usr/bin/env` form required.
+        let arguments: [String] = [scriptPath, "--fix", "--emit-task"]
+
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self = self else { return }
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: Data())
+            }
+            guard let fh = FileHandle(forWritingAtPath: logPath) else {
+                self.logToFile("runHealthCheck: failed to open \(logPath)")
+                return
+            }
+            fh.seekToEndOfFile()
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: pythonPath)
+            proc.arguments = arguments
+            proc.standardOutput = fh
+            proc.standardError = fh
+            proc.currentDirectoryURL = URL(fileURLWithPath: self.workspace)
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                if proc.terminationStatus != 0 {
+                    self.logToFile("runHealthCheck: exit \(proc.terminationStatus)")
+                }
+            } catch {
+                self.logToFile("runHealthCheck: spawn failed — \(error.localizedDescription)")
+            }
+            try? fh.close()
+        }
+    }
+
+    func logToFile(_ msg: String) {
+        let path = workspace + "/logs/sutando-app-debug.log"
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+        }
+    }
+
+    func notify(_ title: String, _ message: String) {
+        logToFile("notify: \(title) — \(message)")
+        // Play sound for immediate feedback
+        NSSound.beep()
+        // Show floating HUD window (no notification permissions needed)
+        DispatchQueue.main.async { [self] in
+            showHUD(title: title, message: message)
+        }
+    }
+
+    var hudWindow: NSWindow?
+    var hudTimer: Timer?
+
+    func showHUD(title: String, message: String) {
+        hudTimer?.invalidate()
+        hudWindow?.orderOut(nil)
+
+        let width: CGFloat = 320
+        let height: CGFloat = 60
+        guard let screen = NSScreen.main else {
+            logToFile("showHUD: no main screen")
+            return
+        }
+        let x = screen.visibleFrame.midX - width / 2
+        let y = screen.visibleFrame.maxY - height - 12
+
+        let window = NSWindow(contentRect: NSRect(x: x, y: y, width: width, height: height),
+                              styleMask: [.borderless],
+                              backing: .buffered, defer: false)
+        window.level = .screenSaver  // above everything
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        // Rounded dark background
+        let bg = NSVisualEffectView(frame: window.contentView!.bounds)
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 10
+        bg.layer?.masksToBounds = true
+        window.contentView?.addSubview(bg)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        titleLabel.textColor = .white
+        titleLabel.frame = NSRect(x: 12, y: 30, width: width - 24, height: 20)
+
+        let bodyLabel = NSTextField(labelWithString: String(message.prefix(120)))
+        bodyLabel.font = NSFont.systemFont(ofSize: 11)
+        bodyLabel.textColor = NSColor(white: 0.85, alpha: 1)
+        bodyLabel.frame = NSRect(x: 12, y: 8, width: width - 24, height: 18)
+        bodyLabel.lineBreakMode = .byTruncatingTail
+
+        window.contentView?.addSubview(titleLabel)
+        window.contentView?.addSubview(bodyLabel)
+        window.orderFrontRegardless()
+        hudWindow = window
+        logToFile("showHUD: displayed at \(x),\(y) size \(width)x\(height)")
+
+        hudTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.hudWindow?.orderOut(nil)
+            }
+        }
+    }
+
+    // MARK: - Pointer Teacher overlay
+
+    /// Stand up the persistent click-through pointer window and watch the
+    /// state dir for Targets. Same window flags as showHUD; same DispatchSource
+    /// idiom as watchResults() (watch the dir, not the file, so the inline
+    /// tool's atomic rewrite still fires the event).
+    func setupPointerOverlay() {
+        guard let screen = NSScreen.main else { logToFile("setupPointerOverlay: no main screen"); return }
+        let f = screen.frame
+        let window = NSWindow(contentRect: f, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.level = .screenSaver
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        pointerView.frame = NSRect(origin: .zero, size: f.size)
+        pointerView.pos = CGPoint(x: f.width / 2, y: f.height / 2)
+        window.contentView = pointerView
+        window.orderFrontRegardless()
+        pointerWindow = window
+
+        let stateDir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let cmdPath = stateDir + "/pointer-cmd.json"
+        if !FileManager.default.fileExists(atPath: cmdPath) {
+            FileManager.default.createFile(atPath: cmdPath, contents: Data("{}".utf8))
+        }
+        // Prime lastTS so a stale command from a previous run doesn't fire on launch.
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: cmdPath)),
+           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let t = o["ts"] as? Double { pointerLastTS = t }
+        let fd = open(stateDir, O_EVTONLY)
+        guard fd >= 0 else { logToFile("setupPointerOverlay: cannot watch \(stateDir)"); return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: DispatchQueue.global(qos: .utility))
+        src.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.pollPointerCmd() }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        pointerWatchSource = src
+        // The window/view are sized once here, but pollPointerCmd maps coords
+        // against the *current* NSScreen.main.frame — a runtime resolution /
+        // scaling / arrangement change would desync them (Codex review,
+        // medium). Re-fit the overlay whenever the screen layout changes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in self?.resizePointerOverlay() }
+        logToFile("setupPointerOverlay: up on \(Int(f.width))x\(Int(f.height)), watching \(cmdPath)")
+    }
+
+    /// Re-fit the overlay window+view to the current main screen after a
+    /// display reconfiguration so it stays aligned with pollPointerCmd's
+    /// coordinate mapping (Codex review, medium).
+    func resizePointerOverlay() {
+        guard let screen = NSScreen.main, let window = pointerWindow else { return }
+        let f = screen.frame
+        window.setFrame(f, display: false)
+        pointerView.frame = NSRect(origin: .zero, size: f.size)
+        pointerView.needsDisplay = true
+        logToFile("resizePointerOverlay: now \(Int(f.width))x\(Int(f.height))")
+    }
+
+    func pollPointerCmd() {
+        let cmdPath = workspace + "/state/pointer-cmd.json"
+        guard let d = try? Data(contentsOf: URL(fileURLWithPath: cmdPath)),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let tsv = o["ts"] as? Double, tsv > pointerLastTS else { return }
+        pointerLastTS = tsv
+        // hide-before-capture: point_at publishes {hide:true} just before it
+        // screenshots, because the :7845 server uses `screencapture` (raw
+        // framebuffer, ignores sharingType). Tear the overlay fully off the
+        // screen so a stale pointer can't bias the next capture (Codex review,
+        // high).
+        if o["hide"] as? Bool == true {
+            pointerAnim?.invalidate()
+            pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+            pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+            pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+            pointerView.alpha = 0
+            pointerView.showLabel = false
+            pointerView.needsDisplay = true
+            pointerWindow?.orderOut(nil)
+            logToFile("pollPointerCmd: hide ts=\(tsv) — overlay ordered out")
+            return
+        }
+        guard let nx = o["nx"] as? Double, let ny = o["ny"] as? Double else { return }
+        let lbl = o["label"] as? String ?? ""
+        guard let screen = NSScreen.main else {
+            logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' but NSScreen.main is nil — cannot fly")
+            return
+        }
+        let f = screen.frame
+        // nx,ny = fraction of the main display, top-left origin → AppKit bottom-left.
+        let raw = CGPoint(x: CGFloat(nx) * f.width, y: f.height - CGFloat(ny) * f.height)
+        // Clicky's "sit beside the element, not on top of it" offset: 8px right,
+        // 12px below (below = smaller y in our bottom-left space). Clamp 20px in.
+        let target = CGPoint(
+            x: min(max(raw.x + 8, 20), f.width - 20),
+            y: min(max(raw.y - 12, 20), f.height - 20))
+        logToFile("pollPointerCmd: accepted ts=\(tsv) nx=\(nx) ny=\(ny) label='\(lbl)' raw=(\(Int(raw.x)),\(Int(raw.y))) → target=(\(Int(target.x)),\(Int(target.y))) on \(Int(f.width))x\(Int(f.height))")
+        flyPointer(to: target, label: lbl)
+    }
+
+    /// Clicky-style quadratic-bezier flight: smoothstep easing, slight arc
+    /// lift, triangle rotated tangent to travel + mid-flight scale swoop;
+    /// beep + settle into the -35° cursor pose on arrival.
+    func flyPointer(to dst: CGPoint, label: String) {
+        // Cancel every timer from a prior point_at — a stale hold/pulse/fade
+        // would otherwise keep mutating halo/alpha/showLabel and hide the new
+        // marker mid-flight (Codex review, high). Reset the visual state too.
+        pointerAnim?.invalidate()
+        pointerPulseTimer?.invalidate(); pointerPulseTimer = nil
+        pointerHoldTimer?.invalidate(); pointerHoldTimer = nil
+        pointerFadeTimer?.invalidate(); pointerFadeTimer = nil
+        pointerView.scale = 1
+        pointerView.alpha = 0
+        pointerView.showLabel = false
+        pointerView.label = label
+        pointerWindow?.orderFrontRegardless()   // a prior {hide} ordered it out
+        let start = pointerView.pos
+        let dist = hypot(dst.x - start.x, dst.y - start.y)
+        let dur = min(max(Double(dist) / 600.0, 1.0), 2.0)
+        let arc = min(dist * 0.2, 80)
+        let ctrl = CGPoint(x: (start.x + dst.x) / 2, y: (start.y + dst.y) / 2 + arc)
+        let frames = max(Int(dur * 60), 1)
+        var i = 0
+        pointerView.alpha = 1
+        logToFile("flyPointer: START from (\(Int(start.x)),\(Int(start.y))) → (\(Int(dst.x)),\(Int(dst.y))) frames=\(frames) dur=\(String(format: "%.2f", dur)) winVisible=\(pointerWindow?.isVisible ?? false) level=\(pointerWindow?.level.rawValue ?? -999)")
+        pointerAnim = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            i += 1
+            let lp = Double(i) / Double(frames)
+            let u = lp * lp * (3 - 2 * lp)            // smoothstep
+            let mt = 1 - u
+            let bx = mt*mt*start.x + 2*mt*u*ctrl.x + u*u*dst.x
+            let by = mt*mt*start.y + 2*mt*u*ctrl.y + u*u*dst.y
+            let tx = 2*mt*(ctrl.x - start.x) + 2*u*(dst.x - ctrl.x)
+            let ty = 2*mt*(ctrl.y - start.y) + 2*u*(dst.y - ctrl.y)
+            self.pointerView.pos = CGPoint(x: bx, y: by)
+            self.pointerView.angle = atan2(ty, tx) - .pi / 2
+            self.pointerView.scale = 1 + 0.3 * CGFloat(sin(.pi * u))   // Clicky swoop, peaks ~1.3 mid-flight
+            self.pointerView.needsDisplay = true
+            if i >= frames {
+                t.invalidate()
+                self.pointerView.angle = PointerOverlayView.restAngle   // settle into cursor pose
+                self.pointerView.scale = 1
+                self.pointerView.showLabel = true
+                self.pointerView.needsDisplay = true
+                self.logToFile("flyPointer: ARRIVED at (\(Int(dst.x)),\(Int(dst.y))) — holding 8s, winVisible=\(self.pointerWindow?.isVisible ?? false)")
+                NSSound.beep()
+                self.holdPointer()
+            }
+        }
+    }
+
+    /// Hold the cursor-pose marker steadily on the target for 8s (Clicky just
+    /// sits at rest — no pulsing ring), then fade out over ~0.7s.
+    func holdPointer() {
+        pointerHoldTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            var a: CGFloat = 1
+            self.pointerFadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+                guard let self = self else { t.invalidate(); return }
+                a -= 1.0 / 42.0
+                self.pointerView.alpha = max(a, 0)
+                self.pointerView.needsDisplay = true
+                if a <= 0 {
+                    t.invalidate()
+                    self.pointerFadeTimer = nil
+                    self.pointerView.showLabel = false
+                }
+            }
+        }
+    }
+
+    @objc func restartServices() {
+        notify("Sutando", "Restarting all services...")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [repoRoot + "/src/restart.sh"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .utility).async {
+            try? proc.run()
+            proc.waitUntilExit()
+        }
+    }
+
+    @objc func stopServices() {
+        notify("Sutando", "Stopping all services...")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [repoRoot + "/src/stop.sh"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .utility).async {
+            try? proc.run()
+            proc.waitUntilExit()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false  // keep running as menu bar app even when HUD closes
+    }
+
+    @objc func quit() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// Pause the proactive loop by writing the sentinel the loop's
+    /// skip-conditions check (per `~/.claude/skills/proactive-loop/SKILL.md`
+    /// Skip Conditions §(d)). Format: ISO-8601 expiry timestamp (UTC).
+    /// `30 min` and `1 hr` auto-expire — forgetting to resume just means
+    /// the loop self-re-enables. `Indefinite` writes a year-2099 expiry
+    /// so the sentinel-check still works without protocol changes; the
+    /// user must explicitly Resume Loop to re-enable.
+    func writePauseSentinel(seconds: TimeInterval, label: String) {
+        let expiry = Date().addingTimeInterval(seconds)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let iso = formatter.string(from: expiry)
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        let dir = workspace + "/state"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        do {
+            try iso.write(toFile: path, atomically: true, encoding: .utf8)
+            notify("Sutando", "Loop paused (\(label)). Click Resume Loop to re-enable sooner.")
+        } catch {
+            notify("Sutando", "Loop pause failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func pauseLoop30() {
+        writePauseSentinel(seconds: 30 * 60, label: "30 min")
+    }
+
+    @objc func pauseLoop1h() {
+        writePauseSentinel(seconds: 60 * 60, label: "1 hr")
+    }
+
+    @objc func pauseLoopIndefinite() {
+        // Far-future expiry (2099-01-10T00:00:00Z) — far enough out that
+        // the sentinel-check treats it as permanent, but still uses the
+        // same ISO-8601 format so no protocol change downstream. Resume
+        // Loop deletes the sentinel.
+        let indefiniteExpiry = ISO8601DateFormatter().date(from: "2099-01-10T00:00:00Z") ?? Date().addingTimeInterval(365 * 24 * 60 * 60 * 75)
+        let secondsToFar = max(0, indefiniteExpiry.timeIntervalSinceNow)
+        writePauseSentinel(seconds: secondsToFar, label: "indefinite")
+    }
+
+    /// Returns true if the loop-pause sentinel exists AND its expiry is in
+    /// the future. Used by Timers (contextual-chips, health-check) to skip
+    /// their body during a pause window — keeps the menu-bar quiet during
+    /// a meeting/dinner break without disabling task watcher recovery.
+    func pauseSentinelActive() -> Bool {
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !iso.isEmpty else { return false }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let expiry = formatter.date(from: iso) else { return false }
+        return expiry > Date()
+    }
+
+    /// Resume the proactive loop by deleting the pause sentinel. No-op
+    /// if the sentinel doesn't exist (loop wasn't paused).
+    @objc func resumeLoop() {
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        if FileManager.default.fileExists(atPath: path) {
+            try? FileManager.default.removeItem(atPath: path)
+            notify("Sutando", "Loop resumed.")
+        } else {
+            notify("Sutando", "Loop wasn't paused.")
+        }
+    }
+
+    /// Restart the core CLI via `graceful-restart.sh`: prep before the kill, and
+    /// `--visible` must be forwarded or the relaunch becomes detached.
+
+    /// Hazard: run from OUTSIDE the sutando-core session — inside it, --restart
+    /// kills its own parent. Selected core CLI only; voice-agent excluded.
+
+    /// Seconds a busy core may hold the quiet gate before we say so out loud.
+    /// Not a timeout — nothing is cancelled when it elapses.
+    private static let busyNudgeAfterS: TimeInterval = 60
+
+    /// Waiter lifecycle. Lives in RestartCoordinator.swift so the click orderings
+    /// are executable in tests; `starting` covers the window before `run()`.
+    private let graceful = RestartCoordinator()
+
+    @objc func restartCore() {
+        let epoch: Int
+        switch graceful.claimRestart() {
+        case .rejectedPastKill:
+            notify("Sutando", "A restart is already past the kill phase — ignoring this click.")
+            return
+        case .rejectedAlreadyQueued:
+            notify("Sutando", "A restart is already queued — ignoring this click.")
+            return
+        case .accepted(let claimed):
+            epoch = claimed
+        }
+
+        notify("Sutando", "Restarting Core CLI — waiting for a safe moment…")
+        let script = repoRoot + "/src/agent/graceful-restart.sh"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        // SUTANDO_RESTART_REHEARSE=1 exercises this AppKit path with the kill skipped.
+        // NOT side-effect-free: --dry-run still runs prep, including a real sync.
+        proc.arguments = GracefulRestartInvocation.args(
+            script: script, env: ProcessInfo.processInfo.environment)
+        // stdout is the phase stream, not noise: on a busy core it is the only
+        // sign the click did anything. stderr stays for the failure preview.
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        graceful.track(proc, epoch: epoch)
+
+        // Fires once if the gate is still waiting. Epoch-checked so a superseded
+        // or cancelled waiter never nudges.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.busyNudgeAfterS) { [weak self] in
+            guard let self = self else { return }
+            guard self.graceful.nudgeApplies(epoch: epoch) else { return }
+            self.notify("Sutando", "Core is still busy — restart is queued, not stuck. "
+                                 + "Use Force Restart Core CLI to kill it now.")
+        }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            switch self.graceful.launch(epoch: epoch, { try proc.run() }) {
+            case .aborted:
+                return                      // cancelled before we ever launched
+            case .failed(let reason):
+                self.notify("Sutando", "Core restart failed to start: \(reason)")
+                return
+            case .launched:
+                break
+            }
+            // The script exec's start-cli.sh, so the stream survives the handoff
+            // and EOF lands only once the relaunch is done.
+            var pending = ""
+            while true {
+                let chunk = outPipe.fileHandleForReading.availableData
+                if chunk.isEmpty { break }
+                pending += String(data: chunk, encoding: .utf8) ?? ""
+                while let nl = pending.firstIndex(of: "\n") {
+                    let line = String(pending[pending.startIndex..<nl])
+                    pending = String(pending[pending.index(after: nl)...])
+                    guard let phase = Self.restartPhaseMessage(for: line) else { continue }
+                    if line.contains("restarting core (") {
+                        self.graceful.enterKilling(epoch: epoch)
+                    }
+                    self.notify("Sutando", phase)
+                }
+            }
+            proc.waitUntilExit()
+            let status = proc.terminationStatus
+            self.graceful.finish(epoch: epoch, proc: proc)
+
+            // 143 = cancelled by Force Restart: the TERM trap released the lock
+            // before any kill, so it is intended and stays silent.
+            if let outcome = GracefulRestartInvocation.outcomeMessage(for: status) {
+                self.notify("Sutando", outcome)
+            } else if status != 143 {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self.notify("Sutando", "Core restart failed (exit \(status)): \(preview)")
+            }
+        }
+    }
+
+    /// Map a script log line to a user-facing phase, or nil. Matches the script's
+    /// own wording, so a reworded log degrades to silence, not a wrong message.
+    static func restartPhaseMessage(for line: String) -> String? {
+        guard line.contains("graceful-restart[") else { return nil }
+        if line.contains("core is DEAD") {
+            return "Core was already dead — restarting now (prep best-effort)."
+        }
+        if line.contains("still busy — waiting") {
+            return nil   // the 60s nudge covers this; every-30s repeats would spam
+        }
+        if line.contains("quiet gate: waiting") {
+            return "Waiting for the core to finish its current task…"
+        }
+        if line.contains("prep") && line.contains("failed") {
+            return "Prep failed — not killing the core."
+        }
+        if line.contains("restarting core (") {
+            return "Safe window reached — restarting the core now."
+        }
+        if line.contains("deferring") {
+            return "Another restart is in progress — deferring."
+        }
+        return nil
+    }
+
+    /// SIGTERM -> SIGKILL escalation for a wedged core. "Restart Core CLI" waits
+    /// for a quiet window and never SIGKILLs; this is the explicit escape hatch.
+    @objc func forceRestartCore() {
+        let (claim, queued) = graceful.claimForce()
+        switch claim {
+        case .rejectedPastKill:
+            // Past the kill it has exec'd start-cli.sh; signalling would abort a
+            // relaunch already underway.
+            notify("Sutando", "A graceful restart is already past the kill phase — "
+                            + "not forcing on top of it.")
+            return
+        case .cancelledBeforeLaunch:
+            // It never launched, so there is nothing to signal — the epoch bump
+            // inside claimForce makes its closure return before `run()`.
+            notify("Sutando", "Cancelled the queued restart before it launched — forcing now.")
+        case .cancelledWhileWaiting:
+            if let queued = queued {
+                queued.terminate()
+                // Wait for the TERM trap to release the restart lock; forcing
+                // while it is held makes the replacement defer with exit 4.
+                queued.waitUntilExit()
+            }
+            notify("Sutando", "Cancelled the queued graceful restart — forcing now.")
+        case .nothingToCancel:
+            break
+        }
+
+        notify("Sutando", "Force-restarting Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/start-cli.sh", args: ["--force-restart"],
+                      okMessage: "Core force-restarted. Attach via Open Core CLI in menu.",
+                      failVerb: "Core force-restart")
+    }
+
+    /// Stop ONLY the core CLI session (sonichi#2401 "stop means stop"):
+    /// bridges and services keep running, and nothing relaunches the core
+    /// until the user asks (menu or chat command).
+    @objc func stopCore() {
+        notify("Sutando", "Stopping Core CLI…")
+        runCoreAction(script: repoRoot + "/src/agent/stop-core.sh", args: [],
+                      okMessage: "Core stopped. It stays stopped until you restart it.",
+                      failVerb: "Core stop")
+    }
+
+    /// Switch the core's model via scripts/switch-model.sh --confirm: the click is the
+    /// owner's instruction, and the script records only after the CLI accepts.
+    @objc func switchModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        notify("Sutando", "Switching core to \(sender.title)…")
+        runCoreAction(script: repoRoot + "/scripts/switch-model.sh",
+                      args: [model, "--confirm", "--session", "sutando-core", "--socket", sutandoTmuxSocket],
+                      okMessage: "Core switched to \(sender.title) — accepted by the CLI and saved as its default.",
+                      failVerb: "Model switch to \(sender.title)")
+    }
+
+    /// Shared runner for core start/stop scripts: detached bash, stderr
+    /// surfaced via notify on failure (same contract as restartCore).
+    private func runCoreAction(script: String, args: [String],
+                               okMessage: String, failVerb: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script] + args
+        let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = errPipe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                try proc.run()
+            } catch {
+                self?.notify("Sutando", "\(failVerb) failed to start: \(error.localizedDescription)")
+                return
+            }
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 {
+                self?.notify("Sutando", okMessage)
+            } else {
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr = String(data: errData, encoding: .utf8) ?? ""
+                let preview = String(errStr.prefix(200))
+                self?.notify("Sutando", "\(failVerb) failed (exit \(proc.terminationStatus)): \(preview)")
+            }
+        }
+    }
+
+    /// Consume <workspace>/state/core-restart-requested.json and perform the
+    /// requested action in THIS (GUI) session. Mirrors core_restart_intent.py:
+    /// delete-before-act, unknown/malformed/stale (>600s) intents dropped —
+    /// and the delete must SUCCEED before any dispatch: an undeletable file
+    /// would re-fire the same action every 5s poll, so fail closed instead
+    /// (qingyun review, #2408).
+    func pollRestartIntent() {
+        let path = workspace + "/state/core-restart-requested.json"
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        do {
+            try FileManager.default.removeItem(atPath: path)  // consume FIRST
+        } catch {
+            notify("Sutando", "Restart request file couldn't be consumed — NOT acting (would loop). Remove it manually: \(path)")
+            return
+        }
+        guard let raw = raw,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let action = obj["action"] as? String,
+              let requestedAt = obj["requested_at"] as? Double,
+              Date().timeIntervalSince1970 - requestedAt <= 600 else { return }
+        switch action {
+        case "restart":
+            notify("Sutando", "Chat-requested core restart — relaunching…")
+            restartCore()
+        case "stop":
+            notify("Sutando", "Chat-requested core stop.")
+            stopCore()
+        default:
+            return
+        }
+    }
+
+    /// Restart the Sutando.app menu bar app — useful after editing
+    /// ~/.config/sutando/hotkeys.json so the new bindings take effect.
+    /// Spawns a detached helper that waits for this process to exit, then
+    /// re-launches the same binary, then exits the current process.
+    @objc func restartSelf() {
+        let myPath = ProcessInfo.processInfo.arguments[0]
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        // Detached shell: wait for current pid to die, then exec the same binary.
+        let script = "while kill -0 \(myPid) 2>/dev/null; do sleep 0.1; done; exec \"\(myPath)\""
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", script]
+        do {
+            try task.run()
+            logToFile("restartSelf: spawned relaunch helper (pid will be \(myPid)), terminating")
+            NSApplication.shared.terminate(nil)
+        } catch {
+            notify("Sutando", "Restart failed: \(error.localizedDescription)")
+            logToFile("restartSelf: failed to spawn helper: \(error)")
+        }
+    }
+}
+
+// MARK: - Pointer Teacher overlay view
+
+/// Renders the Clicky-style cursor triangle (soft blue glow, no halo) + label.
+/// Pure view — the flight is driven by AppDelegate. Ported verbatim from
+/// pointer-teacher-tracer/Sources/pointer-overlay/main.swift (proven by the grill POCs).
+final class PointerOverlayView: NSView {
+    static let blue = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
+    // Clicky-faithful pointer. Small cursor-like triangle, NO halo ring (Clicky
+    // has none — just a soft blue glow). Resting pose is a -35° tilt so it reads
+    // as a pointer, not a fat upward triangle. The centroid sits at `pos`, which
+    // pollPointerCmd offsets +8px right / +12px below the real element so the
+    // marker points *beside* the target instead of covering it.
+    static let triSize: CGFloat = 18                 // Clicky uses 16; 18 for retina legibility
+    static let restAngle: CGFloat = 35 * .pi / 180   // cursor-like tilt at rest
+    var pos = CGPoint.zero          // triangle centroid (view coords, bottom-left)
+    var angle: CGFloat = restAngle  // radians; restAngle = cursor pose
+    var scale: CGFloat = 1          // flight "swoop" (peaks ~1.3 at mid-flight)
+    var label = ""
+    var showLabel = false
+    var alpha: CGFloat = 0          // overall opacity 0..1 (0 = idle/invisible)
+
+    override var isFlipped: Bool { false }
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }   // never capture input
+
+    override func draw(_ r: NSRect) {
+        guard alpha > 0.01 else { return }
+        let ctx = NSGraphicsContext.current!.cgContext
+        ctx.setAlpha(alpha)
+        let blue = PointerOverlayView.blue
+
+        // Cursor-like triangle (Clicky vertex ratios), centroid at origin,
+        // rotated by `angle`, scaled by `scale`. Soft blue glow grows with the
+        // flight scale — no stroked halo ring.
+        let s = PointerOverlayView.triSize, h = s * sqrt(3) / 2
+        ctx.saveGState()
+        ctx.translateBy(x: pos.x, y: pos.y)
+        ctx.rotate(by: angle)
+        ctx.scaleBy(x: scale, y: scale)
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: 0, y: h / 1.5))           // tip
+        p.addLine(to: CGPoint(x: -s / 2, y: -h / 3))    // back-left
+        p.addLine(to: CGPoint(x: s / 2, y: -h / 3))     // back-right
+        p.closeSubpath()
+        ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 8 + (scale - 1.0) * 16,
+                      color: blue.withAlphaComponent(0.9).cgColor)
+        ctx.setFillColor(blue.cgColor)
+        ctx.fillPath()
+        // hairline white edge so it stays legible on dark and light UIs
+        ctx.addPath(p)
+        ctx.setShadow(offset: .zero, blur: 0, color: NSColor.clear.cgColor)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(1.0 / max(scale, 0.01))
+        ctx.setLineJoin(.round)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Small label, offset clear of the element (up-right of the marker) so
+        // it never covers what the pointer indicates.
+        if showLabel, !label.isEmpty {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: NSColor.white]
+            let sz = (label as NSString).size(withAttributes: attrs)
+            let pad: CGFloat = 6
+            let box = NSRect(x: pos.x + 16, y: pos.y + 14,
+                             width: sz.width + pad * 2, height: sz.height + pad)
+            let rp = NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6)
+            blue.setFill(); rp.fill()
+            (label as NSString).draw(at: NSPoint(x: box.minX + pad, y: box.minY + pad / 2),
+                                     withAttributes: attrs)
+        }
+    }
+}
+
+// MARK: - Main
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory) // menu bar only, no dock icon
+app.run()
+
+extension AppDelegate: NSMenuDelegate {
+    static let modelChoicesManifest = "/skills/model-switch/manifest.json"
+    static let modelChoicesKey = "MODEL_SWITCH_CHOICES"
+
+    /// `id=Title;id=Title…` from the manifest's config block; nil when unreadable or empty.
+    func modelChoices() -> [(title: String, id: String)]? {
+        guard let data = FileManager.default.contents(atPath: repoRoot + AppDelegate.modelChoicesManifest),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cfg = root["config"] as? [String: Any],
+              let raw = cfg[AppDelegate.modelChoicesKey] as? String else { return nil }
+        let pairs = raw.split(separator: ";").compactMap { entry -> (title: String, id: String)? in
+            guard let eq = entry.firstIndex(of: "=") else { return nil }
+            let id = entry[..<eq].trimmingCharacters(in: .whitespaces)
+            let title = entry[entry.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            return (id.isEmpty || title.isEmpty) ? nil : (title: title, id: id)
+        }
+        return pairs.isEmpty ? nil : pairs
+    }
+
+    /// The model the switch script last recorded as accepted (state/model-switch.json).
+    func recordedModel() -> String? {
+        guard let data = FileManager.default.contents(atPath: workspace + "/state/model-switch.json"),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return root["model"] as? String
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === modelSubmenu else { return }
+        menu.removeAllItems()
+        let current = recordedModel()
+        if let choices = modelChoices() {
+            for c in choices {
+                let it = NSMenuItem(title: c.title, action: #selector(switchModel(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = c.id
+                it.state = (c.id == current) ? .on : .off
+                menu.addItem(it)
+            }
+        } else {
+            let it = NSMenuItem(title: "Choices unreadable: skills/model-switch/manifest.json", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let other = NSMenuItem(title: "Other model…", action: #selector(switchOtherModel), keyEquivalent: "")
+        other.target = self
+        menu.addItem(other)
+    }
+
+    /// Any id the owner types; the script still refuses one the CLI does not accept.
+    @objc func switchOtherModel() {
+        let alert = NSAlert()
+        alert.messageText = "Switch the core to which model?"
+        alert.informativeText = "An alias (opus, sonnet, fable) or a full id (claude-fable-5-1[1m]). The switch is recorded only after the CLI accepts it."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        field.placeholderString = "model id"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Switch")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let model = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !model.isEmpty else { return }
+        let it = NSMenuItem(title: model, action: nil, keyEquivalent: "")
+        it.representedObject = model
+        switchModel(it)
+    }
+}

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Unit tests for _chunk_for_discord — covers MacBook PR #563 review findings.
+
+Both src/discord-bridge.py and src/dm-result.py carry copies of the chunker;
+test both. Loads via importlib because filenames contain hyphens.
+"""
+
+import tempfile
+import importlib.util
+import os
+import sys
+import types
+from pathlib import Path
+
+# Isolate the channel config BEFORE importing the bridge, and SEED it.
+#
+# This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a machine
+# that has the file the write is a no-op, which is why it survived — the damage
+# lands only on a host that has LOST its token, which is the host you least want
+# a fake one planted on. A fake token also satisfies startup.sh's
+# `grep -q "DISCORD_BOT_TOKEN="` and defeats the #2638 vault fallback, which
+# fires only when no `.env` value exists.
+#
+# Seeding matters as much as redirecting: `channel_access_path()` falls back to
+# the legacy real-home `access.json` when the canonical path is missing, so an
+# EMPTY temp config dir still reads the operator's live allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-discord-chunker-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text('{"allowFrom": []}')
+(_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
+REPO = Path(__file__).resolve().parent.parent
+
+# discord-bridge.py module-load has two side effects that fail in clean CI:
+#   1. `import discord` + `discord.Intents.default()` + `discord.Client(...)`
+#      — discord.py isn't installed on Ubuntu CI runners.
+#   2. Reads DISCORD_BOT_TOKEN from $CLAUDE_CONFIG_DIR/channels/discord/.env and
+#      `exit(1)` if missing — that path doesn't exist in CI.
+#
+# Bypass both so the test can reach `_chunk_for_discord` (pure string ops,
+# no discord runtime dependency). Locally with the real discord installed
+# and a real token, both bypasses no-op.
+try:
+    import discord  # noqa: F401
+except ImportError:
+    stub = types.ModuleType("discord")
+    stub.Intents = type("Intents", (), {"default": staticmethod(lambda: type("I", (), {"message_content": False})())})
+    stub.Client = type("Client", (), {"__init__": lambda self, **kw: None, "event": staticmethod(lambda fn: fn)})
+    stub.File = type("File", (), {})
+    stub.Message = type("Message", (), {})
+    sys.modules["discord"] = stub
+
+# discord-bridge.py reads DISCORD_BOT_TOKEN from a file path, not os.environ.
+# Materialize a fake .env at the expected path if absent (CI runners don't
+# have it; locally it already exists, setdefault-style logic preserves the
+# real one).
+_channels_env = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"
+if not _channels_env.exists():
+    _channels_env.parent.mkdir(parents=True, exist_ok=True)
+    _channels_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+bridge = _load("dbridge", REPO / "src" / "discord-bridge.py")
+dm = _load("dm_result", REPO / "src" / "dm-result.py")
+
+
+def _run_against(mod, label):
+    # The bridge's network-facing alias is intentionally bounded. Exercise the
+    # lossless primitive here so these golden checks remain about fence-safe
+    # reassembly; dm-result.py still exposes only its lossless alias.
+    chunk = getattr(mod, "_chunk_for_discord_unbounded", mod._chunk_for_discord)
+
+    # The fallback above is deliberate (dm-result names its lossless alias
+    # differently), but it made this suite BLIND: renaming the bridge's primitive
+    # away left every assertion below satisfied by the bounded path, which caps at
+    # DISCORD_DELIVERY_MAX_CHUNKS. Assert the PROPERTY, not the name — a lossless
+    # chunker must exceed that cap on input that needs more.
+    _long = ("x" * 1800 + "\n") * 8
+    _n = len(list(chunk(_long)))
+    _cap = getattr(mod, "DISCORD_DELIVERY_MAX_CHUNKS", None)
+    if _cap is not None:
+        assert _n > _cap, (
+            f"{label}: resolved chunker produced {_n} chunks on ~14k chars, at or under the "
+            f"{_cap}-chunk delivery cap — the lossless primitive is missing and the bounded "
+            f"path was substituted silently")
+
+    # Test 1: empty/short
+    assert list(chunk("")) == []
+    assert list(chunk("hi")) == ["hi"]
+
+    # Test 2: long plain text → multiple chunks, all <= max_len
+    src = "\n".join(["line " + str(i) * 40 for i in range(200)])
+    chunks = list(chunk(src, max_len=300))
+    assert all(len(c) <= 300 for c in chunks), f"{label}: chunk too long"
+    assert len(chunks) > 1
+
+    # Test 3: code block spanning multiple chunks preserves opener with language tag
+    src = "intro\n```python\n" + ("x = 1\n" * 400) + "```\nouter"
+    chunks = list(chunk(src, max_len=300))
+    assert len(chunks) >= 3, f"{label}: expected multi-chunk, got {len(chunks)}"
+    # All but last must end with ``` (closer)
+    for i, c in enumerate(chunks[:-1]):
+        assert c.endswith("```"), f"{label}: chunk {i} missing closer: {c[-30:]!r}"
+    # Inner chunks must reopen with the SAME opener (preserves "python" tag)
+    assert "```python" in chunks[1], f"{label}: language tag dropped"
+
+    # Test 4: print("```") inside fenced block must NOT close the fence early
+    src = '```python\nprint("```")\nx = 1\nmore = 2\n```'
+    chunks = list(chunk(src))
+    # Single chunk — but more important: fence is balanced (one opener, one closer)
+    full = "\n".join(chunks)
+    fence_lines = [
+        ln for ln in full.split("\n") if mod._is_fence_open_line(ln) is not None
+    ]
+    assert len(fence_lines) == 2, (
+        f"{label}: print(```) misclassified as fence "
+        f"(found {len(fence_lines)} fence-lines, expected 2)"
+    )
+
+    # Test 5: nested 4-tick outer fence preserved (Markdown allows ```` to wrap ```)
+    src = "````markdown\n```python\ninner\n```\nstill outer\n````"
+    chunks = list(chunk(src))
+    # Outer ```` opener present in first chunk
+    assert "````markdown" in chunks[0], f"{label}: outer 4-tick opener lost"
+
+    # Test 6: regex correctness for _is_fence_open_line
+    cases = [
+        ("```python", "```python"),
+        ("```", "```"),
+        ("``` ", "```"),
+        ("```py extra", "```py extra"),
+        ("~~~js", "~~~js"),
+        ('print("```")', None),
+        ("    print('```')", None),  # 4-space indent makes it not a fence
+        ("foo ```inline``` bar", None),
+        ("``", None),  # only 2 backticks
+    ]
+    for inp, exp in cases:
+        got = mod._is_fence_open_line(inp)
+        assert got == exp, f"{label}: {inp!r} -> got {got!r}, expected {exp!r}"
+
+    # Test 7: tilde fence closes with tildes (not backticks) — token-kind preservation
+    src = "~~~python\n" + ("x = 1\n" * 400) + "~~~"
+    chunks = list(chunk(src, max_len=300))
+    assert len(chunks) >= 2
+    # First chunk closes with ~~~ (matching opener kind), not ```
+    assert chunks[0].rstrip().endswith("~~~"), (
+        f"{label}: tilde fence closed with wrong token: {chunks[0][-30:]!r}"
+    )
+
+    print(f"[{label}] all 7 cases OK")
+
+
+def _run_delivery_budget_cases():
+    assert list(bridge._chunk_for_discord("hi")) == ["hi"]
+
+    chunks = list(bridge._chunk_for_discord("oversized\n" * 100, max_len=40, max_chunks=4))
+    assert len(chunks) == 4, f"budget: expected 4 sends, got {len(chunks)}"
+    assert chunks[0].startswith("oversized"), "budget: preview lost the beginning"
+    assert chunks[-1] == bridge.DISCORD_TRUNCATION_NOTICE
+
+    try:
+        list(bridge._chunk_for_discord("x", max_chunks=0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("budget: max_chunks=0 should raise ValueError")
+
+    print("[discord delivery budget] all 3 cases OK")
+
+
+def _run_gate_message_cases():
+    """The gate line must not state an inequality its own predicate can falsify.
+
+    It fires on the CHUNK COUNT, so a structure that splits at exactly max_len
+    printed "N chars > N" — false, and it sends a reader hunting an off-by-one.
+    """
+    import contextlib
+    import io
+    import re
+
+    body = ("ab\n" * 200)[:40]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        chunks = list(bridge._chunk_for_discord(body, max_len=40, max_chunks=4))
+    out = buf.getvalue()
+
+    assert len(chunks) > 1, (
+        "gate-message: fixture no longer splits at exactly max_len, so this "
+        "case cannot exercise the gate — pick another structure")
+    assert "[delivery-gate]" in out, f"gate-message: gate did not fire: {out!r}"
+    assert f"{len(chunks)} chunk(s)" in out, (
+        f"gate-message: chunk count missing from {out!r}")
+    for lhs, rhs in re.findall(r"(\d+) chars > (\d+)", out):
+        assert int(lhs) > int(rhs), (
+            f"gate-message: printed a FALSE inequality {lhs} > {rhs} in {out!r}")
+
+    plain = ("word " * 200)[:40]
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        assert len(list(bridge._chunk_for_discord(plain, max_len=40, max_chunks=4))) == 1
+    assert "[delivery-gate]" not in buf2.getvalue(), (
+        "gate-message: fired on a single-chunk body")
+
+    print("[delivery gate message] all 2 cases OK")
+
+
+def main():
+    _run_against(bridge, "discord-bridge.py")
+    _run_against(dm, "dm-result.py")
+    _run_delivery_budget_cases()
+    _run_gate_message_cases()
+    print("All chunker tests passed.")
+
+
+if __name__ == "__main__":
+    main()

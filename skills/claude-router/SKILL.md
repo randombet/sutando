@@ -1,12 +1,12 @@
 ---
 name: claude-router
-description: "Choose between the local Codex CLI and Gemini CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation."
+description: "Choose between the local Codex CLI, Gemini CLI, and Pi CLI from Claude Code. Use for automatic model selection when the user wants the best local delegate for code review, repo-wide analysis, planning, or implementation."
 user-invocable: true
 ---
 
 # Claude Router
 
-Route a task from Claude Code to either local `codex` or local `gemini` using simple, explicit rules. This skill assumes the dedicated `claude-codex` and `claude-gemini` skills are installed from this repo.
+Route a task from Claude Code to local `codex`, `gemini`, or `pi` using simple, explicit rules. This skill assumes the dedicated `claude-codex`, `claude-gemini`, and `claude-pi` skills are installed from this repo.
 
 **Usage**: `/claude-router [prompt]`
 
@@ -25,7 +25,17 @@ ARGUMENTS: $ARGUMENTS
   - large-context summarization
   - multimodal or structured JSON output requests
 
-If the request explicitly names `codex` or `gemini`, honor that directly.
+- Route to `pi` when:
+  - the request names `pi` or `kimi`
+  - the user wants a Kimi-family second opinion
+
+If the request explicitly names `codex`, `gemini`, or `pi`, honor that directly.
+
+## When NOT to Use
+
+- **Interactive code review or task hand-off from this Claude Code session** → use the `/codex:*` plugin commands directly (`/codex:review`, `/codex:adversarial-review`, `/codex:rescue`, `/codex:status`). The router is for programmatic delegation from scripts, cron, and bridges — it goes through the `claude-codex` skill's bash wrapper, not the plugin.
+
+  If you don't see `/codex:*` slash-commands, install the plugin via the 4 commands documented in `skills/claude-codex/SKILL.md` ("When NOT to Use" section).
 
 ## Default Behavior
 
@@ -50,6 +60,9 @@ bash "$SKILL_DIR/scripts/route-ai.sh" --engine codex -- "Inspect src/task-bridge
 
 # Force Gemini
 bash "$SKILL_DIR/scripts/route-ai.sh" --engine gemini -- "Trace task flow across the entire repo"
+
+# Force Pi (Kimi)
+bash "$SKILL_DIR/scripts/route-ai.sh" --engine pi -- "Second opinion on this design"
 
 # Dry-run the route decision without executing
 bash "$SKILL_DIR/scripts/route-ai.sh" --dry-run -- "Summarize architecture risks in this repo"

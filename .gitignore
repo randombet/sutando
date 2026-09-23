@@ -1,5 +1,7 @@
 .env
+PERSONAL_CLAUDE.md
 node_modules/
+benchmark-runs/
 dist/
 *.log
 __pycache__/
@@ -13,27 +15,149 @@ results/
 SESSION.md
 conversation.log
 quota-state.json
-data/bills.json
-data/newsletters/
-data/subscribers.txt
-src/*.log
+data/*
+!data/*.example.json
 src/cloudflare-worker.js
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
+# Per-user workspace configs (e.g. config/<surface>.json). Live configs
+# carry per-user data and must never be committed from a repo-root workspace
+# install — the repo ships <skill>/config.json.example templates instead.
+config/*.json
+# ...except the shipped, in-repo defaults (Spine C source). These are CODE that
+# ships with the repo, not per-user data — they MUST be tracked.
+!config/sutando.config.defaults.json
+!config/sutando.config.schema.json
 AGENT_LOOP.md
 PENDING.md
 pending-questions.md
 .claude/
 ACTIVITY.md
 build_log.md
-notes/*.md
-!notes/setup-guide.md
+notes/*
+!notes/.gitkeep
 
 telegram-inbox/
 discord-inbox/
 archive/
 assets/
+# the blanket assets/ rule above is for workspace runtime dirs; the package's
+# brand assets are versioned source
+!packages/ag2-sparrow/assets/
+!packages/ag2-sparrow/assets/**
+# skill assets are versioned source too: a Codex/OpenAI skill manifest
+# references ./assets/ icons, so the blanket rule must not swallow them.
+!skills/*/assets/
+!skills/*/assets/**
 stand-identity.json
-docs/stand-avatar.png
+stand-avatar.png
 docs/youtube/
 core-status.json
+dynamic-content.json
+tests/*
+# Re-include nested test subdirectories so the tests/ tree can mirror src/
+# (tests/kernel/, tests/adapters/, tests/policy/, …) — the companion to the
+# recursive runner glob. Without this, relocated tests are silently untracked.
+!tests/*/
+# `!tests/*/` re-includes EVERY dir under tests/, which defeats the global
+# `__pycache__/` above. Re-deny tool caches here; gitignore is last-match-wins.
+tests/**/__pycache__/
+tests/**/.pytest_cache/
+tests/**/.mypy_cache/
+tests/**/.ruff_cache/
+tests/**/node_modules/
+tests/**/htmlcov/
+!tests/*.test.ts
+!tests/*.test.py
+!tests/*.test.sh
+!tests/*.test.ps1
+!tests/*.test.mjs
+tests/__pycache__/
+!tests/*.txt
+!tests/_helpers/
+!tests/_helpers/*.ts
+!tests/fixtures/
+!tests/fixtures/*.json
+skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
+skills/schedule-crons/crons.json
+# voice-agent + phone-conversation configs are per-user data (model/grounding
+# prefs the operator tunes) and live in $SUTANDO_WORKSPACE/config/. The repo
+# ships only the *.example templates — never commit a live config here.
+src/voice-agent.config.json
+skills/phone-conversation/config.json
+src/Sutando/Sutando
+# NativeMic.swift was removed in PR #329 and keeps getting re-added by
+# search-and-replace sweeps that leave a stale copy in the working tree
+# (regressed in #341, re-deleted in #342). Ignore it so a casual `git add .`
+# can't resurrect it.
+src/Sutando/NativeMic.swift
+voice-context.txt
+tab-aliases.json
+session-state.md
+src/web-client.js
+context-drop-image.png
+generated-*.png
+contextual-chips.json
+*.heartbeat
+.agent/
+.massgen/
+.env.bak
+.env.bak*
+.env.*.bak
+.last-pq-notify
+
+# Task archive — created by the watcher when moving processed tasks.
+# Will eventually move to $SUTANDO_PRIVATE_DIR/done/ for analytics + self-
+# improvement (option b in the 2026-04-27 done/-handling discussion).
+# Until that migration ships, keep done/ ephemeral and gitignored.
+done/
+
+# Runtime state file written by the voice client. Pure cruft, no commit value.
+voice-state.json
+
+# Legacy pre-#2722 voice-agent lock path; canonical is workspace/state/locks/
+# (already covered by workspace/*). Keep through the transition window.
+.voice-agent.pid
+
+# Per-clone Sutando config overrides — workspace path, vault remote, etc.
+# Tracked defaults live in sutando.config.json; .local.json carries the
+# machine-specific overrides (different workspace location, different vault
+# remote per host) and must never be committed.
+sutando.config.local.json
+
+# In-repo workspace (M0 default). Everything user-runtime — tasks/, results/,
+# state/, notes/, build_log.md, etc. — lives under workspace/ and must never
+# be committed. .gitkeep is the exception so the directory ships in fresh
+# clones for a zero-config first run.
+workspace/*
+!workspace/.gitkeep
+# AG2 onboarding summary — private (invite codes + ids)
+ag2-onboarding.txt
+
+# IDE / editor workspace state — per-user, never shared.
+.vscode/
+# coverage-gate artifacts (scripts/coverage-gate.sh)
+.coverage
+.coverage.*
+coverage.xml
+diff-cover.md
+coverage-summary.md
+
+# sw[n-p] only: a dot/underscore prefix plus `sw` still admits real assets
+# (`.interface.swg`), so the range is the discriminator.
+[._]*.sw[n-p]
+[._]sw[n-p]
+# Deep range, but only at a real dotenv boundary — `.env` as a bare substring
+# would hide `diagram.environment.svg` and `service.envoy.svc`.
+*.env.s[a-v][a-z]
+*.env.sw[a-p]
+*.env.*.s[a-v][a-z]
+*.env.*.sw[a-p]
+*~
+
+# Built locally from a GAIA copy; carries the answer key -- never commit.
+benchmarks/gaia-100.json

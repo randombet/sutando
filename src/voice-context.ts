@@ -4,17 +4,25 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveWorkspace } from './workspace_default.js';
+import { claudeHomePath, claudeProjectSlug } from './util_paths.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
-    const slug = repo.replace(/\//g, '-');
-    return join(homedir(), '.claude', 'projects', slug, 'memory');
+    const slug = claudeProjectSlug(repo);
+    return claudeHomePath('projects', slug, 'memory');
 }
 
 const MEMORY_DIR = process.env.SUTANDO_MEMORY_DIR || defaultMemoryDir();
-const REPO_DIR = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+// fileURLToPath, never `.pathname`: URL.pathname stays percent-encoded, so on
+// the desktop-bundled install ("~/Library/Application Support/…") REPO_DIR
+// became ".../Application%20Support/..." and every join() below silently
+// pointed at a path that does not exist — no error, just an empty transcript
+// and missing CLAUDE.md context.
+const REPO_DIR = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
+const WORKSPACE_DIR = resolveWorkspace();
 
 function readMemory(filename: string): string | null {
 	const path = join(MEMORY_DIR, filename);
@@ -28,10 +36,32 @@ function readMemory(filename: string): string | null {
 }
 
 /**
+ * RECENT ACTIVITY lines for a build_log body. Exported so tests drive this
+ * implementation instead of a second copy that cannot disagree with it.
+ */
+export function pickRecentActivity(content: string): string[] {
+	// build_log.md is append-at-bottom, so the newest dated header is the LAST
+	// match; items must be scoped to it or slice(5) returns the file preamble.
+	const headers = [...content.matchAll(/## \d{4}-\d{2}-\d{2} — .+/g)];
+	const newest = headers.length ? headers[headers.length - 1] : null;
+	if (!newest) return [];
+	const rest = content.slice((newest.index ?? 0) + newest[0].length);
+	// The delimiter must match ANY level-two header, not just the narrow form
+	// the selector accepts — otherwise one section swallows the next.
+	const next = rest.search(/^## /m);
+	const section = next === -1 ? rest : rest.slice(0, next);
+	// A section with no bulleted items renders header-only ON PURPOSE:
+	// borrowing items from elsewhere is the mispairing this fixes.
+	const items = section.match(/^- \*\*.+?\*\*.*/gm) ?? [];
+	return ['RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), ''];
+}
+
+/**
  * Build a concise context summary for the Gemini voice agent.
  * Gives Gemini awareness of the current system state and user context.
+ * `extraLines` are lines optional skills contribute about where the session is.
  */
-export function buildVoiceAgentContext(): string {
+export function buildVoiceAgentContext(opts: { extraLines?: string[] } = {}): string {
 	const userProfile = readMemory('user_profile.md');
 	const lines: string[] = [];
 
@@ -39,8 +69,10 @@ export function buildVoiceAgentContext(): string {
 		lines.push('USER CONTEXT:', userProfile.slice(0, 500), '');
 	}
 
+	if (opts.extraLines?.length) lines.push(...opts.extraLines, '');
+
 	// Read build log summary
-	const buildLog = join(REPO_DIR, 'build_log.md');
+	const buildLog = join(WORKSPACE_DIR, 'build_log.md');
 	if (existsSync(buildLog)) {
 		try {
 			const content = readFileSync(buildLog, 'utf-8');
@@ -51,14 +83,31 @@ export function buildVoiceAgentContext(): string {
 		} catch { /* best effort */ }
 	}
 
-	// Read recent activity
-	const activityFile = join(REPO_DIR, 'ACTIVITY.md');
-	if (existsSync(activityFile)) {
+	if (existsSync(buildLog)) {
 		try {
-			const content = readFileSync(activityFile, 'utf-8');
-			const entries = content.match(/## \d{4}-\d{2}-\d{2} \d{2}:\d{2} — .+/g);
-			if (entries && entries.length > 0) {
-				lines.push('RECENT ACTIVITY:', ...entries.slice(0, 5).map(e => e.replace('## ', '  ')), '');
+			lines.push(...pickRecentActivity(readFileSync(buildLog, 'utf-8')));
+		} catch { /* best effort */ }
+	}
+
+	// Read recent phone call summaries (last 3 calls)
+	const callsFile = join(REPO_DIR, 'results', 'calls', 'calls.jsonl');
+	if (existsSync(callsFile)) {
+		try {
+			const callLines = readFileSync(callsFile, 'utf-8').trim().split('\n').filter(Boolean);
+			const recentCalls = callLines.slice(-3).reverse();
+			if (recentCalls.length > 0) {
+				lines.push('RECENT PHONE CALLS:');
+				for (const line of recentCalls) {
+					try {
+						const call = JSON.parse(line);
+						const who = call.caller || call.to || 'unknown';
+						const when = call.start_time || call.timestamp || '';
+						const summary = call.summary || call.topic || '(no summary)';
+						const dateStr = when ? new Date(when).toLocaleDateString() : '';
+						lines.push(`  ${dateStr} ${who}: ${summary.slice(0, 120)}`);
+					} catch { /* skip malformed */ }
+				}
+				lines.push('');
 			}
 		} catch { /* best effort */ }
 	}

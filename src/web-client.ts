@@ -8,12 +8,91 @@
  *   4. Click "Connect" and allow microphone access
  */
 
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
+import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { readTmuxStatus } from './tmux-status.js';
+import { CHAT_HTML } from './chat-ui.js';
+import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
+import { resolveWorkspace, statusReadPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+// Opt-in LAN sharing. The voice WS (WS_PORT) binds loopback only, so a browser
+// on another device on the same network can't reach it. When enabled, this
+// server proxies WS_PORT through its own LAN-reachable HTTP port at /ws — so a
+// LAN peer reaches the voice agent without WS_PORT itself being exposed. OFF by
+// default: enabling it lets any device on the network use this core's agent
+// (the voice WS has no auth), so it's an explicit choice per network.
+const LAN_SHARE = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_LAN_SHARE || '');
+
+// Workspace-relative paths use resolveWorkspace() (closes #763). Skills paths
+// (non-runtime, code-adjacent) remain anchored to the repo root.
+const WORKSPACE_DIR = resolveWorkspace();
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
+const STATE_DIR = join(WORKSPACE_DIR, 'state');
+const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
+
+// ─── Browser voice-transport delivery ──────────────────────────────────────
+//
+// The page loads src/web-voice-transport.ts — the canonical transport — as a
+// plain <script>. Getting real TypeScript into the browser needs a build step,
+// and the two runtime modes need different ones:
+//
+//   BUNDLED (packaged desktop app): this file IS dist/web-client.js, running
+//     under the pinned node with no tsx and no devDependencies. It serves the
+//     prebuilt dist/web-voice-transport.browser.js that build:bundle produced.
+//     A missing artifact is a PACKAGING ERROR — 503, never a silent fallback.
+//
+//   SOURCE (tsx src/web-client.ts): devDependencies are present, so the
+//     transport is compiled on demand from the TypeScript and cached in memory
+//     for the process. Compiling rather than reading dist/ is deliberate — it
+//     is what guarantees source mode cannot serve a stale artifact left behind
+//     by an old build:bundle run.
+//
+// Distinguishing the modes by where this module is running from is exact:
+// esbuild writes the bundle to dist/, tsx runs it from src/.
+const RUNNING_BUNDLED = basename(dirname(fileURLToPath(import.meta.url))) === 'dist';
+const BROWSER_TRANSPORT_ARTIFACT = 'web-voice-transport.browser.js';
+const BROWSER_TRANSPORT_ROUTE = '/web-voice-transport.js';
+const BROWSER_TRANSPORT_DIST = join(REPO_ROOT, 'dist', BROWSER_TRANSPORT_ARTIFACT);
+let _browserTransportCache: string | null = null;
+
+/**
+ * Resolve the browser transport JS for the current mode. Throws with a
+ * diagnostic message rather than returning a fallback: there is no second
+ * implementation to fall back TO, so a silent empty response would surface as
+ * an unexplained dead Connect button.
+ */
+async function loadBrowserTransport(): Promise<string> {
+	if (_browserTransportCache) return _browserTransportCache;
+
+	if (RUNNING_BUNDLED) {
+		if (!existsSync(BROWSER_TRANSPORT_DIST)) {
+			throw new Error(
+				`bundled mode: ${BROWSER_TRANSPORT_ARTIFACT} missing from ${dirname(BROWSER_TRANSPORT_DIST)} — ` +
+					'desktop packaging error (npm run build:bundle did not run or did not ship this artifact)',
+			);
+		}
+		_browserTransportCache = readFileSync(BROWSER_TRANSPORT_DIST, 'utf8');
+		return _browserTransportCache;
+	}
+
+	// Source mode. The specifier is built at runtime so esbuild cannot follow it
+	// when bundling this file — that keeps the esbuild devDependency out of
+	// dist/web-client.js, which must run without a development node_modules.
+	const specifier = ['..', 'scripts', 'browser-transport-build.mjs'].join('/');
+	const mod = await import(new URL(specifier, import.meta.url).href);
+	_browserTransportCache = await mod.buildBrowserTransportSource();
+	return _browserTransportCache!;
+}
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -22,34 +101,240 @@ const HTML = /* html */ `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sutando Web UI</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* Surface tokens. The page shipped hardcoded dark; the app that embeds it is
+   * light, so ground/text/line are named here and the dark values move into a
+   * prefers-color-scheme block. Accent hues are unchanged. */
+  :root {
+    --ui-bg: #ffffff;
+    --ui-raised: #f7f7f9;
+    --ui-sunken: #f1f1f4;
+    --ui-line: #e4e4e9;
+    --ui-line-soft: #ededf1;
+    --ui-text: #1f1f25;
+    --ui-text-hi: #101014;
+    --ui-text-2: #5f5f6b;
+    --ui-text-3: #8b8b97;
+    --ui-chip: #eeeef2;
+    --ui-chip-hover: #e3e3e9;
+    --ui-live-bg: #e6f4ec;
+    --ui-live-fg: #1e5128;
+    --ui-accent: #2563eb;
+    --ui-code-bg: #f4f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ui-bg: #0a0a12;
+      --ui-raised: #0e0e18;
+      --ui-sunken: #12121e;
+      --ui-line: #1e1e30;
+      --ui-line-soft: #1a1a2e;
+      --ui-text: #c0c0d0;
+      --ui-text-hi: #ffffff;
+      --ui-text-2: #888888;
+      --ui-text-3: #555555;
+      --ui-chip: #2a2a3e;
+      --ui-chip-hover: #3a3a4e;
+      --ui-live-bg: #1a2e24;
+      --ui-live-fg: #4ecca3;
+      --ui-accent: #66aaff;
+      --ui-code-bg: #0a0a12;
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: text; user-select: text; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0a0a12; color: #c0c0d0;
+    background: var(--ui-bg); color: var(--ui-text);
     display: flex; flex-direction: column; align-items: center;
-    min-height: 100vh; padding: 0;
+    min-height: 100vh; padding: 0 0 60px 0;
   }
   /* Header */
   .header {
     width: 100%; padding: 16px 20px;
     display: flex; align-items: center; gap: 14px;
-    background: #0e0e18; border-bottom: 1px solid #1a1a2e;
+    background: var(--ui-raised); border-bottom: 1px solid var(--ui-line);
+  }
+  .header .avatar-wrap {
+    position: relative; width: 60px; height: 60px; flex-shrink: 0;
+  }
+  .header .avatar-wrap canvas {
+    position: absolute; top: 0; left: 0; width: 60px; height: 60px; pointer-events: none;
   }
   .header .avatar {
+    position: absolute; top: 8px; left: 8px;
     width: 44px; height: 44px; border-radius: 50%;
     border: 2px solid #4ecca3; object-fit: cover; display: none;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
   }
+  .header .avatar.speaking {
+    border-color: #6ee7b7;
+  }
+  .header .avatar.working:not(.speaking) {
+    border-color: #60a5fa;
+    box-shadow: 0 0 10px rgba(96,165,250,0.4);
+    animation: avatar-work 2s linear infinite;
+  }
+  .header .avatar.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 12px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
+  @keyframes avatar-work {
+    0% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
+    50% { box-shadow: 0 0 16px rgba(96,165,250,0.5), 0 0 0 4px rgba(96,165,250,0.2); }
+    100% { box-shadow: 0 0 8px rgba(96,165,250,0.3), 0 0 0 2px rgba(96,165,250,0.1); }
+  }
+  @keyframes avatar-see {
+    0% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
+    50% { box-shadow: 0 0 20px rgba(251,191,36,0.8), inset 0 0 14px 2px rgba(251,191,36,0.35); }
+    100% { box-shadow: 0 0 10px rgba(251,191,36,0.45), inset 0 0 0 0 rgba(251,191,36,0.0); }
+  }
+
+  /* Halo animations for the PNG avatar path (mirrors the SVG .s-* halos
+     from PR #457 so users with avatarGenerated=true still get per-state
+     feedback around the image). Keyed off the .s-* class on the parent
+     wrapper (avatar-wrap / hero), not the img itself, so SSE state wires
+     straight through. */
+  @keyframes avatar-idle {
+    0%,100% { box-shadow: 0 0 0 0 rgba(124,131,255,0.5); }
+    50%     { box-shadow: 0 0 0 6px rgba(124,131,255,0); }
+  }
+  @keyframes avatar-listen {
+    0%   { box-shadow: 0 0 0 0 rgba(167,139,250,0.7); }
+    100% { box-shadow: 0 0 0 10px rgba(167,139,250,0); }
+  }
+  @keyframes avatar-speak {
+    0%   { box-shadow: 0 0 0 0 rgba(78,204,163,0.75); }
+    100% { box-shadow: 0 0 0 9px rgba(78,204,163,0); }
+  }
+  .avatar-wrap.s-idle > .avatar,
+  .hero-svg-wrap.s-idle > .avatar {
+    border-color: #7c83ff; animation: avatar-idle 3.2s ease-in-out infinite;
+  }
+  .avatar-wrap.s-listening > .avatar,
+  .hero-svg-wrap.s-listening > .avatar {
+    border-color: #a78bfa; animation: avatar-listen 1.4s ease-out infinite;
+  }
+  .avatar-wrap.s-speaking > .avatar,
+  .hero-svg-wrap.s-speaking > .avatar {
+    border-color: #6ee7b7; animation: avatar-speak 0.9s ease-out infinite;
+  }
+  .avatar-wrap.s-working > .avatar,
+  .hero-svg-wrap.s-working > .avatar {
+    border-color: #60a5fa; animation: avatar-work 2s linear infinite;
+  }
+  .avatar-wrap.s-seeing > .avatar,
+  .hero-svg-wrap.s-seeing > .avatar {
+    border-color: #fbbf24; animation: avatar-see 1.2s ease-in-out infinite;
+  }
+
+  /* Default inline-SVG avatar — shown when no custom avatar has been
+     generated (most new users). Mirrors docs/avatar-default.html mockup
+     from PR #443. State classes drive per-state animation via the .s-*
+     modifier on the container (#avatar-wrap / .hero-svg-wrap). */
+  .avatar-svg-default {
+    width: 100%; height: 100%; overflow: visible; display: block;
+  }
+  .avatar-svg-default .stand-body,
+  .avatar-svg-default .stand-head {
+    fill: var(--accent, #7c83ff); transition: fill 0.4s ease;
+  }
+  .avatar-svg-default .stand-visor { fill: #0f1117; }
+  .avatar-svg-default .stand-arm {
+    stroke: var(--accent, #7c83ff); stroke-width: 1.5; fill: none;
+    opacity: 0.45; transition: stroke 0.4s ease;
+  }
+  .avatar-svg-default .halo {
+    fill: none; stroke: var(--accent, #7c83ff);
+    stroke-width: 1.5; opacity: 0; transform-origin: center;
+  }
+  .avatar-svg-default .orbit-dot { fill: var(--accent, #60a5fa); opacity: 0; }
+  .avatar-svg-default .scan-beam { fill: var(--accent, #fbbf24); opacity: 0; }
+  .avatar-svg-default .constellation { stroke: #3a3f5c; stroke-width: 0.5; opacity: 0.3; }
+  .avatar-svg-default .constellation-node { fill: #3a3f5c; opacity: 0.35; }
+
+  /* idle — indigo, faint breathe */
+  .s-idle .avatar-svg-default { --accent: #7c83ff; }
+  .s-idle .avatar-svg-default .stand-body,
+  .s-idle .avatar-svg-default .stand-head {
+    animation: svg-breathe 4s ease-in-out infinite; transform-origin: 50% 55%;
+  }
+  @keyframes svg-breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+  }
+  /* listening — violet, concentric wave rings */
+  .s-listening .avatar-svg-default { --accent: #a78bfa; }
+  .s-listening .avatar-svg-default .halo { animation: svg-halo-pulse 1.6s ease-out infinite; }
+  .s-listening .avatar-svg-default .halo:nth-of-type(2) { animation-delay: 0.4s; }
+  .s-listening .avatar-svg-default .halo:nth-of-type(3) { animation-delay: 0.8s; }
+  @keyframes svg-halo-pulse {
+    0% { r: 26; opacity: 0.7; stroke-width: 2; }
+    100% { r: 46; opacity: 0; stroke-width: 0.5; }
+  }
+  /* speaking — green, visor sweep + glow */
+  .s-speaking .avatar-svg-default { --accent: #4ecca3; }
+  .s-speaking .avatar-svg-default .stand-visor { fill: url(#visorSweep); }
+  .s-speaking .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-glow 0.8s ease-in-out infinite alternate;
+  }
+  @keyframes svg-glow {
+    0% { r: 32; opacity: 0.25; stroke-width: 2; }
+    100% { r: 36; opacity: 0.5; stroke-width: 3; }
+  }
+  /* working — blue, orbiting dots + swell */
+  .s-working .avatar-svg-default { --accent: #60a5fa; }
+  .s-working .avatar-svg-default .orbit-dot {
+    opacity: 1; animation: svg-orbit 1.2s linear infinite;
+  }
+  .s-working .avatar-svg-default .orbit-dot:nth-of-type(2) {
+    animation-delay: -0.6s; opacity: 0.55;
+  }
+  @keyframes svg-orbit {
+    0%   { transform: rotate(0deg) translateX(28px) rotate(0deg); }
+    100% { transform: rotate(360deg) translateX(28px) rotate(-360deg); }
+  }
+  .s-working .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-work-swell 1.2s ease-in-out infinite;
+  }
+  @keyframes svg-work-swell {
+    0%, 100% { r: 28; opacity: 0.25; }
+    50% { r: 32; opacity: 0.55; }
+  }
+  /* seeing — amber, visor scan */
+  .s-seeing .avatar-svg-default { --accent: #fbbf24; }
+  .s-seeing .avatar-svg-default .scan-beam {
+    animation: svg-scan 0.7s ease-in-out infinite;
+  }
+  @keyframes svg-scan {
+    0%   { transform: translateX(-22px); opacity: 0; }
+    25%  { opacity: 0.9; }
+    75%  { opacity: 0.9; }
+    100% { transform: translateX(22px); opacity: 0; }
+  }
+  .s-seeing .avatar-svg-default .halo:nth-of-type(1) {
+    animation: svg-see-ring 0.7s ease-out infinite;
+  }
+  @keyframes svg-see-ring {
+    0%   { r: 28; opacity: 0.6; stroke-width: 2; }
+    100% { r: 38; opacity: 0; stroke-width: 0.5; }
+  }
+
+  /* Default SVG containers (hidden until identity fetch decides) */
+  #avatar-svg-wrap { position: absolute; top: 8px; left: 8px; width: 44px; height: 44px; display: none; }
+  .hero-svg-wrap { width: 80px; height: 80px; margin-bottom: 16px; display: none; }
+
   .header .info { flex: 1; }
-  .header h1 { color: #fff; font-size: 1.1em; font-weight: 500; }
-  .header .meta { font-size: 11px; color: #555; display: flex; gap: 12px; align-items: center; margin-top: 2px; }
-  .header .meta a { color: #555; text-decoration: none; border-bottom: 1px dotted #333; }
-  .header .meta a:hover { color: #888; }
+  .header h1 { color: var(--ui-text-hi); font-size: 1.15em; font-weight: 500; }
+  .header .meta { font-size: 16px; color: var(--ui-text-2); display: flex; gap: 14px; align-items: center; margin-top: 4px; }
+  .header .meta a { color: var(--ui-text-2); text-decoration: none; border-bottom: 1px dotted var(--ui-text-3); }
+  .header .meta a:hover { color: var(--ui-text); }
   .status-pill {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 500;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 12px; font-size: 16px; font-weight: 500;
   }
-  .status-pill.voice-on { background: #1a2e24; color: #4ecca3; }
-  .status-pill.voice-off { background: #1a1a2e; color: #666; }
+  .status-pill.voice-on { background: var(--ui-live-bg); color: var(--ui-live-fg); }
+  .status-pill.voice-off { background: var(--ui-chip); color: var(--ui-text-3); }
   .status-pill .dot {
     width: 6px; height: 6px; border-radius: 50%; background: #333;
   }
@@ -68,84 +353,202 @@ const HTML = /* html */ `<!DOCTYPE html>
   .btn-voice:hover { background: #277334; box-shadow: 0 0 16px rgba(78, 204, 163, 0.25); }
   .btn-voice.active { background: #8b1a1a; border-color: #a52222; box-shadow: none; }
   .btn-voice.active:hover { background: #a52222; }
-  .btn-mute { background: #2a2a3e; color: #888; }
-  .btn-mute:hover { background: #3a3a4e; color: #fff; }
+  .btn-mute { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-mute:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
   .btn-mute.muted { background: #4a1a1a; color: #e94560; }
-  .btn-subtle { background: transparent; color: #444; font-size: 11px; padding: 5px 8px; }
-  .btn-subtle:hover { color: #888; }
+  /* Watch (vision streaming) — matches the avatar 'seeing' palette (#fbbf24). */
+  .btn-watch { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-watch:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
+  .btn-watch.watching {
+    background: #3a2e10; color: #fbbf24; border: 1px solid #7a5a14;
+    box-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
+    animation: btn-watch-pulse 1.6s ease-in-out infinite;
+  }
+  .btn-watch.watching:hover { background: #4a3a14; color: #ffd966; }
+  @keyframes btn-watch-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(251, 191, 36, 0.3); }
+    50%      { box-shadow: 0 0 16px rgba(251, 191, 36, 0.55); }
+  }
+  .btn-subtle { background: transparent; color: var(--ui-text-3); font-size: 11px; padding: 5px 8px; }
+  .btn-subtle:hover { color: var(--ui-text-2); }
 
   /* Main content */
-  .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px; margin: 0 auto; }
+  .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px 80px; margin: 0 auto; }
 
   /* Conversation */
   #transcript {
-    flex: 1; min-height: 200px; max-height: 50vh;
-    background: #0e0e18; border-radius: 12px; padding: 14px 16px;
-    overflow-y: auto; font-size: 14px; line-height: 1.7;
-    margin-bottom: 10px;
+    min-height: 80px; max-height: 50vh;
+    background: var(--ui-raised); border-radius: 12px; padding: 10px 14px;
+    overflow-y: auto; font-size: 16px; line-height: 1.6;
+    margin-bottom: 6px;
   }
-  .t-entry { margin-bottom: 6px; }
+  .t-entry { margin-bottom: 8px; position: relative; user-select: text; }
+  .t-entry .copy-btn {
+    display: none; position: absolute; right: 0; top: 0;
+    background: var(--ui-chip); border: 1px solid var(--ui-line); color: var(--ui-text-3); font-size: 10px;
+    padding: 2px 6px; border-radius: 4px; cursor: pointer;
+  }
+  .t-entry:hover .copy-btn { display: inline-block; }
+  .t-entry .copy-btn:hover { color: #4ecca3; border-color: #4ecca3; }
   .t-user { color: #7fb3e0; }
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
-  .t-system { color: #666; font-size: 12px; }
-  .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 13px; }
+  .t-working { opacity: 0.6; font-style: italic; }
+  @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
+  .t-system { color: var(--ui-text-2); font-size: 14px; }
+  .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
 
   /* Input bar */
+  #bottom-panel {
+    position: fixed; bottom: 0; left: 0; right: 0; max-width: 960px; margin: 0 auto;
+    background: var(--ui-sunken); z-index: 10;
+    border-top: 1px solid var(--ui-line);
+    padding: 8px 16px 12px;
+  }
   .input-bar {
-    display: flex; gap: 8px; margin-bottom: 12px;
+    display: flex; gap: 8px;
   }
   .input-bar input {
-    flex: 1; padding: 10px 14px; border-radius: 10px;
-    border: 1px solid #1e1e30; background: #0e0e18; color: #fff; font-size: 13px;
+    flex: 1; padding: 12px 16px; border-radius: 10px;
+    border: 1px solid var(--ui-line); background: var(--ui-raised); color: var(--ui-text); font-size: 16px;
     outline: none;
   }
   .input-bar input:focus { border-color: #4ecca3; }
-  .input-bar input::placeholder { color: #444; }
+  .input-bar input::placeholder { color: var(--ui-text-3); }
   .btn-send { background: #1a2e24; color: #4ecca3; border: 1px solid #2a4a36; }
   .btn-send:hover { background: #243e30; }
 
   /* Tasks */
   #tasks {
-    background: #0e0e18; border-radius: 10px; padding: 8px 14px;
+    background: var(--ui-raised); border-radius: 10px; padding: 8px 14px;
     margin-bottom: 10px; font-size: 12px;
   }
   #tasks:empty { display: none; }
   .task-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 5px 0; border-bottom: 1px solid #141420;
+    display: flex; align-items: center; gap: 13px;
+    padding: 15px 10px; margin: 0 -10px; border-bottom: 1px solid #141420;
+    transition: background 0.12s; border-radius: 6px;
   }
   .task-item:last-child { border-bottom: none; }
+  .task-item:hover { background: #1a1a2a; cursor: pointer; }
+  .task-workstream + .task-workstream { margin-top: 7px; }
+  .task-workstream-header {
+    appearance: none; width: 100%; display: flex; align-items: center;
+    justify-content: space-between; gap: 8px; padding: 9px 10px;
+    color: #aeb4ff; background: #11111d; cursor: pointer;
+    border: 1px solid #24243a; border-radius: 8px; font-family: inherit;
+    text-align: left; font-size: 12px;
+    font-weight: 600; letter-spacing: 0.02em;
+  }
+  .task-workstream-header:hover { background: #18182a; border-color: #39395d; }
+  .task-workstream-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .task-workstream-chevron { color: #6f75ba; width: 10px; flex-shrink: 0; }
+  .task-workstream-count { color: #666; font-size: 11px; font-weight: 400; }
+  .task-workstream-tasks { padding-top: 3px; }
+  .task-workstream--collapsed .task-workstream-tasks { display: none; }
+  .note-item:hover { background: #1a1a2a; }
   .task-status {
-    width: 16px; height: 16px; border-radius: 50%;
+    width: 22px; height: 22px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-size: 9px; flex-shrink: 0;
+    font-size: 12px; flex-shrink: 0;
   }
   .task-status.working { background: #1e3a5f; color: #60a5fa; animation: pulse 1.5s infinite; }
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .task-text { color: #888; flex: 1; word-break: break-word; }
-  .task-time { color: #444; font-size: 10px; }
+  .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 1s yellow flash on a task-item when voice expand:N targets it.
+     Visual confirmation that the expand landed, independent of whether
+     the task has a result body to display. */
+  @keyframes task-flash-anim {
+    0% { background: rgba(255, 220, 100, 0.45); }
+    100% { background: transparent; }
+  }
+  .task-item.task-flash { animation: task-flash-anim 1s ease-out; }
+  .task-text.expanded { white-space: normal; }
+  .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
+  .task-expand {
+    flex-shrink: 0; padding: 5px 12px; border-radius: 12px;
+    background: #2a4060; color: #d8e8f8; font-size: 13px; font-weight: 500;
+    cursor: pointer; border: 1px solid #3a5075; user-select: none;
+  }
+  .task-expand:hover { background: #3a5075; color: #ffffff; }
+  .task-actions {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    margin: -2px 0 10px 30px; padding: 0; user-select: text;
+  }
+  .task-action-btn {
+    background: #1e3a5f; color: #d8e8f8; border: 1px solid #2a4a7a;
+    padding: 5px 12px; border-radius: 14px; font-size: 12px; font-weight: 600;
+    cursor: pointer; user-select: none;
+  }
+  .task-action-btn:hover { background: #2a4a7a; color: #ffffff; border-color: #3a5a9a; }
+  .task-action-btn:active { background: #3a5a9a; }
+  .task-action-input {
+    flex: 1; min-width: 140px; background: #0d1520; border: 1px solid #2a4a7a;
+    color: #d0d0d8; padding: 5px 12px; border-radius: 14px; font-size: 12px;
+    outline: none;
+  }
+  .task-action-input:focus { border-color: #4ecca3; }
+  .task-action-sent {
+    color: #4ecca3; font-size: 12px; font-style: italic;
+    margin: 4px 0 10px 30px;
+  }
 
   /* Dynamic region */
-  #dynamic-region { padding: 0 16px 8px; }
+  #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
-  #core-status-bar { text-align: center; font-size: 11px; color: #555; padding: 2px 16px; }
+  #core-status-bar { font-size: 16px; color: var(--ui-text-2); }
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
-  #core-status-bar .core-idle { color: #444; }
+  #core-status-bar .core-idle { color: var(--ui-text-3); }
+  /* Presenter-mode badge — only visible when the /presenter same-origin
+     endpoint reports active:true. The endpoint reads state/presenter-mode.sentinel
+     (written by scripts/presenter-mode.sh). Mirrors the Swift menu-bar HUD's
+     eventual "presenting" state on the web side. */
+  #presenter-badge {
+    display: none; margin-left: 14px; padding: 4px 10px; border-radius: 12px;
+    background: linear-gradient(135deg, #6a1b9a, #4527a0); color: #fff;
+    font-size: 13px; font-weight: 600; letter-spacing: 0.5px;
+    box-shadow: 0 0 8px #8e24aa88; vertical-align: middle;
+  }
+  #presenter-badge.active { display: inline-block; animation: pb-pulse 2s infinite; }
+  @keyframes pb-pulse {
+    0%, 100% { box-shadow: 0 0 8px #8e24aa88; }
+    50%      { box-shadow: 0 0 14px #ce93d8cc; }
+  }
+  /* Meeting-mode badge — only visible when state/voice-mode.txt is "meeting"
+     AND presenter mode is off (presenter takes precedence). renderModeBadge()
+     populates textContent + adds .meeting class to make it visible. Color
+     is amber to match the menu-bar app meeting dot (#b26a00, see
+     src/Sutando/main.swift avatarImage — meeting amber dot). */
+  #mode-badge {
+    display: none; margin-left: 10px; padding: 3px 9px; border-radius: 12px;
+    background: linear-gradient(135deg, #d68000, #b26a00); color: #fff;
+    font-size: 13px; font-weight: 600; letter-spacing: 0.4px;
+    box-shadow: 0 0 6px #d6800066; vertical-align: middle;
+  }
+  #mode-badge.meeting { display: inline-block; }
   #dynamic-region .dr-questions {
     background: linear-gradient(135deg, #1e1a12, #2a2218); border: 1px solid #f0ad4e44;
-    border-radius: 10px; padding: 12px 16px; font-size: 13px; box-shadow: 0 0 12px #f0ad4e22;
+    border-radius: 10px; padding: 14px 18px; font-size: 16px; box-shadow: 0 0 12px #f0ad4e22;
   }
-  #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  #dynamic-region .dr-questions .q-item { color: #ddd; padding: 8px 0; border-bottom: 1px solid #2e281844; }
+  #dynamic-region .dr-questions .q-title { color: #f0ad4e; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  #dynamic-region .dr-questions .q-item { color: #ddd; padding: 10px 0; border-bottom: 1px solid #2e281844; }
   #dynamic-region .dr-questions .q-item:last-child { border-bottom: none; }
-  #dynamic-region .q-actions { margin-top: 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  #dynamic-region .q-queue-meta { display: flex; gap: 10px; align-items: baseline; font-size: 11px; color: #8a8a99; margin-bottom: 6px; }
+  #dynamic-region .q-wait { color: #f0ad4e; font-weight: 600; }
+  #dynamic-region .q-blocks { color: #7c83ff; }
+  #dynamic-region .q-recheck { font-size: 11px; margin: 6px 0; padding: 5px 8px; border-radius: 6px; background: #2e281844; color: #f0ad4e; }
+  #dynamic-region .q-recheck.q-stale { background: #1d3a2a; color: #4ecca3; }
+  #dynamic-region .q-nav { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  #dynamic-region .q-nav .q-btn { flex: 0 0 auto; }
+  #dynamic-region .q-empty { color: #666; font-size: 12px; text-align: center; padding: 12px; }
+  #dynamic-region .q-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #dynamic-region .q-btn {
-    padding: 4px 14px; border-radius: 14px; font-size: 11px; cursor: pointer;
+    padding: 6px 16px; border-radius: 14px; font-size: 15px; cursor: pointer;
     border: 1px solid #2e2818; background: #1e1a12; color: #ccc; transition: all 0.15s;
   }
   #dynamic-region .q-btn:hover { background: #2e2818; border-color: #f0ad4e66; }
@@ -154,29 +557,29 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .q-btn.q-no { border-color: #e9456066; color: #e94560; }
   #dynamic-region .q-btn.q-no:hover { background: #3a1520; }
   #dynamic-region .q-input {
-    flex: 1; min-width: 120px; padding: 4px 10px; border-radius: 14px; font-size: 11px;
+    flex: 1; min-width: 120px; padding: 6px 12px; border-radius: 14px; font-size: 15px;
     border: 1px solid #2e2818; background: #12100a; color: #ccc; outline: none;
   }
   #dynamic-region .q-input:focus { border-color: #f0ad4e66; }
-  #dynamic-region .dr-proactive { text-align: center; padding: 8px; font-size: 13px; color: #8899a6; }
+  #dynamic-region .dr-proactive { text-align: center; padding: 10px; font-size: 16px; color: #a8b8c6; }
   #dynamic-region .dr-chips { text-align: center; }
-  #dynamic-region .dr-chips .suggestions-label { margin-bottom: 6px; }
+  #dynamic-region .dr-chips .suggestions-label { margin-bottom: 8px; }
   #dynamic-region .dr-chips .suggestion {
-    display: inline-block; background: #1a1a2e; border: 1px solid #2a2a4e;
-    border-radius: 16px; padding: 6px 14px; margin: 3px; font-size: 11px;
+    display: inline-block; background: var(--ui-chip); border: 1px solid var(--ui-line);
+    border-radius: 16px; padding: 7px 15px; margin: 4px; font-size: 15px;
     color: #8899a6; cursor: pointer; transition: all 0.2s;
   }
-  #dynamic-region .dr-chips .suggestion:hover { background: #2a2a4e; color: #ccc; border-color: #4a4a6e; }
+  #dynamic-region .dr-chips .suggestion:hover { background: var(--ui-chip-hover); color: var(--ui-text); border-color: var(--ui-line); }
   #dynamic-region .dr-media {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px;
     padding: 12px 16px; text-align: center;
   }
-  #dynamic-region .dr-media-title { color: #ccc; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
-  #dynamic-region .dr-media-caption { color: #666; font-size: 11px; margin-top: 6px; }
+  #dynamic-region .dr-media-title { color: var(--ui-text); font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  #dynamic-region .dr-media-caption { color: var(--ui-text-3); font-size: 11px; margin-top: 6px; }
   #dynamic-region .dr-document {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px; padding: 12px 16px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px; padding: 12px 16px;
   }
-  #dynamic-region .dr-doc-body { color: #bbb; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+  #dynamic-region .dr-doc-body { color: var(--ui-text); font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
 
   /* Section labels */
   .section-label {
@@ -187,24 +590,35 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Debug */
   #debug {
     background: #08080f; border-radius: 10px; padding: 10px 12px;
-    max-height: 20vh; overflow-y: auto; font-size: 10px; line-height: 1.5;
+    max-height: 30vh; overflow-y: auto; font-size: 10px; line-height: 1.6;
     font-family: 'SF Mono', 'Fira Code', monospace;
+    margin-bottom: 10px;
   }
-  .d-entry { color: #444; }
+  #debug-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  #debug-header .debug-actions { display: flex; gap: 8px; }
+  #debug-header .debug-actions button {
+    background: none; border: 1px solid #222; color: #555; font-size: 10px;
+    padding: 2px 8px; border-radius: 4px; cursor: pointer;
+  }
+  #debug-header .debug-actions button:hover { color: #aaa; border-color: #444; }
+  .d-entry { color: #555; padding: 1px 0; }
   .d-entry.warn { color: #f0ad4e; }
   .d-entry.err { color: #ef5350; }
   .d-entry.event { color: #9575cd; }
   .d-entry.audio { color: #4db6ac; }
   .btn-download {
     display: inline-block; margin-top: 6px; padding: 4px 10px;
-    border-radius: 6px; border: 1px solid #1e1e30; background: #0e0e18;
+    border-radius: 6px; border: 1px solid var(--ui-line); background: var(--ui-raised);
     color: #555; font-size: 11px; cursor: pointer; text-decoration: none;
   }
-  .btn-download:hover { background: #1a1a2e; color: #aaa; }
+  .btn-download:hover { background: var(--ui-chip); color: var(--ui-text); }
 
   /* Hidden URL input */
   #wsUrl { display: none; }
-  .stats { font-size: 10px; color: #444; }
+  .stats { font-size: 14px; color: #777; }
 
   /* Hero connect screen — shown when voice is disconnected */
   .hero {
@@ -216,8 +630,21 @@ const HTML = /* html */ `<!DOCTYPE html>
     border: 3px solid #4ecca3; object-fit: cover; margin-bottom: 16px; display: none;
     transition: all 0.8s ease;
   }
-  .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
-  .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
+  .hero .avatar-hero.speaking {
+    border-color: #6ee7b7;
+  }
+  .hero .avatar-hero.working:not(.speaking) {
+    border-color: #60a5fa;
+    box-shadow: 0 0 14px rgba(96,165,250,0.4);
+    animation: avatar-work 2s linear infinite;
+  }
+  .hero .avatar-hero.seeing:not(.speaking) {
+    border-color: #fbbf24;
+    box-shadow: 0 0 16px rgba(251,191,36,0.55);
+    animation: avatar-see 1.2s ease-in-out infinite;
+  }
+  .hero h2 { color: var(--ui-text-hi); font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
+  .hero .tagline { color: var(--ui-text-3); font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
     0% { box-shadow: 0 0 0 rgba(78,204,163,0); transform: scale(0.9); opacity: 0; }
     40% { box-shadow: 0 0 40px rgba(78,204,163,0.7); transform: scale(1.05); opacity: 1; }
@@ -239,12 +666,104 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* When voice is active, hide hero */
   body.voice-active .hero { display: none; }
   body.voice-active .main { display: flex; }
+  /* Capabilities panel — shown on idle, hidden when voice is active */
+  .caps-panel {
+    max-width: 480px; margin: 0 auto 20px; padding: 12px 18px;
+    border: 1px solid var(--ui-line); border-radius: 8px;
+    background: var(--ui-raised);
+  }
+  body.voice-active .caps-panel { display: none; }
+  .caps-panel .caps-heading {
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ui-text-3); margin-bottom: 8px;
+  }
+  .caps-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .caps-panel dt { color: var(--ui-accent); font-size: 12px; white-space: nowrap; padding: 2px 0; }
+  .caps-panel dd { color: var(--ui-text-3); font-size: 12px; margin: 0; padding: 2px 0; }
+  /* Toast notifications */
+  .toast-container {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    z-index: 100; display: flex; flex-direction: column; gap: 6px; align-items: center;
+  }
+  .toast {
+    background: var(--ui-live-bg); border: 1px solid var(--ui-line); color: var(--ui-text);
+    padding: 10px 16px; border-radius: 10px; font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    animation: toastIn 0.3s ease, toastOut 0.3s ease 3.7s forwards;
+    max-width: 400px; text-align: center;
+  }
+  .toast .toast-label { color: #4ecca3; font-weight: 600; }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateY(-8px); } }
+
+  /* Markdown styles inside .t-assistant — when the bridge result contains
+     headings/lists/code, render it instead of showing raw # ## etc. The
+     bubble already has a colored prefix ("Sutando: ") via .t-assistant::before. */
+  .t-assistant h1, .t-assistant h2, .t-assistant h3, .t-assistant h4 { color: #e8e8ee; font-weight: 700; margin: 0.5em 0 0.3em; }
+  .t-assistant h1 { font-size: 1.3em; }
+  .t-assistant h2 { font-size: 1.15em; }
+  .t-assistant h3 { font-size: 1.05em; }
+  .t-assistant p { margin: 0.4em 0; }
+  .t-assistant ul, .t-assistant ol { margin: 0.4em 0; padding-left: 1.6em; }
+  .t-assistant li { margin: 0.2em 0; }
+  .t-assistant code { background: var(--ui-code-bg); padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
+  .t-assistant pre { background: var(--ui-code-bg); padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid var(--ui-line); }
+  .t-assistant pre code { background: none; padding: 0; color: var(--ui-text); font-size: 0.9em; }
+  .t-assistant a { color: #6ea3ff; text-decoration: none; }
+  .t-assistant a:hover { text-decoration: underline; }
+  .t-assistant strong { color: #f0f0f8; font-weight: 700; }
+  .t-assistant table { border-collapse: collapse; margin: 0.4em 0; font-size: 0.95em; }
+  .t-assistant th, .t-assistant td { border: 1px solid var(--ui-line); padding: 4px 8px; }
+  .t-assistant th { background: var(--ui-sunken); }
+  .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<!-- DOMPurify — agent results come from external task channels (Discord,
+     Telegram, voice, SMS) and aren't trusted input. marked@12 ships no
+     sanitizer by default, so unwrapped innerHTML on transcript replies would
+     execute embedded <script> / inline handlers. Sandbox before insertion. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 </head>
 <body>
 
 <div class="header">
-  <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+  <div class="avatar-wrap s-idle" id="avatar-wrap">
+    <canvas id="speak-canvas" width="60" height="60"></canvas>
+    <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+    <div id="avatar-svg-wrap">
+      <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="visorSweep" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#6ee7b7"/>
+            <stop offset="50%" stop-color="#a7f3d0"/>
+            <stop offset="100%" stop-color="#6ee7b7"/>
+            <animate attributeName="x1" values="-100%;100%" dur="1.2s" repeatCount="indefinite"/>
+            <animate attributeName="x2" values="0%;200%" dur="1.2s" repeatCount="indefinite"/>
+          </linearGradient>
+        </defs>
+        <circle class="constellation-node" cx="-34" cy="-28" r="1.2"/>
+        <circle class="constellation-node" cx="32" cy="-30" r="1"/>
+        <circle class="constellation-node" cx="-28" cy="32" r="1.2"/>
+        <circle class="constellation-node" cx="36" cy="26" r="1"/>
+        <line class="constellation" x1="-34" y1="-28" x2="32" y2="-30"/>
+        <line class="constellation" x1="32" y1="-30" x2="36" y2="26"/>
+        <line class="constellation" x1="-28" y1="32" x2="36" y2="26"/>
+        <path class="stand-arm" d="M -14 0 Q -26 4 -30 14"/>
+        <path class="stand-arm" d="M 14 0 Q 26 4 30 14"/>
+        <path class="stand-arm" d="M -14 -2 Q -22 -14 -18 -24"/>
+        <path class="stand-arm" d="M 14 -2 Q 22 -14 18 -24"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <circle class="halo" cx="0" cy="0" r="32"/>
+        <ellipse class="stand-body" cx="0" cy="10" rx="14" ry="22"/>
+        <circle class="stand-head" cx="0" cy="-18" r="10"/>
+        <rect class="stand-visor" x="-8" y="-20" width="16" height="4" rx="1"/>
+        <rect class="scan-beam" x="-3" y="-22" width="6" height="8" rx="1"/>
+        <circle class="orbit-dot" cx="0" cy="0" r="2.2"/>
+        <circle class="orbit-dot" cx="0" cy="0" r="1.6"/>
+      </svg>
+    </div>
+  </div>
   <div class="info">
     <h1 id="stand-name">Sutando</h1>
     <div class="meta">
@@ -256,10 +775,20 @@ const HTML = /* html */ `<!DOCTYPE html>
   <div class="controls">
     <button id="btn" class="btn-voice" onclick="toggle()" style="display:none">End Voice</button>
     <button id="btn-mute" class="btn-mute" onclick="toggleMute()" style="display:none">Mute</button>
-    <button class="btn-subtle" onclick="saveDebug()">Debug</button>
+    <button id="btn-watch" class="btn-watch" onclick="toggleWatch()" title="Let Sutando watch your screen" style="display:none">👁️ Watch</button>
   </div>
 </div>
-<input type="text" id="wsUrl" value="${DEFAULT_WS_URL}" />
+<!-- Vision preview — shows what Sutando is seeing. Mirrors the MediaStream
+     captured by getDisplayMedia so the user can verify the picked surface
+     and see the same view the model gets. -->
+<div id="vision-preview-wrap" style="display:none; position: fixed; bottom: 16px; right: 16px; z-index: 200; background: rgba(0,0,0,0.6); border: 2px solid #fbbf24; border-radius: 10px; padding: 6px 6px 4px; box-shadow: 0 4px 18px rgba(0,0,0,0.35), 0 0 14px rgba(251,191,36,0.45); max-width: 280px;">
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; font: 11px/1.2 -apple-system, system-ui, sans-serif; color:#fbbf24;">
+    <span style="display:inline-flex; align-items:center; gap:6px;">👁️ Sutando is seeing</span>
+    <span id="vision-preview-stats" style="color:#bbb; font-size:10px;"></span>
+  </div>
+  <video id="vision-preview" autoplay muted playsinline style="display:block; width: 100%; max-height: 180px; background:#000; border-radius:6px;"></video>
+</div>
+<input type="text" id="wsUrl" value="" placeholder="${DEFAULT_WS_URL}" />
 <script>
 fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   if(s.name){
@@ -274,6 +803,16 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     document.getElementById('stand-avatar').style.display='block';
     var ha=document.getElementById('hero-avatar');
     if(ha){ha.style.display='block';ha.style.opacity='0';}
+  } else {
+    // No custom avatar — show the inline-SVG default in both places.
+    // PR #443 shipped the SVG assets in docs/avatar-default.html; this
+    // wiring makes them visible at runtime for the common "no custom
+    // identity yet" path. State classes on the containers (s-idle etc.)
+    // are toggled by the SSE agent-state bridge below.
+    var svgHeader=document.getElementById('avatar-svg-wrap');
+    if(svgHeader) svgHeader.style.display='block';
+    var svgHero=document.getElementById('hero-svg-wrap');
+    if(svgHero) svgHero.style.display='block';
   }
   if(s.name || s.avatarGenerated){
     var hero=document.getElementById('hero');
@@ -288,18 +827,65 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 }).catch(()=>{});
 </script>
 
-<div class="hero" id="hero">
+<div class="hero s-idle" id="hero">
   <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  <div class="hero-svg-wrap" id="hero-svg-wrap">
+    <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
+      <!-- Hero reuses header's #visorSweep gradient (single definition). -->
+      <circle class="constellation-node" cx="-34" cy="-28" r="1.2"/>
+      <circle class="constellation-node" cx="32" cy="-30" r="1"/>
+      <circle class="constellation-node" cx="-28" cy="32" r="1.2"/>
+      <circle class="constellation-node" cx="36" cy="26" r="1"/>
+      <line class="constellation" x1="-34" y1="-28" x2="32" y2="-30"/>
+      <line class="constellation" x1="32" y1="-30" x2="36" y2="26"/>
+      <line class="constellation" x1="-28" y1="32" x2="36" y2="26"/>
+      <path class="stand-arm" d="M -14 0 Q -26 4 -30 14"/>
+      <path class="stand-arm" d="M 14 0 Q 26 4 30 14"/>
+      <path class="stand-arm" d="M -14 -2 Q -22 -14 -18 -24"/>
+      <path class="stand-arm" d="M 14 -2 Q 22 -14 18 -24"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <circle class="halo" cx="0" cy="0" r="32"/>
+      <ellipse class="stand-body" cx="0" cy="10" rx="14" ry="22"/>
+      <circle class="stand-head" cx="0" cy="-18" r="10"/>
+      <rect class="stand-visor" x="-8" y="-20" width="16" height="4" rx="1"/>
+      <rect class="scan-beam" x="-3" y="-22" width="6" height="8" rx="1"/>
+      <circle class="orbit-dot" cx="0" cy="0" r="2.2"/>
+      <circle class="orbit-dot" cx="0" cy="0" r="1.6"/>
+    </svg>
+  </div>
   <h2 id="hero-name">Sutando</h2>
-  <p class="tagline">Summon your AI superpower</p>
+  <p class="tagline">My AI Stand · Summon my AI superpower</p>
   <button class="btn-hero" onclick="toggle()">Start Voice</button>
 </div>
 
+<div class="caps-panel">
+  <p class="caps-heading">What I can do</p>
+  <dl>
+    <dt>Voice + screen</dt><dd>control any Mac app by voice; read what's on screen</dd>
+    <dt>Comms</dt><dd>phone, iMessage, Telegram, Discord</dd>
+    <dt>Calendar + email</dt><dd>Gmail / Google Calendar; draft replies; book meetings</dd>
+    <dt>Autonomous work</dt><dd>ships code, summarizes news, runs benchmarks</dd>
+    <dt>Fleet</dt><dd>coordinates with other Sutandos under access tiers</dd>
+    <dt>Skills</dt><dd><code style="color:#8af;font-size:11px">/list-skills</code> to see all installed</dd>
+  </dl>
+</div>
+
+<div id="status-bar" style="text-align:center;font-size:16px;color:#888;letter-spacing:0.3px;padding:12px 16px">
+  <!-- Hotkey hints render from /hotkeys (published by the Sutando app from its
+       resolved config — single source of truth, no hardcoded keys here). -->
+  <span id="hotkey-hints"></span>
+  <span id="core-status-bar" style="display:inline"></span>
+  <span id="presenter-badge">🎤 PRESENTER MODE</span>
+  <span id="mode-badge"></span>
+</div>
+
 <div id="dynamic-region"></div>
-<div id="core-status-bar"></div>
 
 <div class="main" id="main-area">
 
+<div class="toast-container" id="toast-container"></div>
+<div id="bottom-panel">
 <div id="transcript">
   <div class="t-entry t-system">Ask Sutando anything.</div>
 </div>
@@ -308,24 +894,38 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
   <input type="text" id="textInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendText()" />
   <button class="btn-send" onclick="sendText()">Send</button>
 </div>
-
-<div id="tasks-header" style="display:none;margin:8px 0 2px;font-size:11px;color:#555;display:flex;justify-content:space-between;align-items:center">
-  <span>Tasks</span>
-  <span style="cursor:pointer;color:#4a6a7a" onclick="toggleAllTasks()">collapse all</span>
 </div>
-<div id="tasks"></div>
+
+<div id="tasks-header" style="display:none"></div>
+<div id="tasks" style="display:none"></div>
 
 <div class="section-label" style="cursor:pointer" onclick="$('debug').style.display=$('debug').style.display==='none'?'':'none'">Debug</div>
-<div id="debug" style="display:none"></div>
-
+<div id="debug" style="display:none">
+  <div id="debug-header">
+    <span style="color:#666;font-size:10px">Voice session log</span>
+    <div class="debug-actions">
+      <button onclick="$('debug').querySelectorAll('.d-entry').forEach(function(e){e.remove()});debugLog.length=0">Clear</button>
+      <button onclick="saveDebug()">Export</button>
+    </div>
+  </div>
 </div>
 
+<div style="height:80px"></div>
+</div>
+
+<!-- The ONE canonical browser voice transport (src/web-voice-transport.ts),
+     served as a classic-script IIFE that installs the SutandoVoice global.
+     Loaded before the page script so SutandoVoice is defined when voice
+     wiring below runs. A 503 here (packaging error) logs to the console and
+     connectWs() reports it to the user. -->
+<script src="${BROWSER_TRANSPORT_ROUTE}"></script>
 <script>
 // ─── Config ───────────────────────────────────────────────
 let INPUT_RATE  = 16000;
 let OUTPUT_RATE = 24000;
 const CAPTURE_BUF = 2048;
 const WS_PORT = ${WS_PORT};
+const LAN_SHARE = ${LAN_SHARE ? 'true' : 'false'};
 
 // Auto-detect WebSocket URL from current hostname
 function getDefaultWsUrl() {
@@ -335,37 +935,171 @@ function getDefaultWsUrl() {
   if (window.location.protocol === 'https:') {
     return protocol + '//' + hostname + '/ws';
   }
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  if (!isLoopback && LAN_SHARE) {
+    // Served to a LAN peer AND LAN sharing is on: the voice WS port is
+    // loopback-only, so route through the /ws proxy on this LAN-reachable HTTP
+    // port. (Only when the proxy actually exists — otherwise fall through to the
+    // direct port so trusted remote deployments with a reachable WS port work.)
+    return protocol + '//' + window.location.host + '/ws';
+  }
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
 
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
+}
+
 // Set default WebSocket URL on page load + init Chrome STT
+// Descriptions are local UI copy keyed by the stable action name; the KEY
+// bindings come from /hotkeys (the app's published config) so they never drift.
+function renderHotkeyHints() {
+  var desc = { drop_context: 'drop context', drop_screenshot: 'drop screenshot',
+    drop_video_clip: 'drop video', toggle_voice: 'voice', toggle_mute: 'mute' };
+  var el = document.getElementById('hotkey-hints');
+  if (!el) return;
+  fetch('/hotkeys').then(function (r) { return r.json(); }).then(function (list) {
+    if (!Array.isArray(list) || !list.length) return;
+    var kbd = 'background:#1a1a2e;padding:3px 8px;border-radius:4px;border:1px solid #333;font-family:monospace;color:#8af;font-size:14px';
+    var sep = '<span style="margin:0 8px;color:#444">|</span>';
+    el.innerHTML = list.map(function (e) {
+      return '<kbd style="' + kbd + '">' + esc(e.label || '') + '</kbd> ' + (desc[e.action] || esc(e.action || ''));
+    }).join(sep) + sep;
+  }).catch(function () {});
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   const wsUrlInput = $('wsUrl');
   if (wsUrlInput && !wsUrlInput.value) {
     wsUrlInput.value = getDefaultWsUrl();
   }
+  renderHotkeyHints();
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
+});
+
+// ─── Remote toggle via SSE ────────────────────────────────
+// Chrome throttles/suspends background tabs after ~5 min, killing SSE event
+// processing. On visibility change (tab returns to foreground), reconnect
+// the EventSource so ⌃V/⌃M hotkeys work immediately after tab wake-up.
+let _sseSource = null;
+function initRemoteToggle() {
+  if (_sseSource) { try { _sseSource.close(); } catch {} }
+  _sseSource = new EventSource('/sse');
+  _sseSource.addEventListener('toggle-voice', () => toggle());
+  _sseSource.addEventListener('toggle-mute', () => toggleMute());
+  // Server-pushed agent state (working/seeing). Browser's own reportAgentState
+  // poll derives listening/speaking from audio RMS, but working and seeing
+  // originate from server-side tool calls (capture_screen, any inline tool
+  // run) — without this bridge, the CSS never fires during voice because
+  // the DOM doesn't know the server is in that state.
+  _sseSource.addEventListener('agent-state', (e) => {
+    try {
+      var st = String(e.data || '').trim();
+      var av = document.getElementById('stand-avatar');
+      var hav = document.getElementById('hero-avatar');
+      var setWorking = st === 'working';
+      var setSeeing = st === 'seeing';
+      if (av) { av.classList.toggle('working', setWorking); av.classList.toggle('seeing', setSeeing); }
+      if (hav) { hav.classList.toggle('working', setWorking); hav.classList.toggle('seeing', setSeeing); }
+      // Drive inline-SVG default avatar via .s-* classes on parent
+      // containers (header #avatar-wrap + .hero). Server emits 'idle',
+      // 'listening', 'speaking', 'working', 'seeing'; we keep exactly one
+      // active and default to s-idle when the state is empty/unknown.
+      var validStates = ['idle', 'listening', 'speaking', 'working', 'seeing'];
+      var next = validStates.indexOf(st) >= 0 ? st : 'idle';
+      var aw = document.getElementById('avatar-wrap');
+      var hw = document.getElementById('hero');
+      [aw, hw].forEach(function(el) {
+        if (!el) return;
+        validStates.forEach(function(s) { el.classList.remove('s-' + s); });
+        el.classList.add('s-' + next);
+      });
+    } catch {}
+  });
+  // Short audible cue when the agent invokes a tool/core (owner ask
+  // 2026-07-09) — a subtle "the answer is grounded" signal. Distinct pitch
+  // per kind: research (cloud lookup) / work (local core) / tool (inline).
+  _sseSource.addEventListener('tool-cue', function(e) {
+    try { playToolCue(String(e.data || '').trim()); } catch {}
+  });
+  _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
+}
+initRemoteToggle();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') initRemoteToggle();
 });
 
 // ─── State ────────────────────────────────────────────────
-let ws = null;
+// Page-level AudioContext is for tool cues ONLY — the voice audio graph
+// (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
-let micStream = null;
-let processor = null;
+// Play a short, low-volume Web Audio blip to signal a tool/core invocation
+// (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
+// gesture, so it's already running during a voice session. Pitch/shape differ
+// by kind so the user can tell a cloud research lookup from a local-core
+// handoff by ear alone. Fire-and-forget: never blocks or gates the tool call.
+function playToolCue(kind) {
+  try {
+    if (!audioCtx) { try { audioCtx = new AudioContext(); } catch (e) { return; } }
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    // [freq Hz, startOffset s, duration s] steps. Kept <120ms total, gain low
+    // so the blip sits under speech without masking it. Retune here freely.
+    var seqs = {
+      research: [[720, 0.0, 0.05], [1080, 0.06, 0.06]], // two rising notes — reaching out to the cloud
+      work:     [[500, 0.0, 0.11]],                     // one low note — handing off to local core
+      tool:     [[820, 0.0, 0.045]]                     // short mid tick — inline tool
+    };
+    var seq = seqs[kind] || seqs.tool;
+    var vol = 0.05; // "not too loud" (owner)
+    var now = audioCtx.currentTime;
+    seq.forEach(function(step) {
+      var freq = step[0], t0 = now + step[1], dur = step[2];
+      var osc = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      // Fast attack, exponential decay — avoids the click of a hard on/off edge.
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(vol, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g); g.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    });
+  } catch (e) {}
+}
+// Voice session surface state. The audio pipeline + WS protocol live in the
+// canonical transport (SutandoVoice.VoiceTransport, loaded from
+// /web-voice-transport.js); the page keeps ONLY surface concerns: transcript
+// DOM, status text, stats mirror, reconnect policy, avatar analyser.
+let voice = null;               // SutandoVoice.VoiceTransport of the active session
 let connected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
-let nextPlayTime = 0;
-let activeSources = [];
-let playbackRate = 1.0;
-let bytesSent = 0;
+let analyserNode = null;        // playback AnalyserNode handed over via onAnalyser
+let speakingRAF = null;
+let bytesSent = 0;              // onStats mirror (stats panel + debug dump)
 let bytesRecv = 0;
-let audioChunksRecv = 0;
-let playChunkCount = 0;
-let statsTimer = null;
 let muted = false;
+let micAnnounced = false;       // one "Microphone active" system line per session
+let cleanupDone = true;         // doCleanup idempotence latch (reset on connect)
+let _voiceUrlOverride = null;   // takeoverVoice() one-shot URL override
 
 // Chrome STT state — provides real-time interim display; server STT replaces with final
 let recognition = null;
@@ -412,7 +1146,7 @@ function showChromeSttInterim(text) {
     $('transcript').appendChild(currentUserEl);
   }
   currentUserEl.textContent = text;
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function startChromeStt() {
@@ -428,6 +1162,35 @@ function stopChromeStt() {
 let currentUserEl = null;
 let currentAssistantEl = null;
 let serverUserTextReceived = false;  // blocks Chrome STT overwrites after server sends
+
+// Stick-to-bottom autoscroll: follow new content only while the user is at the
+// bottom. A manual scroll-up to read history must not be yanked back down by
+// streaming updates. force=true (the user's own typed message) always jumps.
+let transcriptPinned = true;
+let transcriptScrollHooked = false;
+function scrollTranscript(force) {
+  const t = $('transcript');
+  if (!transcriptScrollHooked) {
+    transcriptScrollHooked = true;
+    t.addEventListener('scroll', () => {
+      transcriptPinned = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
+    });
+  }
+  if (force || transcriptPinned) t.scrollTop = t.scrollHeight;
+}
+
+function addCopyBtn(el) {
+  const btn = document.createElement('span');
+  btn.className = 'copy-btn';
+  btn.textContent = 'Copy';
+  btn.onclick = function(e) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(el.textContent.replace(/^(You: |Sutando: )/, '').replace(/Copy$/, '').trim());
+    btn.textContent = 'Copied';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+  };
+  el.appendChild(btn);
+}
 
 function handleTranscript(role, text, partial) {
   if (role === 'user') {
@@ -448,6 +1211,7 @@ function handleTranscript(role, text, partial) {
       }
       currentUserEl.className = 't-entry t-user';
       currentUserEl.textContent = text;
+      addCopyBtn(currentUserEl);
       currentUserEl = null;
     }
   } else {
@@ -457,17 +1221,18 @@ function handleTranscript(role, text, partial) {
       $('transcript').appendChild(currentAssistantEl);
     }
     currentAssistantEl.textContent = text;
-    if (!partial) currentAssistantEl = null;
+    if (!partial) { addCopyBtn(currentAssistantEl); currentAssistantEl = null; }
   }
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 function addSystem(text, isHtml) {
   const el = document.createElement('div');
   el.className = 't-entry t-system';
   if (isHtml) { el.innerHTML = text; } else { el.textContent = text; }
+  addCopyBtn(el);
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript();
 }
 
 // ─── Debug log ────────────────────────────────────────────
@@ -490,67 +1255,600 @@ function setStatus(text, state) {
 
 // ─── Task list ────────────────────────────────────────────
 // Expose on window so inline tools can access via Chrome AppleScript JS injection
-const taskMap = window.taskMap = {};
-function updateTask(taskId, status, text, result) {
-  const existing = taskMap[taskId] || {};
-  const wasDone = existing.status === 'done';
-  taskMap[taskId] = { status, text: text || existing.text, time: new Date(), result: result || existing.result || '' };
-  // Auto-expand the latest completed task (collapse others if user had collapsed)
-  if (status === 'done' && !wasDone && (result || existing.result)) {
-    if (userCollapsed) expandedTasks.clear(); // keep old ones collapsed
-    expandedTasks.add(taskId);
-    userCollapsed = false;
-    setTimeout(() => { const el = document.getElementById('result-' + taskId); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 100);
+// Restore taskMap + expandedTasks from localStorage so results don't disappear
+// across page refreshes. The /tasks/active API only returns the result text on
+// the first poll after the bridge writes it; once the result file is moved to
+// archive, the API returns the task with an empty result. Without persistence
+// here, refreshing the page wipes the results from the UI.
+const PERSIST_KEY_TASKS = 'sutando-taskmap-v1';
+const PERSIST_KEY_EXPAND = 'sutando-expanded-v1';
+const PERSIST_KEY_SHOW_DONE = 'sutando-show-done-v1';
+const PERSIST_KEY_WORKSTREAM_DISPLAY = 'sutando-task-workstream-display-v1';
+// Durable schedulers and health probes use normal task records for claiming,
+// retries, and audit. Archive-backed history must keep those records available
+// to the API without turning them into owner work in the Tasks UI.
+function isOwnerVisibleTask(taskId, task) {
+  const id = String(taskId || '');
+  const source = String((task && task.source) || '').toLowerCase();
+  return source !== 'cron' && source !== 'health-check' &&
+    !id.startsWith('task-cron-') && !id.startsWith('task-health-') &&
+    !id.startsWith('task-smoke-') && !id.startsWith('task-discord-e2e-');
+}
+// Default-hide done tasks. With Tasks growing to top-30, completed work was
+// crowding out active items and the watcher-glance use case ("what's still
+// running?") got lost. Toggle persists across reloads.
+let showDone = (() => {
+  try { return localStorage.getItem(PERSIST_KEY_SHOW_DONE) === '1'; } catch { return false; }
+})();
+window.toggleShowDone = function() {
+  showDone = !showDone;
+  try { localStorage.setItem(PERSIST_KEY_SHOW_DONE, showDone ? '1' : '0'); } catch {}
+  renderTasks();
+};
+function loadPersistedTaskMap() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY_TASKS);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    Object.keys(parsed).forEach(function(taskId) {
+      if (!isOwnerVisibleTask(taskId, parsed[taskId])) delete parsed[taskId];
+    });
+    // Reconstruct Date objects on time fields
+    Object.values(parsed).forEach(t => { if (t && t.time) t.time = new Date(t.time); });
+    return parsed;
+  } catch { return {}; }
+}
+function loadPersistedExpanded() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY_EXPAND);
+    if (!raw) return new Set();
+    return new Set(JSON.parse(raw));
+  } catch { return new Set(); }
+}
+function persistTaskMap() {
+  try { localStorage.setItem(PERSIST_KEY_TASKS, JSON.stringify(taskMap)); } catch {}
+}
+function persistExpanded() {
+  try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
+}
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
+const taskMap = window.taskMap = loadPersistedTaskMap();
+let taskWorkstreamNames = Object.create(null);
+
+function loadTaskWorkstreamDisplayState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PERSIST_KEY_WORKSTREAM_DISPLAY) || '{}');
+    return {
+      collapsed: new Set(Array.isArray(parsed.collapsed) ? parsed.collapsed : []),
+      seen: new Set(Array.isArray(parsed.seen) ? parsed.seen : []),
+      manual: new Set(Array.isArray(parsed.manual) ? parsed.manual : []),
+    };
+  } catch {
+    return { collapsed: new Set(), seen: new Set(), manual: new Set() };
   }
+}
+const taskWorkstreamDisplayState = loadTaskWorkstreamDisplayState();
+const collapsedTaskWorkstreams = taskWorkstreamDisplayState.collapsed;
+const seenTaskWorkstreams = taskWorkstreamDisplayState.seen;
+const manuallyCollapsedTaskWorkstreams = taskWorkstreamDisplayState.manual;
+function persistTaskWorkstreamDisplayState() {
+  try {
+    localStorage.setItem(PERSIST_KEY_WORKSTREAM_DISPLAY, JSON.stringify({
+      collapsed: Array.from(collapsedTaskWorkstreams),
+      seen: Array.from(seenTaskWorkstreams),
+      manual: Array.from(manuallyCollapsedTaskWorkstreams),
+    }));
+  } catch {}
+}
+
+function toggleTaskWorkstream(workstreamId) {
+  if (collapsedTaskWorkstreams.has(workstreamId)) {
+    collapsedTaskWorkstreams.delete(workstreamId);
+    manuallyCollapsedTaskWorkstreams.delete(workstreamId);
+  } else {
+    collapsedTaskWorkstreams.add(workstreamId);
+    manuallyCollapsedTaskWorkstreams.add(workstreamId);
+  }
+  persistTaskWorkstreamDisplayState();
+  renderTasks();
+  updateDynamicRegion();
+}
+
+function rememberTaskWorkstreams(workstreams) {
+  if (!Array.isArray(workstreams)) return;
+  workstreams.forEach(function(workstream) {
+    if (workstream && workstream.id && workstream.name) {
+      taskWorkstreamNames[String(workstream.id)] = String(workstream.name);
+    }
+  });
+}
+
+function taskTimeFromRow(row, existing) {
+  if (row.time instanceof Date && !Number.isNaN(row.time.getTime())) return row.time;
+  if (typeof row.time === 'number') {
+    const date = new Date(row.time * 1000);
+    if (!Number.isNaN(date.getTime())) return date;
+  } else if (row.time) {
+    const date = new Date(row.time);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  if (existing.time) {
+    const date = existing.time instanceof Date ? existing.time : new Date(existing.time);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return new Date();
+}
+
+function mergeTaskRow(existing, row) {
+  const hasWorkstreamId = Object.prototype.hasOwnProperty.call(row, 'workstream_id');
+  const hasWorkstreamName = Object.prototype.hasOwnProperty.call(row, 'workstream_name');
+  if (row.status === 'working' && row.workstream_id &&
+      !manuallyCollapsedTaskWorkstreams.has(String(row.workstream_id)) &&
+      collapsedTaskWorkstreams.delete(String(row.workstream_id))) {
+    persistTaskWorkstreamDisplayState();
+  }
+  return Object.assign({}, existing, {
+    status: row.status || existing.status || 'done',
+    text: row.text || existing.text || row.id,
+    time: taskTimeFromRow(row, existing),
+    result: row.result || existing.result || '',
+    source: row.source || existing.source || '',
+    workstream_id: hasWorkstreamId ? (row.workstream_id || '') : (existing.workstream_id || ''),
+    workstream_name: hasWorkstreamName ? (row.workstream_name || '') : (existing.workstream_name || ''),
+  });
+}
+
+function updateTask(taskId, status, text, result) {
+  if (!isOwnerVisibleTask(taskId, null)) return;
+  const existing = taskMap[taskId] || {};
+  const isNew = !existing.status;
+  taskMap[taskId] = Object.assign({}, existing, {
+    status,
+    text: text || existing.text,
+    time: existing.time || new Date(),
+    result: result || existing.result || '',
+  });
+  // Auto-switch to tasks tab if new task arrives and user is on starter
+  if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
+  // Auto-expand ongoing tasks so the user sees progress, AND newly-finished
+  // tasks so the user sees the result land. (Respect userCollapsed — if the
+  // user hit "collapse all", don't re-expand on their behalf.)
+  if ((status === 'working' || status === 'done') && !expandedTasks.has(taskId) && !userCollapsed) {
+    expandedTasks.add(taskId);
+  }
+  persistTaskMap();
+  persistExpanded();
   renderTasks();
 }
-const expandedTasks = window.expandedTasks = new Set();
+const expandedTasks = window.expandedTasks = loadPersistedExpanded();
+const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
-// Listen for external collapse/expand commands (from inline tools via AppleScript)
+// Listen for external collapse/expand commands (from inline tools via AppleScript).
+// Action is 'collapse' / 'expand' for all-tasks, or 'collapse:N' / 'expand:N' (1-based) for one.
 new MutationObserver(() => {
-  if (document.body.dataset.taskAction === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); document.body.dataset.taskAction = ''; }
-  if (document.body.dataset.taskAction === 'expand') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); document.body.dataset.taskAction = ''; }
+  const a = document.body.dataset.taskAction || '';
+  if (!a) return;
+  const [verb, idxStr] = a.split(':');
+  const idx = idxStr ? parseInt(idxStr, 10) : NaN;
+  // Per-task ops ("expand:3") must use the SAME ordering the user actually sees.
+  // The primary #tasks container is hidden; use the same grouped ordering as
+  // the visible Tasks tab so workstream headers cannot shift voice numbering.
+  const visibleIds = groupedTaskDisplay(Object.entries(taskMap)).entries.map(([id]) => id);
+  // All-tasks ops ("expand"/"collapse" with no index) still use the broader
+  // filtered list — "expand all" should reach everything non-done, not just
+  // the visible 10.
+  const allIds = groupedTaskDisplay(
+    Object.entries(taskMap).filter(([, t]) => showDone || t.status !== 'done')
+  ).entries.map(([id]) => id);
+  if (Number.isInteger(idx) && idx >= 1 && idx <= visibleIds.length) {
+    const targetId = visibleIds[idx - 1];
+    if (verb === 'expand') {
+      // Add target. Do NOT reset userCollapsed — if the user just said
+      // "collapse all" → "expand task N", we want ONLY N visible.
+      // Resetting userCollapsed to false lets the API-poll auto-expand
+      // block re-add all working tasks on the next 3s tick, undoing the
+      // collapse and making per-task expand look like a no-op.
+      expandedTasks.add(targetId); userExpanded.add(targetId);
+    }
+    else if (verb === 'collapse') { expandedTasks.delete(targetId); userExpanded.delete(targetId); }
+    renderTasks();
+    // Visual flash on the targeted task-item across BOTH render paths
+    // (primary + dynamic-region). 50ms delay lets renderTasks() paint
+    // first. Querying after the delay also catches the dr-content
+    // element which re-renders on its own 3s tick — by the time the
+    // user issues subsequent commands the flash will have ridden the
+    // next dynamic-region paint too.
+    setTimeout(function() {
+      document.querySelectorAll('[data-taskid="' + targetId + '"]').forEach(function(el) {
+        el.classList.remove('task-flash');
+        // Force reflow so the animation re-triggers on repeat expand:N.
+        void el.offsetWidth;
+        el.classList.add('task-flash');
+        setTimeout(function() { el.classList.remove('task-flash'); }, 1100);
+      });
+    }, 50);
+  } else {
+    if (verb === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); }
+    else if (verb === 'expand') { allIds.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
+  }
+  document.body.dataset.taskAction = '';
 }).observe(document.body, { attributes: true, attributeFilter: ['data-task-action'] });
 function toggleResult(taskId) {
-  if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); } else { expandedTasks.add(taskId); userCollapsed = false; }
-  const el = document.getElementById('result-' + taskId);
-  if (el) el.style.display = expandedTasks.has(taskId) ? 'block' : 'none';
+  if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); userExpanded.delete(taskId); } else { expandedTasks.add(taskId); userExpanded.add(taskId); userCollapsed = false; }
+  // Re-render the whole task list so the .task-text gets the expanded class,
+  // the "Show details" chip flips to "Hide", the displayText switches from
+  // summary to full, and the reply/action buttons appear. Just toggling the
+  // result block's display left the task header in a half-expanded state.
+  persistExpanded();
+  renderTasks();
 }
 window.toggleAllTasks = toggleAllTasks;
 function toggleAllTasks() {
   const hasExpanded = expandedTasks.size > 0;
   if (hasExpanded) { expandedTasks.clear(); userCollapsed = true; }
   else { Object.entries(taskMap).forEach(([id, t]) => { if (t.result) expandedTasks.add(id); }); userCollapsed = false; }
+  persistExpanded();
   renderTasks();
-  const link = document.querySelector('#tasks-header span:last-child');
-  if (link) link.textContent = hasExpanded ? 'expand all' : 'collapse all';
 }
 document.addEventListener('click', function(e) {
-  const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
+  const workstreamHeader = e.target.closest && e.target.closest('.task-workstream-header[data-workstream-id]');
+  if (workstreamHeader) {
+    toggleTaskWorkstream(workstreamHeader.dataset.workstreamId);
+    return;
+  }
+  // Don't toggle if clicking inside the result text (allow text selection)
+  if (e.target.closest && e.target.closest('[id^="result-"]')) return;
+  // Don't toggle if the click ended a drag-to-select on the task title.
+  // Without this, the mouseup at the end of a text-select fires the click
+  // handler and toggles before the user can copy.
+  const sel = window.getSelection && window.getSelection();
+  if (sel && sel.toString().length > 0) return;
+  // Only working-with-result items are clickable; data-taskid is on every
+  // task-item now (for flash), so gate the toggle on data-clickable.
+  const item = e.target.closest && e.target.closest('.task-item[data-clickable]');
   if (item) toggleResult(item.dataset.taskid);
 });
+// Collapse routing prefixes to a short category badge + clause head.
+// "[Discord @susanliu_] maybe make it look more like this, add emoji in front"
+//   → "[Discord] maybe make it look more like this"
+// Keeps the origin channel visible per Susan's 16:53 ask while still
+// dropping the noisy handle+replyTo+file-attached chunks.
+// NOTE: regex literals live inside the HTML template string — single \ is
+// eaten by the template literal parser (so /\s+/g turns into /s+/g in the
+// browser and strips s characters!). Double-escape every backslash.
+function summarizeTaskText(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  // Collapse "[Discord @handle]" → "[Discord]", "[Voice foo]" → "[Voice]", etc.
+  // Iterate because a task may have multiple stacked prefixes.
+  for (let i = 0; i < 4; i++) {
+    const before = s;
+    s = s.replace(/^\\[(Discord|Voice|Replying to|Reply|Phone|Sutando-core|Sutando-Lucy|Sutando-Maddy|Task|Context drop)[^\\]]*\\]\\s*/i, function(_, kind) {
+      var k = kind.toLowerCase();
+      var short = k === 'replying to' || k === 'reply' ? 'Reply'
+                : k === 'sutando-core' ? 'Sutando-core'
+                : k === 'sutando-lucy' ? 'Sutando-Lucy'
+                : k === 'sutando-maddy' ? 'Sutando-Maddy'
+                : k === 'context drop' ? 'Context drop'
+                : kind.charAt(0).toUpperCase() + kind.slice(1).toLowerCase();
+      return '[' + short + '] ';
+    });
+    if (s === before) break;
+  }
+  // Strip inline "[File attached: ...]" chunks anywhere in the text.
+  s = s.replace(/\\[File attached:[^\\]]*\\]/gi, '').replace(/\\s+/g, ' ').trim();
+  // Now cut at first strong boundary to keep the head of the first sentence.
+  const cuts = [' (', ' — ', ' - ', ': ', '. ', ', '];
+  for (const c of cuts) {
+    const idx = s.indexOf(c);
+    if (idx > 0 && idx < 90) { s = s.slice(0, idx); break; }
+  }
+  // Final safety: never let a single phrase exceed ~85 chars
+  if (s.length > 85) s = s.slice(0, 82) + '…';
+  return s;
+}
+
+// ─── Workstream-grouped task display helpers ─────────────────
+// Sort once, then build workstream buckets in encounter order. Because the input
+// is newest-first, workstream groups are ordered by latest activity and each
+// group's tasks remain newest-first. The flattened entries array is the
+// canonical numbered display order used by rendering and voice expand:N.
+const UNGROUPED_WORKSTREAM_ID = '__ungrouped__';
+function groupedTaskDisplay(entries, limit) {
+  let chronological = entries.filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  }).sort(function(a, b) {
+    return b[1].time - a[1].time;
+  });
+  if (Number.isInteger(limit) && limit >= 0) chronological = chronological.slice(0, limit);
+
+  const byWorkstream = new Map();
+  let hasInferredWorkstream = false;
+  chronological.forEach(function(entry) {
+    const task = entry[1] || {};
+    const rawId = task.workstream_id;
+    const hasWorkstream = rawId !== undefined && rawId !== null && String(rawId).trim() !== '';
+    const workstreamId = hasWorkstream ? String(rawId) : UNGROUPED_WORKSTREAM_ID;
+    if (hasWorkstream) hasInferredWorkstream = true;
+    if (!byWorkstream.has(workstreamId)) {
+      const workstreamName = hasWorkstream
+        ? (taskWorkstreamNames[workstreamId] || task.workstream_name || 'Workstream')
+        : 'Ungrouped';
+      byWorkstream.set(workstreamId, { id: workstreamId, name: String(workstreamName), entries: [] });
+    }
+    byWorkstream.get(workstreamId).entries.push(entry);
+  });
+
+  const groups = Array.from(byWorkstream.values());
+  return {
+    grouped: hasInferredWorkstream,
+    groups,
+    entries: groups.reduce(function(all, group) { return all.concat(group.entries); }, []),
+  };
+}
+
+function renderTaskWorkstreamGroups(display, renderEntry) {
+  let defaultsChanged = false;
+  if (display.grouped) {
+    display.groups.forEach(function(group) {
+      if (seenTaskWorkstreams.has(group.id)) return;
+      seenTaskWorkstreams.add(group.id);
+      // Make the whole workstream taxonomy visible at a glance. Completed-only
+      // workstreams start compact; a workstream with current work starts open.
+      if (group.entries.every(function(entry) { return entry[1].status === 'done'; })) {
+        collapsedTaskWorkstreams.add(group.id);
+      }
+      defaultsChanged = true;
+    });
+  }
+  if (defaultsChanged) persistTaskWorkstreamDisplayState();
+  let displayIndex = 0;
+  return display.groups.map(function(group) {
+    const rows = group.entries.map(function(entry) {
+      return renderEntry(entry, displayIndex++);
+    }).join('');
+    if (!display.grouped) return rows;
+    const count = group.entries.length;
+    const collapsed = collapsedTaskWorkstreams.has(group.id);
+    return '<section class="task-workstream' + (collapsed ? ' task-workstream--collapsed' : '') + '">' +
+      '<button type="button" class="task-workstream-header" data-workstream-id="' + esc(group.id) + '" aria-expanded="' + (!collapsed) + '">' +
+      '<span class="task-workstream-title"><span class="task-workstream-chevron">' + (collapsed ? '&#9656;' : '&#9662;') + '</span>' + esc(group.name) + '</span>' +
+      '<span class="task-workstream-count">' + count + (count === 1 ? ' task' : ' tasks') + '</span></button>' +
+      '<div class="task-workstream-tasks">' + rows + '</div></section>';
+  }).join('');
+}
+// ─── End workstream-grouped task display helpers ─────────────
+
 function renderTasks() {
   const container = $('tasks');
-  const entries = Object.entries(taskMap);
+  const entries = Object.entries(taskMap).filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  });
+  window._drTaskCount = entries.length;
   const hdr = $('tasks-header');
   if (entries.length === 0) { container.innerHTML = ''; if (hdr) hdr.style.display = 'none'; return; }
-  if (hdr) hdr.style.display = 'flex';
-  const sorted = entries.sort((a, b) => b[1].time - a[1].time).slice(0, 8);
-  container.innerHTML = sorted.map(([id, t]) => {
+  // Default-filter done tasks. error/pending/working always render so the
+  // user never loses sight of active work. Toggle in header reveals done.
+  const doneCount = entries.filter(([, t]) => t.status === 'done').length;
+  const visible = showDone ? entries : entries.filter(([, t]) => t.status !== 'done');
+  if (hdr) {
+    const hasExpanded = expandedTasks.size > 0;
+    hdr.style.display = 'flex';
+    hdr.style.gap = '12px';
+    const doneToggle = doneCount > 0
+      ? '<span onclick="toggleShowDone()" style="cursor:pointer">' +
+        (showDone ? 'hide ' + doneCount + ' done' : 'show ' + doneCount + ' done') +
+        '</span>'
+      : '';
+    hdr.innerHTML = '<span>Tasks</span>' +
+      doneToggle +
+      '<span onclick="toggleAllTasks()" style="cursor:pointer">' +
+      (hasExpanded ? 'collapse all' : 'expand all') +
+      '</span>';
+  }
+  // Empty visible list with non-empty entries means everything is done and
+  // hidden. Show the header toggle so the user can reveal — clear the list.
+  if (visible.length === 0) { container.innerHTML = ''; return; }
+  // Render top-30 most recent. Was 8, but in active sessions (e.g. a kid
+  // iterating on a party plan) new tasks pushed earlier valuable results out
+  // of view within seconds. 30 keeps a longer history visible; localStorage
+  // persistence above keeps results from being lost across refreshes.
+  const display = groupedTaskDisplay(visible, 30);
+  container.innerHTML = renderTaskWorkstreamGroups(display, ([id, t], i) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
-    const hasResult = t.result && t.status === 'done';
-    const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+    // Show the result if it exists, regardless of status. The agent's task
+    // bookkeeping sometimes leaves tasks in 'working' even after the result
+    // file is written — gating render on status === 'done' meant those
+    // results never showed up in the UI even though they were in taskMap.
+    const hasResult = !!t.result;
+    // Always emit data-taskid so flash + expand:N can target working tasks
+    // too. cursor:pointer + data-clickable only when there's a result to show.
+    const clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
-    const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:6px 26px;color:#8ab4c8;font-size:11px;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:6px;margin:4px 0 4px 26px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
+    // Action buttons / reply input — only when expanded + has a result.
+    // Pattern-matches DECISION: X / Y / Z lines; otherwise offers a plain
+    // text input. Either emits a new task via replyToTask() -> /task.
+    let actionsHtml = '';
+    if (hasResult && isExpanded) {
+      const opts = parseDecisionOptions(t.result);
+      let inner = '';
+      if (opts) {
+        inner = opts.map(o => '<button class="task-action-btn" data-taskid="' + id + '" data-answer="' + esc(o) + '">' + esc(o) + '</button>').join('');
+        inner += '<input type="text" class="task-action-input" data-taskid="' + id + '" placeholder="or type a reply...">';
+      } else {
+        inner = '<input type="text" class="task-action-input" data-taskid="' + id + '" placeholder="Type a reply...">';
+      }
+      actionsHtml = '<div class="task-actions" data-replyfor="' + id + '">' + inner + '</div>';
+    }
+    const rawText = t.text || id;
+    // Tag un-prefixed tasks by their source field: voice -> [Voice],
+    // anything else (cron/system reminders, etc.) -> [System]. Replaces the
+    // old "every bare task is [Voice]" default that mislabeled non-voice
+    // items (#bugs 2026-06-25).
+    const taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
+    // Prepend the 1-based index INTO the display text so it always renders
+    // — earlier attempt with a separate <span class="task-num"> got
+    // zero-width even with min-width set (flex layout/min-content issue).
+    // Embedding sidesteps the layout question entirely.
+    const numPrefix = (i + 1) + '. ';
+    const displayText = numPrefix + (isExpanded ? taggedRaw : summarizeTaskText(taggedRaw));
+    const textClass = isExpanded ? 'task-text expanded' : 'task-text';
+    const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
-      '<span class="task-text">' + (t.text || id) + (hasResult ? (isExpanded ? ' ▾' : ' ▸') : '') + '</span>' +
+      '<span class="' + textClass + '">' + esc(displayText) + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
-      '</div>' + resultHtml;
-  }).join('');
+      expandChip +
+      '</div>' + resultHtml + actionsHtml;
+  });
+}
+
+// ─── Toast notifications ────────────────────────────────
+function showToast(msg) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = msg;
+  container.appendChild(el);
+  setTimeout(() => { if (el.parentNode) el.remove(); }, 4000);
+}
+const knownTaskIds = new Set(Object.keys(taskMap));
+
+// Hydrate durable history once at startup. The always-on agent API performs
+// inference independently of this page; while it is still backfilling inferred
+// workstreams, re-read the snapshot so tasks move into their canonical groups
+// without a reload. Historical rows are marked known before merging, so the live
+// poll never announces them as newly received work.
+let taskHistoryRetryTimer = null;
+let taskHistoryHydrating = false;
+let taskHistoryInitialLoadComplete = false;
+const taskWorkstreamRefreshRequested = new Set();
+function scheduleTaskHistoryHydration(delayMs) {
+  if (taskHistoryRetryTimer) return;
+  taskHistoryRetryTimer = setTimeout(function() {
+    taskHistoryRetryTimer = null;
+    if (taskHistoryHydrating) {
+      scheduleTaskHistoryHydration(delayMs);
+      return;
+    }
+    hydrateTaskHistory();
+  }, delayMs || 3000);
+}
+async function hydrateTaskHistory() {
+  if (taskHistoryHydrating) return;
+  taskHistoryHydrating = true;
+  if (taskHistoryRetryTimer) {
+    clearTimeout(taskHistoryRetryTimer);
+    taskHistoryRetryTimer = null;
+  }
+  try {
+    const resp = await fetch('/api/task-history');
+    if (!resp.ok) {
+      scheduleTaskHistoryHydration(30000);
+      return;
+    }
+    const data = await resp.json();
+    rememberTaskWorkstreams(data.workstreams);
+    for (const row of (data.tasks || [])) {
+      if (!row || !row.id || !isOwnerVisibleTask(row.id, row)) continue;
+      knownTaskIds.add(row.id);
+      taskMap[row.id] = mergeTaskRow(taskMap[row.id] || {}, row);
+      if (row.workstream_id) taskWorkstreamRefreshRequested.delete(row.id);
+    }
+    persistTaskMap();
+    renderTasks();
+    updateDynamicRegion();
+    taskHistoryInitialLoadComplete = true;
+    if (data.inference && data.inference.pending) {
+      scheduleTaskHistoryHydration(10000);
+    }
+  } catch {
+    scheduleTaskHistoryHydration(30000);
+  }
+  finally {
+    taskHistoryHydrating = false;
+  }
 }
 
 // ─── Poll agent API for task status ───────────────────────
@@ -565,15 +1863,41 @@ function startTaskPolling() {
       // Replace taskMap with API data (preserve expanded state and WebSocket-delivered results)
       const apiTasks = new Set();
       for (const t of (data.tasks || [])) {
+        if (!t || !isOwnerVisibleTask(t.id, t)) continue;
         apiTasks.add(t.id);
         const existing = taskMap[t.id] || {};
-        // Auto-expand latest completed task (collapse others if user had collapsed)
-        if (t.status === 'done' && existing.status !== 'done' && (t.result || existing.result)) {
-          if (userCollapsed) expandedTasks.clear();
-          expandedTasks.add(t.id);
-          userCollapsed = false;
+        if (t.workstream_id) {
+          taskWorkstreamRefreshRequested.delete(t.id);
+        } else if (!existing.workstream_id && !taskWorkstreamRefreshRequested.has(t.id)) {
+          taskWorkstreamRefreshRequested.add(t.id);
+          scheduleTaskHistoryHydration(1000);
         }
-        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '' };
+        // Toast for new tasks
+        if (!knownTaskIds.has(t.id)) {
+          knownTaskIds.add(t.id);
+          if (taskHistoryInitialLoadComplete) {
+            const snippet = (t.text || '').slice(0, 60);
+            showToast('<span class="toast-label">Context received</span> ' + snippet);
+          }
+        }
+        // Toast for completed tasks
+        if (taskHistoryInitialLoadComplete && t.status === 'done' && existing.status && existing.status !== 'done') {
+          showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
+        }
+        // Auto-expand working tasks every poll; auto-expand done tasks ONLY
+        // on the working→done transition. If the user clicks Hide on a done
+        // task (toggleResult removes it from expandedTasks without setting
+        // userCollapsed), the next poll must NOT re-add it. The transition
+        // check makes the expand one-shot per task. Mini flagged this in the
+        // second #506 review: the prior version fired every poll and overrode
+        // per-task user collapse.
+        if (t.status === 'working' && !expandedTasks.has(t.id) && !userCollapsed) {
+          expandedTasks.add(t.id);
+        }
+        if (t.status === 'done' && existing.status !== 'done' && !expandedTasks.has(t.id) && !userCollapsed) {
+          expandedTasks.add(t.id);
+        }
+        taskMap[t.id] = mergeTaskRow(existing, t);
       }
       // Remove tasks no longer in API (stale)
       for (const id of Object.keys(taskMap)) {
@@ -581,6 +1905,7 @@ function startTaskPolling() {
           delete taskMap[id];
         }
       }
+      persistTaskMap();
       renderTasks();
       // Update system status indicators
       const statusParts = [];
@@ -598,13 +1923,15 @@ function stopTaskPolling() {
   if (taskPollTimer) { clearInterval(taskPollTimer); taskPollTimer = null; }
 }
 
-// Start polling on page load
+// Hydrate history immediately, then keep the lightweight active-task poll.
+hydrateTaskHistory();
 startTaskPolling();
 
 function updateStats() {
+  // Fed by the transport's onStats (byte totals). Per-chunk detail lives in
+  // the debug log via the transport's onDebug audio channel.
   $('stats').textContent =
-    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv) +
-    ' (' + audioChunksRecv + ' chunks, ' + playChunkCount + ' played)';
+    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv);
 }
 
 function fmtBytes(n) {
@@ -619,7 +1946,7 @@ function saveDebug() {
     config: { INPUT_RATE, OUTPUT_RATE, CAPTURE_BUF },
     audioCtxState: audioCtx?.state ?? null,
     audioCtxSampleRate: audioCtx?.sampleRate ?? null,
-    bytesSent, bytesRecv, audioChunksRecv, playChunkCount,
+    bytesSent, bytesRecv,
     log: debugLog,
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -631,367 +1958,237 @@ function saveDebug() {
   dbg('Debug data saved');
 }
 
-// ─── PCM helpers ──────────────────────────────────────────
-function downsample(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const ratio = fromRate / toRate;
-  const len = Math.floor(input.length / ratio);
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    out[i] = input[idx] * (1 - frac) + (input[idx + 1] || 0) * frac;
-  }
-  return out;
-}
+// PCM DSP + gapless playback live in the canonical transport
+// (SutandoVoice — src/web-voice-transport.ts). The page receives the
+// playback AnalyserNode via onAnalyser for the avatar animation below.
 
-function float32ToInt16(f32) {
-  const i16 = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    i16[i] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7FFF) | 0;
-  }
-  return i16;
-}
-
-function int16ToFloat32(buf) {
-  const view = new DataView(buf);
-  const len = buf.byteLength / 2;
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    out[i] = view.getInt16(i * 2, true) / 32768;
-  }
-  return out;
-}
-
-// ─── Audio playback (gapless scheduling) ──────────────────
-function playChunk(arrayBuf) {
-  if (!audioCtx || audioCtx.state === 'closed') {
-    try {
-      audioCtx = new AudioContext();
-      dbg('playChunk: created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-    } catch (e) {
-      dbg('playChunk: failed to create AudioContext: ' + e, 'err');
-      return;
+// ─── Speaking detection (avatar animation) ────────────────
+function startSpeakingDetection() {
+  if (speakingRAF) return;
+  var avatar = document.getElementById('stand-avatar');
+  var heroAvatar = document.getElementById('hero-avatar');
+  var canvas = document.getElementById('speak-canvas');
+  var ctx = canvas ? canvas.getContext('2d') : null;
+  var buf = new Uint8Array(analyserNode ? analyserNode.frequencyBinCount : 128);
+  var smoothed = 0;
+  var NUM_BARS = 24;
+  var CX = 30, CY = 30, INNER = 24, OUTER = 30; // canvas center and radii
+  // Formant-weighting: find top-3 peak bins (approximate F1/F2/F3) per frame,
+  // then boost bars near those bins so the ring shape visibly shifts with
+  // vowel changes instead of just pulsing louder.
+  var K = 3;
+  var peakIdx = new Int16Array(K);
+  var peakVal = new Uint8Array(K);
+  function findPeaks() {
+    for (var k = 0; k < K; k++) { peakIdx[k] = -1; peakVal[k] = 0; }
+    // Skip bin 0 (DC) and last bin (Nyquist) — noisy, not formant-bearing.
+    for (var i = 1; i < buf.length - 1; i++) {
+      if (buf[i] < buf[i - 1] || buf[i] <= buf[i + 1]) continue;
+      var v = buf[i];
+      for (var k = 0; k < K; k++) {
+        if (v > peakVal[k]) {
+          for (var j = K - 1; j > k; j--) {
+            peakVal[j] = peakVal[j - 1]; peakIdx[j] = peakIdx[j - 1];
+          }
+          peakVal[k] = v; peakIdx[k] = i;
+          break;
+        }
+      }
     }
   }
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-    dbg('playChunk: resumed suspended audioCtx');
-  }
-
-  const f32 = int16ToFloat32(arrayBuf);
-  if (f32.length === 0) return;
-
-  try {
-    const audioBuf = audioCtx.createBuffer(1, f32.length, OUTPUT_RATE);
-    audioBuf.getChannelData(0).set(f32);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.playbackRate.value = playbackRate;
-    src.connect(audioCtx.destination);
-
-    const now = audioCtx.currentTime;
-    if (nextPlayTime < now) {
-      nextPlayTime = now + 0.05;
+  function tick() {
+    speakingRAF = requestAnimationFrame(tick);
+    if (!analyserNode) return;
+    analyserNode.getByteFrequencyData(buf);
+    var sum = 0;
+    for (var i = 0; i < buf.length; i++) sum += buf[i];
+    var avg = sum / buf.length;
+    smoothed = avg > smoothed ? avg * 0.7 + smoothed * 0.3 : avg * 0.15 + smoothed * 0.85;
+    var speaking = smoothed > 6;
+    if (avatar) avatar.classList.toggle('speaking', speaking);
+    if (heroAvatar) heroAvatar.classList.toggle('speaking', speaking);
+    // Propagate to the inline-SVG default avatar on parent containers.
+    // Local audio-RMS fires faster than the server-side 'speaking'
+    // agent-state event; without this the SVG would lag ~500ms.
+    var aw = document.getElementById('avatar-wrap');
+    var hw = document.getElementById('hero');
+    [aw, hw].forEach(function(el) {
+      if (!el) return;
+      if (speaking) {
+        el.classList.remove('s-idle','s-listening','s-working','s-seeing');
+        el.classList.add('s-speaking');
+      } else if (el.classList.contains('s-speaking')) {
+        // Clear s-speaking on audio drop so the SVG visor does not stay
+        // green until the next SSE event. Fall back to s-idle; server SSE
+        // will overwrite with the true state on the next poll.
+        el.classList.remove('s-speaking');
+        el.classList.add('s-idle');
+      }
+    });
+    // Draw radial bars on canvas
+    if (ctx && canvas) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (speaking) {
+        findPeaks();
+        var step = buf.length / NUM_BARS;
+        for (var i = 0; i < NUM_BARS; i++) {
+          var binIdx = Math.floor(i * step);
+          var raw = buf[binIdx] / 255;
+          // Bars within 6 bins of any peak get up to 1.8x their raw height.
+          // Bars far from any peak stay at their raw value. Fall back to
+          // pure amplitude (boost=1.0) when no peaks were found (silence).
+          var minDist = 999;
+          for (var k = 0; k < K; k++) {
+            if (peakIdx[k] < 0) continue;
+            var d = Math.abs(binIdx - peakIdx[k]);
+            if (d < minDist) minDist = d;
+          }
+          var boost = minDist >= 6 ? 1.0 : 1.0 + (1 - minDist / 6) * 0.8;
+          var val = Math.min(1.0, raw * boost);
+          var barLen = 2 + val * 6; // 2px min, 8px max
+          var angle = (i / NUM_BARS) * Math.PI * 2 - Math.PI / 2;
+          var x1 = CX + Math.cos(angle) * INNER;
+          var y1 = CY + Math.sin(angle) * INNER;
+          var x2 = CX + Math.cos(angle) * (INNER + barLen);
+          var y2 = CY + Math.sin(angle) * (INNER + barLen);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.strokeStyle = 'rgba(110,231,183,' + (0.4 + val * 0.6).toFixed(2) + ')';
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.stroke();
+        }
+      }
     }
-    src.start(nextPlayTime);
-    nextPlayTime += audioBuf.duration / playbackRate;
-    activeSources.push(src);
-    src.onended = () => {
-      const idx = activeSources.indexOf(src);
-      if (idx >= 0) activeSources.splice(idx, 1);
-    };
-    playChunkCount++;
-
-    if (playChunkCount <= 5) {
-      dbg('Played chunk #' + playChunkCount + ': ' + f32.length + ' samples, scheduled at ' + nextPlayTime.toFixed(3) + 's (ctx.state=' + audioCtx.state + ')', 'audio');
-    }
-  } catch (err) {
-    dbg('playChunk error: ' + err.message, 'err');
   }
+  tick();
+}
+function stopSpeakingDetection() {
+  if (speakingRAF) { cancelAnimationFrame(speakingRAF); speakingRAF = null; }
+  var avatar = document.getElementById('stand-avatar');
+  var heroAvatar = document.getElementById('hero-avatar');
+  if (avatar) avatar.classList.remove('speaking');
+  if (heroAvatar) heroAvatar.classList.remove('speaking');
+  var canvas = document.getElementById('speak-canvas');
+  if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
-// ─── Microphone capture ───────────────────────────────────
-async function startMic() {
-  // Check if getUserMedia is available (requires HTTPS or localhost)
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    const isLocalhost = window.location.hostname === 'localhost' || 
-                       window.location.hostname === '127.0.0.1' ||
-                       window.location.hostname === '[::1]';
-    const isHttps = window.location.protocol === 'https:';
-    
-    if (!isLocalhost && !isHttps) {
-      throw new Error('Microphone access requires HTTPS. Please access this page via HTTPS (https://your-domain.com) or use localhost. Modern browsers block getUserMedia on HTTP for security.');
-    } else {
-      throw new Error('Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.');
-    }
-  }
+// ─── Voice session wiring (canonical transport) ───────────
+// Mic capture, playback, WS protocol, connect timeout, and failure
+// classification all live in SutandoVoice.VoiceTransport (the canonical
+// src/web-voice-transport.ts served at /web-voice-transport.js). The page
+// supplies callbacks for its surface concerns and keeps reconnect policy.
 
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    }
-  });
-
-  const trackSettings = micStream.getAudioTracks()[0].getSettings();
-  dbg('Mic stream: ' + (trackSettings.sampleRate || '?') + ' Hz, device=' + (trackSettings.deviceId || '?').slice(0, 8));
-
-  // Reuse AudioContext created in toggle() on user gesture
-  if (!audioCtx || audioCtx.state === 'closed') {
-    audioCtx = new AudioContext();
-    dbg('Created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-  }
-  dbg('AudioContext state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
-
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-    dbg('AudioContext resumed');
-  }
-
-  const source = audioCtx.createMediaStreamSource(micStream);
-
-  processor = audioCtx.createScriptProcessor(CAPTURE_BUF, 1, 1);
-  let sendCount = 0;
-  processor.onaudioprocess = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const raw = e.inputBuffer.getChannelData(0);
-    const down = downsample(raw, audioCtx.sampleRate, INPUT_RATE);
-    const pcm = float32ToInt16(down);
-    ws.send(pcm.buffer);
-    bytesSent += pcm.buffer.byteLength;
-    sendCount++;
-    if (sendCount <= 3) {
-      dbg('Sent mic #' + sendCount + ': ' + pcm.buffer.byteLength + 'B (' + down.length + ' samples @ ' + INPUT_RATE + 'Hz)', 'audio');
-    }
-  };
-
-  source.connect(processor);
-  const silence = audioCtx.createGain();
-  silence.gain.value = 0;
-  processor.connect(silence);
-  silence.connect(audioCtx.destination);
-
-  dbg('Mic capture started');
-  reconnectAttempts = 0;
-  addSystem('Microphone active — speak now.');
-
-  // Start Chrome STT for real-time interim display (server final replaces)
-  startChromeStt();
-}
-
-function stopMic() {
-  stopChromeStt();
-  if (processor) { processor.disconnect(); processor = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  // Don't close audioCtx here — playback may still be draining
-}
-
-// ─── WebSocket ────────────────────────────────────────────
 function connectWs() {
-  const url = $('wsUrl').value.trim();
+  const url = _voiceUrlOverride || $('wsUrl').value.trim();
+  _voiceUrlOverride = null;
   if (!url) return;
+  if (typeof SutandoVoice === 'undefined' || !SutandoVoice.VoiceTransport) {
+    // The classic <script> for /web-voice-transport.js failed (packaging
+    // error → 503; console already has the server-side reason).
+    setStatus('Voice unavailable', 'error');
+    addSystem('Voice transport failed to load (/web-voice-transport.js) — check the server logs, then reload this page.');
+    doCleanup({ keepStatus: true });
+    return;
+  }
 
   dbg('Connecting to ' + url);
   setStatus('Connecting...', '');
 
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
+  voice = new SutandoVoice.VoiceTransport({
+    captureBuf: CAPTURE_BUF,
+    inputRate: INPUT_RATE,
+    outputRate: OUTPUT_RATE,
+    onStatus: onVoiceStatus,
+    onConnectFailure: onVoiceConnectFailure,
+    onDebug: function (msg, kind) { dbg(msg, kind); },
+    onTranscript: function (role, text, partial) { handleTranscript(role, text, partial); },
+    // turn.end and turn.interrupted need the same per-turn transcript reset
+    // here; the transport already handles the barge-in playback flush itself.
+    onTurnEnd: resetTurnTranscriptState,
+    onInterrupted: resetTurnTranscriptState,
+    onSessionConfig: function (inRate, outRate) {
+      INPUT_RATE = inRate;
+      OUTPUT_RATE = outRate;
+      dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
+    },
+    onProtocolMessage: handleProtocolMessage,
+    onMicError: function (name, message, friendly) { addSystem(friendly); },
+    onAnalyser: function (node) { analyserNode = node; startSpeakingDetection(); },
+    onStats: function (s) { bytesSent = s.bytesSent; bytesRecv = s.bytesRecv; updateStats(); },
+  });
+  // Fire-and-forget by contract: async outcomes arrive via the callbacks.
+  voice.connect(url).catch(function (e) {
+    dbg('connect failed: ' + e, 'err');
+    setStatus('Connection failed', 'error');
+    doCleanup({ keepStatus: true });
+  });
+}
 
-  ws.onopen = async () => {
-    dbg('WebSocket connected');
-    setStatus('Starting mic...', 'live');
-    try {
-      await startMic();
-      setStatus('Live — speak now', 'live');
-      statsTimer = setInterval(updateStats, 500);
-    } catch (err) {
-      dbg('Mic error: ' + err.message, 'err');
-      setStatus('Mic error', 'error');
-      addSystem('Microphone access denied. Please allow and retry.');
-      ws.close();
+function resetTurnTranscriptState() {
+  // Remove orphaned Chrome STT interim — if server never finalized it,
+  // it's echo from the assistant's voice picked up by mic.
+  if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
+    currentUserEl.remove();
+  }
+  currentUserEl = null;
+  currentAssistantEl = null;
+  serverUserTextReceived = false;
+}
+
+function onVoiceStatus(status, detail, close) {
+  if (status === 'connecting') {
+    setStatus(detail || 'Connecting...', '');
+    return;
+  }
+  if (status === 'live') {
+    setStatus(detail || 'Live', 'live');
+    // The transport emits exactly this detail when mic capture is up;
+    // announce once per session and start the Chrome interim-STT display.
+    if (!micAnnounced && detail === 'Live — speak now') {
+      micAnnounced = true;
+      reconnectAttempts = 0;
+      addSystem('Microphone active — speak now.');
+      startChromeStt();
     }
-  };
-
-  ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) {
-      bytesRecv += event.data.byteLength;
-      audioChunksRecv++;
-      if (audioChunksRecv <= 5) {
-        dbg('Recv audio #' + audioChunksRecv + ': ' + event.data.byteLength + 'B', 'audio');
-      }
-      playChunk(event.data);
-    } else {
-      try {
-        const msg = JSON.parse(event.data);
-        dbg('Recv: ' + JSON.stringify(msg), 'event');
-
-        if (msg.type === 'session.config' && msg.audioFormat) {
-          INPUT_RATE = msg.audioFormat.inputSampleRate;
-          OUTPUT_RATE = msg.audioFormat.outputSampleRate;
-          dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
-        } else if (msg.type === 'transcript') {
-          handleTranscript(msg.role, msg.text, msg.partial !== false);
-        } else if (msg.type === 'turn.end') {
-          // Remove orphaned Chrome STT interim — if server never finalized it,
-          // it's echo from the assistant's voice picked up by mic.
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'turn.interrupted') {
-          for (const s of activeSources) {
-            try { s.stop(); } catch {}
-          }
-          activeSources = [];
-          nextPlayTime = 0;
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'gui.update') {
-          const guiData = msg.payload?.data;
-          if (guiData?.type === 'subprocess_log' && guiData.line) {
-            dbg('subprocess  ' + guiData.line, 'audio');
-          } else if (guiData?.type === 'image' && guiData.base64) {
-            const imgEl = document.createElement('div');
-            imgEl.className = 't-entry t-system';
-            const img = document.createElement('img');
-            const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
-            img.src = imgDataUrl;
-            img.alt = guiData.description || 'Generated image';
-            img.style.maxWidth = '100%';
-            img.style.borderRadius = '8px';
-            img.style.marginTop = '8px';
-            imgEl.appendChild(img);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = imgDataUrl;
-            const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
-            dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
-            dlLink.textContent = 'Download image';
-            imgEl.appendChild(dlLink);
-            $('transcript').appendChild(imgEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
-            dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else if (guiData?.type === 'video' && guiData.base64) {
-            const vidEl = document.createElement('div');
-            vidEl.className = 't-entry t-system';
-            const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
-            const video = document.createElement('video');
-            video.src = vidDataUrl;
-            video.controls = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.style.maxWidth = '100%';
-            video.style.borderRadius = '8px';
-            video.style.marginTop = '8px';
-            if (guiData.description) {
-              const caption = document.createElement('div');
-              caption.style.fontSize = '12px';
-              caption.style.color = '#888';
-              caption.style.marginTop = '4px';
-              caption.textContent = guiData.description;
-              vidEl.appendChild(caption);
-            }
-            vidEl.appendChild(video);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = vidDataUrl;
-            const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
-            dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
-            dlLink.textContent = 'Download video';
-            vidEl.appendChild(dlLink);
-            $('transcript').appendChild(vidEl);
-            $('transcript').scrollTop = $('transcript').scrollHeight;
-            dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else {
-            addSystem('[gui] ' + JSON.stringify(guiData));
-          }
-        } else if (msg.type === 'gui.command') {
-          if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
-          else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
-        } else if (msg.type === 'gui.notification') {
-          addSystem('[notification] ' + (msg.payload?.message || ''));
-        } else if (msg.type === 'image') {
-          const imgEl = document.createElement('div');
-          imgEl.className = 't-entry t-system';
-          const img = document.createElement('img');
-          const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
-          img.src = legacyDataUrl;
-          img.alt = msg.data.description || 'Generated image';
-          img.style.maxWidth = '100%';
-          img.style.borderRadius = '8px';
-          img.style.marginTop = '8px';
-          imgEl.appendChild(img);
-          const dlLink2 = document.createElement('a');
-          dlLink2.className = 'btn-download';
-          dlLink2.href = legacyDataUrl;
-          const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
-          dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
-          dlLink2.textContent = 'Download image';
-          imgEl.appendChild(dlLink2);
-          $('transcript').appendChild(imgEl);
-          $('transcript').scrollTop = $('transcript').scrollHeight;
-          dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
-        } else if (msg.type === 'speech_speed') {
-          const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
-          playbackRate = speeds[msg.speed] || 1.0;
-          addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + playbackRate + 'x)');
-        } else if (msg.type === 'session_end') {
-          addSystem('Session ended by voice command.');
-          dbg('session_end received — disconnecting', 'event');
-          connected = false; // prevent auto-reconnect
-          if (ws) { ws.close(); ws = null; }
-          doCleanup();
-        } else if (msg.type === 'task.status') {
-          updateTask(msg.taskId, msg.status, msg.text, msg.result);
-        } else if (msg.type === 'grounding') {
-          const chunks = msg.payload?.groundingChunks;
-          if (Array.isArray(chunks) && chunks.length > 0) {
-            const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
-            if (sources) addSystem('[sources] ' + sources);
-          }
-        }
-      } catch {
-        dbg('Bad JSON text frame', 'warn');
-      }
-    }
-  };
-
-  ws.onclose = (e) => {
-    dbg('WS closed: code=' + e.code + ' reason=' + e.reason);
+    return;
+  }
+  if (status === 'error') {
+    setStatus(detail || 'Error', 'error');
+    return;
+  }
+  if (status === 'superseded') {
+    // Close 4410 (superseded-by-takeover): a user-confirmed takeover moved
+    // the call to another surface. Terminal — never auto-reconnect into a
+    // fight over the call.
+    addSystem('Voice call moved to another surface (window or device).');
+    doCleanup({ keepStatus: true });
+    setStatus('Call moved', 'error');
+    return;
+  }
+  if (status === 'closed') {
     // Server-initiated clean close (goodbye code 4000) or user clicked Disconnect
-    const wasCleanDisconnect = !connected || e.code === 4000;
-    if (wasCleanDisconnect) connected = false;
+    const wasCleanDisconnect = !connected || (close && close.code === 4000);
+    // Always reset connected here so subsequent toggle calls (from auto-
+    // reconnect or the external SSE toggle path) take the open-new-ws
+    // branch instead of seeing stale state.
+    connected = false;
     doCleanup();
     if (wasCleanDisconnect) {
       addSystem('Disconnected.');
     } else {
-      // Unexpected drop (Gemini timeout) — auto-reconnect with limit
+      // Unexpected drop (Gemini timeout, voice-agent restart) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        addSystem('Still trying to connect. Common causes:');
-        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
-        addSystem('2. Voice agent not running — run: bash src/startup.sh');
-        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
-        addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        showVoiceTroubleshooting('Still trying to connect. Common causes:');
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
         addSystem('Connection lost — reconnecting (' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...');
         setStatus('Reconnecting...', 'error');
       }
-      // Always retry
+      // Always retry — connected is now false, so toggle() will open a fresh ws
       setTimeout(() => {
         if (!connected) {
           dbg('Auto-reconnecting (attempt ' + reconnectAttempts + ')...');
@@ -999,66 +2196,619 @@ function connectWs() {
         }
       }, 3000);
     }
-  };
-
-  ws.onerror = () => {
-    dbg('WS error', 'err');
-    setStatus('Connection failed', 'error');
-    addSystem('Connection error — is the agent server running?');
-  };
+  }
 }
 
-function doCleanup() {
-  stopMic();
-  if (audioCtx && audioCtx.state !== 'closed') {
-    // Close audio context immediately — don't use a delayed timeout
-    // (a delayed null can race with reconnect and kill the new AudioContext)
-    if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+function showVoiceTroubleshooting(lead) {
+  addSystem(lead);
+  addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
+  addSystem('2. Voice agent not running — run: bash src/startup.sh');
+  addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+  addSystem('You can type commands below in the meantime.');
+  addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+}
+
+// Terminal connect-attempt failures (design 1e): the transport latched the
+// 'error' status and suppressed its own close, so the page resets its UI here
+// — fail fast with actionable copy instead of the eternal reconnect spinner.
+function onVoiceConnectFailure(f) {
+  dbg('Voice connect failure: ' + f.kind + ' — ' + f.detail, 'err');
+  doCleanup({ keepStatus: true });
+  if (f.kind === 'mic-permission' || f.kind === 'mic-device' || f.kind === 'mic-other') {
+    return; // onMicError already printed the classified mic guidance
   }
-  setStatus('Text only', '');
+  if (f.kind === 'client-busy') {
+    // W5: voice is in use elsewhere — offer the user-confirmed take-over.
+    addSystem(f.detail + ' <span style="color:#4ecca3;cursor:pointer;text-decoration:underline" onclick="takeoverVoice()">Take over the call here</span>', true);
+    return;
+  }
+  addSystem(f.detail + (f.remediation ? ' ' + f.remediation : ''));
+  if (f.kind === 'timeout' || f.kind === 'connect-error') {
+    showVoiceTroubleshooting('Voice did not come up. Common causes:');
+  }
+}
+
+// W5 take-over affordance: the click IS the user confirmation. The challenger
+// reconnects with ?takeover=1; the server closes the incumbent with 4410
+// (its surface shows "call moved") and attaches us.
+function takeoverVoice() {
+  if (connected) return; // already in a call here
+  const url = $('wsUrl').value.trim();
+  if (!url) return;
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  _voiceUrlOverride = url + sep + 'takeover=1';
+  toggle();
+}
+window.takeoverVoice = takeoverVoice;
+
+// Non-audio protocol frames the transport forwards raw. Types the transport
+// itself owns (session.config, transcript, turn.*, agent.state) are handled
+// via the typed callbacks above and deliberately NOT re-handled here.
+function handleProtocolMessage(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === 'gui.update') {
+    const guiData = msg.payload?.data;
+    if (guiData?.type === 'subprocess_log' && guiData.line) {
+      dbg('subprocess  ' + guiData.line, 'audio');
+    } else if (guiData?.type === 'image' && guiData.base64) {
+      const imgEl = document.createElement('div');
+      imgEl.className = 't-entry t-system';
+      const img = document.createElement('img');
+      const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
+      img.src = imgDataUrl;
+      img.alt = guiData.description || 'Generated image';
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.style.marginTop = '8px';
+      imgEl.appendChild(img);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = imgDataUrl;
+      const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
+      dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
+      dlLink.textContent = 'Download image';
+      imgEl.appendChild(dlLink);
+      $('transcript').appendChild(imgEl);
+      scrollTranscript();
+      dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else if (guiData?.type === 'video' && guiData.base64) {
+      const vidEl = document.createElement('div');
+      vidEl.className = 't-entry t-system';
+      const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
+      const video = document.createElement('video');
+      video.src = vidDataUrl;
+      video.controls = true;
+      video.autoplay = true;
+      video.muted = true;
+      video.style.maxWidth = '100%';
+      video.style.borderRadius = '8px';
+      video.style.marginTop = '8px';
+      if (guiData.description) {
+        const caption = document.createElement('div');
+        caption.style.fontSize = '12px';
+        caption.style.color = '#888';
+        caption.style.marginTop = '4px';
+        caption.textContent = guiData.description;
+        vidEl.appendChild(caption);
+      }
+      vidEl.appendChild(video);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = vidDataUrl;
+      const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
+      dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
+      dlLink.textContent = 'Download video';
+      vidEl.appendChild(dlLink);
+      $('transcript').appendChild(vidEl);
+      scrollTranscript();
+      dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else {
+      addSystem('[gui] ' + JSON.stringify(guiData));
+    }
+  } else if (msg.type === 'gui.command') {
+    if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
+    else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
+  } else if (msg.type === 'gui.notification') {
+    addSystem('[notification] ' + (msg.payload?.message || ''));
+  } else if (msg.type === 'image') {
+    const imgEl = document.createElement('div');
+    imgEl.className = 't-entry t-system';
+    const img = document.createElement('img');
+    const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
+    img.src = legacyDataUrl;
+    img.alt = msg.data.description || 'Generated image';
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '8px';
+    img.style.marginTop = '8px';
+    imgEl.appendChild(img);
+    const dlLink2 = document.createElement('a');
+    dlLink2.className = 'btn-download';
+    dlLink2.href = legacyDataUrl;
+    const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
+    dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
+    dlLink2.textContent = 'Download image';
+    imgEl.appendChild(dlLink2);
+    $('transcript').appendChild(imgEl);
+    scrollTranscript();
+    dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
+  } else if (msg.type === 'speech_speed') {
+    const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
+    const rate = speeds[msg.speed] || 1.0;
+    if (voice) voice.setPlaybackRate(rate);
+    addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + rate + 'x)');
+  } else if (msg.type === 'session_end') {
+    addSystem('Session ended by voice command.');
+    dbg('session_end received — disconnecting', 'event');
+    connected = false; // prevent auto-reconnect
+    // disconnect() emits one synchronous 'closed'; the status handler
+    // sees connected=false → clean path ("Disconnected.", no retry).
+    if (voice) { voice.disconnect(); }
+    doCleanup();
+  } else if (msg.type === 'task.status') {
+    updateTask(msg.taskId, msg.status, msg.text, msg.result);
+  } else if (msg.type === 'grounding') {
+    const chunks = msg.payload?.groundingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+      const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
+      if (sources) addSystem('[sources] ' + sources);
+    }
+  }
+}
+
+// Page-surface reset after a voice session ends (any path: user disconnect,
+// server close, terminal failure, takeover). The TRANSPORT owns mic/playback/
+// audio-graph teardown; this only resets what the page itself put up.
+// Idempotent via cleanupDone — several paths may reach it for one session.
+function doCleanup(opts) {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  const keepStatus = opts && opts.keepStatus; // preserve an error status line
+  voice = null; // drop the handle — a dead session must not be reused
+  stopChromeStt();
+  if (!keepStatus) setStatus('Text only', '');
   connected = false;
   muted = false;
+  fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
+  reportAgentState();
   document.body.classList.remove('voice-active');
+  stopSpeakingDetection();
+  analyserNode = null;
   $('hero').style.display = '';
   $('btn').style.display = 'none';
   $('btn-mute').style.display = 'none';
+  $('btn-watch').style.display = 'none';
+  teardownPushSession();
+  stopVisionPoll();
   $('voice-status').className = 'status-pill voice-off';
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
-  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
 
+// ─── Vision toggle (let Sutando see your screen) ──────────
+// The browser owns capture (so the user gets the native Chrome Tab / Window /
+// Entire Screen picker), and we POST each frame to /vision/frame. The same
+// MediaStream renders into the on-screen preview so the user sees exactly
+// what Sutando sees. Voice tools (start_vision/stop_vision) still flip the
+// button via the 2s poll for the server-side screencapture path.
+var VISION_FRAME_INTERVAL_MS = 1500; // 1280x720 JPEG q=0.6 → ~80–150KB/frame; ~0.7 fps
+var VISION_FRAME_WIDTH = 1280;
+var VISION_FRAME_HEIGHT = 720;
+var VISION_FRAME_QUALITY = 0.6;
+var _visionStreaming = false;        // last-known server state (push or pull)
+var _visionPushActive = false;       // this browser is the push-mode driver
+var _visionPollTimer = null;
+var _visionStream = null;            // MediaStream from getDisplayMedia
+var _visionFrameTimer = null;
+var _visionFrameCount = 0;
+var _visionCanvas = null;            // hidden canvas reused for toBlob
+// Auto-recover state: when voice-agent restarts, the browser still holds
+// a live MediaStream but the server has pushMode=false. We re-issue
+// /vision/start (without re-prompting for getDisplayMedia) to recover.
+// Capped to prevent thrashing if recovery genuinely fails.
+var _visionRearmInFlight = false;
+var _visionRearmCount = 0;
+// Latched when the server reports a terminal stop; cleared only by a fresh
+// user-initiated start, so no recovery path can undo that decision.
+var _visionTerminalStop = false;
+var _VISION_REARM_LIMIT = 3;
+
+function applyVisionState(state) {
+  if (!state) return;
+  var streaming = !!state.streaming;
+  _visionStreaming = streaming;
+  var btn = document.getElementById('btn-watch');
+  if (!btn) return;
+  btn.className = streaming ? 'btn-watch watching' : 'btn-watch';
+  if (streaming) {
+    var src = state.source || 'screen';
+    var label = src === 'browser' ? 'screen' : src;
+    btn.textContent = '👁️ Watching (' + label + ')';
+    btn.title = 'Sutando is watching your ' + label + ' — click to stop';
+  } else {
+    btn.textContent = '👁️ Watch';
+    btn.title = 'Let Sutando watch your screen';
+  }
+  // Auto-recover: the server has fallen out of push mode (voice-agent
+  // restart, race, etc.) but we still hold a live MediaStream. Re-arm
+  // push mode without re-prompting for getDisplayMedia. If the stream
+  // is gone, just tear down our side.
+  var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
+  if (ourSideStale) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      _visionTerminalStop = true;
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
+      rearmPushMode();
+    } else {
+      teardownPushSession();
+    }
+  } else if (streaming && state.source === 'browser') {
+    // Healthy push session — clear any prior recovery attempts.
+    _visionRearmCount = 0;
+  }
+}
+
+// Re-issue /vision/start so the server re-enters push mode, without
+// re-prompting the user for getDisplayMedia. The browser's MediaStream
+// is still live; only the server-side flag was lost. Capped at
+// _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
+// recovery genuinely fails (e.g., voice session is gone).
+function rearmPushMode() {
+  // A terminal stop is a decision. Re-arming would restart the capture the
+  // server just stopped, so it outranks every recovery guard below.
+  if (_visionTerminalStop) return;
+  if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
+  if (!_visionStream || !_visionStream.active) return;
+  _visionRearmInFlight = true;
+  _visionRearmCount++;
+  fetch('/vision/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: 'browser' }),
+  }).then(function(r) {
+    return r.json().catch(function() { return {}; });
+  }).then(function(d) {
+    if (d && d.status === 'streaming') {
+      _visionRearmCount = 0;
+      addSystem('Vision: push mode re-armed (server restart detected).');
+    } else if (_visionRearmCount >= _VISION_REARM_LIMIT) {
+      addSystem('Vision: re-arm failed — click Watch to share again.');
+      teardownPushSession();
+    }
+  }).catch(function() {
+    if (_visionRearmCount >= _VISION_REARM_LIMIT) {
+      teardownPushSession();
+    }
+  }).finally(function() {
+    _visionRearmInFlight = false;
+  });
+}
+function pollVisionState() {
+  fetch('/vision/state').then(function(r) {
+    if (!r.ok) return null;
+    return r.json();
+  }).then(function(s) { if (s) applyVisionState(s); }).catch(function() {});
+}
+function startVisionPoll() {
+  pollVisionState();
+  if (_visionPollTimer) clearInterval(_visionPollTimer);
+  _visionPollTimer = setInterval(pollVisionState, 2000);
+}
+function stopVisionPoll() {
+  if (_visionPollTimer) { clearInterval(_visionPollTimer); _visionPollTimer = null; }
+  _visionStreaming = false;
+}
+
+function updateVisionPreviewStats() {
+  var stats = document.getElementById('vision-preview-stats');
+  if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
+}
+
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
+function captureAndSendFrame() {
+  var preview = document.getElementById('vision-preview');
+  if (!preview || !_visionStream) return;
+  // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
+  if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
+  if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
+  _visionCanvas.width = VISION_FRAME_WIDTH;
+  _visionCanvas.height = VISION_FRAME_HEIGHT;
+  var ctx = _visionCanvas.getContext('2d');
+  ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
+    if (!blob) return;
+    // Skip blank frames — getDisplayMedia sometimes paints a black frame
+    // for the first tick when the user switches surfaces; uploading a
+    // black JPEG just wastes context.
+    if (blob.size < 2048) return;
+    fetch('/vision/frame', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+      body: blob,
+    }).then(function(r) {
+      if (r.ok) {
+        _visionFrameCount++;
+        // Successful POST → server is in push mode again. Reset the
+        // recovery counter so future restarts get a fresh budget.
+        _visionRearmCount = 0;
+        updateVisionPreviewStats();
+      } else {
+        // 409 means the server's pushMode flag is false (voice-agent
+        // restart) — try to re-arm without waiting for the 2s state poll.
+        if (r.status === 409 && _visionPushActive) {
+          // The 2s poll usually loses this race at >=1fps, so read the reason
+          // off the rejection itself rather than waiting for the next poll.
+          r.clone().json().then(function(d) {
+            if (d && d.stoppedReason === 'no-client') {
+              _visionTerminalStop = true;
+              teardownPushSession();
+            } else {
+              rearmPushMode();
+            }
+          }).catch(function() { rearmPushMode(); });
+        }
+        // Surface the first rejection so the user sees why Sutando doesn't
+        // see frames (e.g. push mode not active because voice isn't ready).
+        if (_visionFrameCount === 0) {
+          r.text().then(function(t) { addSystem('Vision frame rejected (' + r.status + '): ' + t); }).catch(function() {});
+        }
+      }
+    }).catch(function() { /* network blip — next tick will retry */ });
+}
+
+function teardownPushSession() {
+  _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
+  if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
+  if (_visionStream) {
+    try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    _visionStream = null;
+  }
+  var preview = document.getElementById('vision-preview');
+  if (preview) preview.srcObject = null;
+  var wrap = document.getElementById('vision-preview-wrap');
+  if (wrap) wrap.style.display = 'none';
+  _visionFrameCount = 0;
+  _visionRearmCount = 0;
+}
+
+async function startWatch() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    addSystem('Vision: this browser does not support screen sharing.');
+    return;
+  }
+  var stream;
+  try {
+    // User picks Chrome Tab / Window / Entire Screen here.
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: VISION_FRAME_WIDTH, height: VISION_FRAME_HEIGHT, frameRate: 2 },
+      audio: false,
+    });
+  } catch (err) {
+    // NotAllowedError when the user cancels the picker — silent.
+    if (err && err.name !== 'NotAllowedError') {
+      addSystem('Vision: ' + (err.message || 'screen share failed'));
+    }
+    return;
+  }
+  _visionStream = stream;
+  var preview = document.getElementById('vision-preview');
+  var wrap = document.getElementById('vision-preview-wrap');
+  if (preview) preview.srcObject = stream;
+  if (wrap) wrap.style.display = '';
+
+  // User can end sharing from the browser's native UI ("Stop sharing"
+  // toolbar) — clean up our side and tell the server.
+  var track = stream.getVideoTracks()[0];
+  if (track) track.addEventListener('ended', function() {
+    console.log('[Vision] track.ended fired — user stopped share via Chrome native UI (or track died)');
+    stopWatch();
+  });
+
+  // Tell the server we're entering push mode.
+  var startResp;
+  try {
+    var r = await fetch('/vision/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'browser' }),
+    });
+    startResp = await r.json().catch(function() { return { status: 'failed', error: 'bad json' }; });
+  } catch (e) {
+    startResp = { status: 'failed', error: 'voice-agent not reachable' };
+  }
+  if (startResp.status === 'failed') {
+    addSystem('Vision: ' + (startResp.error || 'failed to start'));
+    teardownPushSession();
+    pollVisionState();
+    return;
+  }
+  _visionTerminalStop = false;   // a user-initiated start supersedes it
+  _visionPushActive = true;
+  _visionFrameCount = 0;
+  updateVisionPreviewStats();
+
+  // Wait for the first painted frame, then start the ticker. Without this
+  // the first capture often paints a black canvas because the video
+  // element hasn't rendered any data yet.
+  var startTicker = function() {
+    if (_visionFrameTimer) clearInterval(_visionFrameTimer);
+    setTimeout(captureAndSendFrame, 250);
+    _visionFrameTimer = setInterval(captureAndSendFrame, VISION_FRAME_INTERVAL_MS);
+  };
+  if (preview && preview.readyState >= 2 && preview.videoWidth) {
+    startTicker();
+  } else if (preview) {
+    preview.addEventListener('playing', startTicker, { once: true });
+  }
+  pollVisionState();
+}
+
+async function stopWatch() {
+  console.log('[Vision] stopWatch called — tearing down push session and POSTing /vision/stop');
+  console.trace('[Vision] stopWatch caller');
+  teardownPushSession();
+  try {
+    await fetch('/vision/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {}
+  pollVisionState();
+}
+
+function toggleWatch() {
+  // Debug: log entry state so we can see why a click went to stop vs start.
+  // Common gotcha: a stale _visionPushActive=true from a prior dead
+  // session sends the click to stopWatch silently, and the user is stuck.
+  var streamAlive = !!(_visionStream && _visionStream.active);
+  console.log('[Vision] toggleWatch:',
+    'pushActive=' + _visionPushActive,
+    'streaming=' + _visionStreaming,
+    'streamAlive=' + streamAlive);
+  // Defensive: if we *think* we're pushing but the MediaStream is gone
+  // or its tracks have ended, drop the stale flag so the click resolves
+  // to startWatch instead of a no-op stopWatch.
+  if (_visionPushActive && !streamAlive) {
+    console.log('[Vision] toggleWatch: clearing stale _visionPushActive — stream is dead');
+    teardownPushSession();
+  }
+  if (_visionPushActive || _visionStreaming) {
+    stopWatch();
+  } else {
+    startWatch();
+  }
+}
+window.toggleWatch = toggleWatch;
+
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {
-  if (!micStream) return;
+  if (!voice || !connected) return;
   muted = !muted;
-  micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  // Transport call-control gate (also flips the track so the OS mic
+  // indicator reflects the mute).
+  voice.setMicMuted(muted);
   const btn = document.getElementById('btn-mute');
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
   addSystem(muted ? 'Microphone muted.' : 'Microphone unmuted.');
+  // Report actual mute state to server for menu bar indicator
+  fetch('/mute-state?muted=' + muted).catch(() => {});
+  reportAgentState();
 }
+
+// Derive semantic agent state from existing DOM + connection signals and
+// report it to the server. Called on explicit signal changes (mute toggle,
+// voice connect/disconnect) and from a 1s polling loop for .speaking / .working
+// class transitions which flip too fast to hook directly. Last-state dedup
+// avoids flooding the server.
+var _lastReportedAgentState = 'idle';
+function reportAgentState() {
+  var state = 'idle';
+  if (connected && !muted) {
+    var av = document.getElementById('stand-avatar');
+    if (av && av.classList.contains('speaking')) {
+      state = 'speaking';
+    } else if (av && av.classList.contains('working')) {
+      state = 'working';
+    } else {
+      state = 'listening';
+    }
+  }
+  // Re-assert voice=true on every agent-state heartbeat while connected.
+  // The server's _voiceState is a module-level variable that resets to
+  // false on web-client restart; without this, a mid-session restart of
+  // com.sutando.web-client leaves /sse-status reporting voiceConnected=false
+  // until the user manually toggles voice or reloads the tab.
+  // Only send on transition to avoid spamming the server with identical
+  // state on every 1s tick.
+  var needsReassert = connected && !_lastAssertedVoiceTrue;
+  if (state === _lastReportedAgentState && !needsReassert) return;
+  _lastReportedAgentState = state;
+  var params = 'state=' + state;
+  if (connected) {
+    params += '&voice=true';
+    _lastAssertedVoiceTrue = true;
+  } else {
+    _lastAssertedVoiceTrue = false;
+  }
+  fetch('/mute-state?' + params).catch(function() {});
+}
+var _lastAssertedVoiceTrue = false;
+setInterval(reportAgentState, 1000);
 
 // ─── UI toggle (user gesture context!) ────────────────────
 function toggle() {
   if (connected) {
-    if (ws) { ws.close(); ws = null; }
-    doCleanup();
+    // Set connected=false BEFORE disconnect(): the transport synchronously
+    // emits one 'closed', and the status handler must read it as a clean
+    // user stop (no auto-reconnect).
+    connected = false;
+    const v = voice;
+    if (v) v.disconnect();
+    doCleanup(); // idempotent — no-op when the closed handler already ran
   } else {
-    // Create AudioContext HERE in the click handler so browsers allow playback
-    // Use system default sample rate — it handles resampling from OUTPUT_RATE internally
-    audioCtx = new AudioContext();
-    dbg('AudioContext created on click: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
+    // Page-level AudioContext (tool cues) on the user gesture; the transport
+    // creates its own voice audio graph inside connect(), also within this
+    // gesture's synchronous call stack.
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new AudioContext();
+    } else if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
-    // Reset counters
-    nextPlayTime = 0;
+    // Reset per-session surface state
     bytesSent = 0;
     bytesRecv = 0;
-    audioChunksRecv = 0;
-    playChunkCount = 0;
+    micAnnounced = false;
+    cleanupDone = false;
 
     connected = true;
     muted = false;
+    fetch('/mute-state?muted=false&voice=true').catch(() => {}); // Report connected + unmuted
+    reportAgentState();
     document.body.classList.add('voice-active');
     $('hero').style.display = 'none';
     $('btn').style.display = '';
@@ -1067,12 +2817,17 @@ function toggle() {
     $('btn-mute').style.display = '';
     $('btn-mute').textContent = 'Mute';
     $('btn-mute').className = 'btn-mute';
+    $('btn-watch').style.display = '';
+    $('btn-watch').textContent = '👁️ Watch';
+    $('btn-watch').className = 'btn-watch';
+    startVisionPoll();
     $('voice-status').className = 'status-pill voice-on';
     $('status').textContent = 'Voice active';
     try { sessionStorage.setItem('sutando-voice', '1'); } catch {}
     connectWs();
   }
 }
+window.toggle = toggle;
 
 // ─── Suggestion chips ─────────────────────────────────────
 function copyLogs() {
@@ -1084,6 +2839,92 @@ function copyLogs() {
     });
   }).catch(function() { addSystem('Could not fetch logs — is the agent API running?'); });
 }
+
+// Parse a result for decision options. Two patterns, in preference order:
+//   1. "Say X, Y, or Z" / "say X or Y"
+//   2. "DECISION: X / Y / Z"
+// NOTE: embedded in an HTML template literal — backslashes in regex literals
+// get eaten by the template. Use new RegExp('\\\\pattern') so the served JS
+// gets '\\pattern' which becomes /\pattern/ at runtime. Ref: inline-JS escape
+// memo + the wrapper regex at the bottom of this file.
+function parseDecisionOptions(text) {
+  if (!text) return null;
+  var reSay = new RegExp('\\\\bSay\\\\s+([^.\\\\n\\\\r]+?)(?:\\\\s*\\\\.|\\\\s*$)', 'im');
+  var reDecision = new RegExp('DECISION:\\\\s*([^\\\\n\\\\r]+)', 'i');
+  var reOrJoin = new RegExp(',?\\\\s+or\\\\s+', 'i');
+  var reAsterisk = new RegExp('^\\\\*\\\\*|\\\\*\\\\*$', 'g');
+  var reSplitTail = new RegExp('\\\\s*[\\\\u2014\\\\u2013(]\\\\s*|\\\\.\\\\s');
+  var reQuotes = new RegExp('^[\\\\x27\\\\x22\\\\u201C]|[\\\\x27\\\\x22\\\\u201D.]$', 'g');
+
+  var sm = text.match(reSay);
+  if (sm) {
+    var list = sm[1].trim().replace(reOrJoin, ', ');
+    var parts = list.split(',').map(function(p) { return p.trim(); }).filter(Boolean);
+    if (parts.length >= 2 && parts.every(function(p) { return p.length > 0 && p.length <= 30; })) {
+      return parts;
+    }
+  }
+  var m = text.match(reDecision);
+  if (m) {
+    var opts = m[1].split('/').map(function(p) {
+      var s = p.trim().replace(reAsterisk, '').trim();
+      var cut = s.split(reSplitTail)[0].trim();
+      cut = cut.replace(reQuotes, '').trim();
+      return cut;
+    }).filter(function(s) { return s && s.length > 0 && s.length <= 30; });
+    if (opts.length >= 2) return opts;
+  }
+  return null;
+}
+
+// Post a reply to a task via the task bridge. Creates a new task that
+// carries context about which result it is answering. Reuses /task
+// endpoint — same plumbing as sendText() voice-disconnected path.
+function replyToTask(taskId, answer) {
+  if (!answer || !answer.trim()) return;
+  var apiBase = 'http://' + location.hostname + ':7843';
+  var body = JSON.stringify({ from: 'web-reply:' + taskId, task: answer.trim() });
+  fetch(apiBase + '/task', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var container = document.querySelector('[data-replyfor="' + taskId + '"]');
+      if (!container) return;
+      if (d.ok) {
+        container.outerHTML = '<div class="task-action-sent">Replied: ' + esc(answer.trim()) + '</div>';
+      } else {
+        alert('Reply failed: ' + (d.error || 'unknown'));
+      }
+    })
+    .catch(function() { alert('Could not reach agent API'); });
+}
+
+// Event delegation: button click + Enter in reply input. Keeps renderTasks
+// free of inline onclick handlers (avoids innerHTML-quoting issues).
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('.task-action-btn');
+  if (btn && btn.dataset.taskid) { replyToTask(btn.dataset.taskid, btn.dataset.answer); }
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    var input = e.target;
+    if (input.classList && input.classList.contains('task-action-input') && input.dataset.taskid) {
+      replyToTask(input.dataset.taskid, input.value);
+    }
+    return;
+  }
+  // Global "/" — jump focus to the most recent task's reply input.
+  // Skip when user is already typing in ANY input/textarea/contenteditable.
+  if (e.key === '/') {
+    var active = document.activeElement;
+    var tag = active && active.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (active && active.isContentEditable)) return;
+    var firstInput = document.querySelector('.task-action-input');
+    if (firstInput) {
+      e.preventDefault();
+      firstInput.focus();
+    }
+  }
+});
 
 function answerQuestion(qid, answer) {
   if (!answer || !answer.trim()) return;
@@ -1099,13 +2940,10 @@ function answerQuestion(qid, answer) {
       var qParent = qItem ? qItem.closest('.q-item') : null;
       if (qParent) {
         var actions = qParent.querySelector('.q-actions');
-        if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim().substring(0, 60)) + '</span>';
+        if (actions) actions.innerHTML = '<span style="color:#4ecca3;font-size:12px">Answered: ' + esc(answer.trim()) + '</span>';
       }
       // Remove after brief delay so user sees confirmation
-      setTimeout(function() {
-        window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
-        updateDynamicRegion();
-      }, 1500);
+      setTimeout(function() { dropQuestionFromQueue(qid); }, 1500);
       // Show in transcript too
       var el = document.createElement('div');
       el.className = 't-entry t-system';
@@ -1117,20 +2955,163 @@ function answerQuestion(qid, answer) {
   }).catch(() => { alert('Could not reach agent API'); });
 }
 
+function trackChipUsage(label) {
+  try {
+    var usage = JSON.parse(localStorage.getItem('sutando_chip_usage') || '{}');
+    usage[label] = (usage[label] || 0) + 1;
+    localStorage.setItem('sutando_chip_usage', JSON.stringify(usage));
+  } catch(e) {}
+}
+
+function getChipUsage() {
+  try { return JSON.parse(localStorage.getItem('sutando_chip_usage') || '{}'); } catch(e) { return {}; }
+}
+
 function trySuggestion(el) {
   // Extract only the quoted command (e.g. "summon" from '"summon" — description')
   const raw = el.textContent;
   const dashIdx = raw.indexOf(' — ');
   const cmd = dashIdx > 0 ? raw.slice(0, dashIdx) : raw;
   const text = cmd.replace(/[\u201C\u201D"]/g, '').trim();
+  // Track usage
+  trackChipUsage(text);
+  // Handle special actions
+  if (text === 'Show questions') { switchDRTab('questions'); return; }
+  if (text === 'Notes') { showNotesInDR(); return; }
   $('textInput').value = text;
-  // If voice is connected, start voice first then it'll go through voice
-  if (!connected) {
-    // Send as text task
-    sendText();
+  sendText();
+}
+
+function showNotesInDR() { switchDRTab('notes'); }
+
+function showNoteInDR(slug) { showNoteContent(slug); }
+
+function toggleActivity() { switchDRTab('activity'); }
+window.toggleActivity = toggleActivity;
+
+// Expose notes functions to global scope for onclick handlers
+window.showNotesInDR = showNotesInDR;
+window.showNoteInDR = showNoteInDR;
+
+// ─── Web-chat send-path persistence ──────────────────────
+// When voice is disconnected, sendText() routes through the task bridge and
+// polls /result for the late reply (core pickup is 10-32s). The poll used to
+// live in an in-page setInterval closure that died on page reload, so a refresh
+// during the wait dropped the reply forever. Persist {task_id, text} to
+// localStorage and resume polling on load so a reload re-attaches and renders
+// the reply. /result/<id> serves from results/archive too, so the reply
+// survives the bridge archiving the file before the resumed poll runs.
+const PERSIST_KEY_CHAT_PENDING = 'sutando-dashboard-chat-pending-v1';
+// Long-running agent tasks (PR creation, research, multi-step analysis) routinely
+// take many minutes. A short poll cap orphaned the reply: the result landed in the
+// Tasks tab but the transcript was stuck on a dead "(No response yet…)" line forever.
+// Keep polling well past the first minute (backing the cadence off once past the
+// fast window), and on the hard ceiling stop the in-page timer but KEEP the
+// persisted entry so a reload re-attaches and still renders the late reply.
+const CHAT_POLL_FAST_MS = 2 * 1000;            // cadence during the fast window
+const CHAT_POLL_SLOW_MS = 15 * 1000;           // cadence after the fast window
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;// poll every 2s for the first 2 min
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;       // ceiling for ONE page session's polling
+// Must stay strictly greater than the poll ceiling: an entry kept for a reload
+// to recover is by definition already older than the ceiling that stopped it.
+const CHAT_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function loadPendingChatSends() {
+  try {
+    const cutoff = Date.now() - CHAT_PENDING_TTL_MS;
+    return JSON.parse(localStorage.getItem(PERSIST_KEY_CHAT_PENDING) || '[]')
+      .filter(p => p && p.task_id && (p.ts || 0) >= cutoff);
+  } catch { return []; }
+}
+function addPendingChatSend(taskId, text) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    list.push({ task_id: taskId, text, ts: Date.now() });
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function removePendingChatSend(taskId) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function renderChatReply(el, resultText) {
+  // Same markdown-or-escaped-text rendering the inline poll used. marked +
+  // DOMPurify both required — marked alone would be unsafe innerHTML on agent
+  // results that originate from external task channels.
+  if (window.marked && window.DOMPurify) {
+    try {
+      el.innerHTML = window.DOMPurify.sanitize(
+        window.marked.parse(resultText, { breaks: true, gfm: true })
+      );
+    } catch (e) {
+      el.textContent = resultText;
+    }
   } else {
-    sendText();
+    el.textContent = resultText;
   }
+  el.classList.remove('t-working');
+  addCopyBtn(el);
+}
+// Poll the task bridge for a chat reply and render it into placeholderEl when
+// it arrives. Backs the cadence off after the fast window. On completion it
+// clears the persisted entry; on the ceiling it stops this session's timer but
+// KEEPS the entry so a reload re-attaches and still renders the reply (the
+// result is served from results/archive indefinitely).
+// sentAt is display/context only. The ceiling deliberately runs from THIS
+// session's start: measuring it from the original send made a resumed poll
+// exceed it on its first tick and return without ever calling /result.
+function pollChatReply(taskId, placeholderEl, sentAt) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const begin = Date.now();
+  let timer = null;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const schedule = (elapsed) => {
+    const delay = elapsed < CHAT_POLL_FAST_WINDOW_MS ? CHAT_POLL_FAST_MS : CHAT_POLL_SLOW_MS;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = () => {
+    const elapsed = Date.now() - begin;
+    if (elapsed > CHAT_POLL_MAX_MS) {
+      stop();
+      // Keep the persisted entry — a reload resumes the poll and can still
+      // render the reply once the (slow) task finishes.
+      if (placeholderEl && placeholderEl.classList.contains('t-working')) {
+        placeholderEl.textContent = '(Still working — the reply will appear here when it lands, or refresh. It is also in the Tasks tab.)';
+        placeholderEl.classList.remove('t-working');
+      }
+      return;
+    }
+    fetch(apiBase + '/result/' + taskId).then(r => r.json()).then(r => {
+      if (r.status === 'completed') {
+        stop();
+        removePendingChatSend(taskId);
+        renderChatReply(placeholderEl, r.result);
+        scrollTranscript();
+      } else {
+        schedule(elapsed);
+      }
+    }).catch(() => { schedule(elapsed); });
+  };
+  tick();
+}
+// On page load, re-render any in-flight chat sends and resume polling so a
+// reload during the core-pickup wait still surfaces the reply.
+function resumePendingChatSends() {
+  const pending = loadPendingChatSends();
+  if (!pending.length) return;
+  pending.forEach(p => {
+    const ue = document.createElement('div');
+    ue.className = 't-entry t-user';
+    ue.textContent = p.text;
+    $('transcript').appendChild(ue);
+    const placeholder = document.createElement('div');
+    placeholder.className = 't-entry t-assistant t-working';
+    placeholder.textContent = 'working…';
+    $('transcript').appendChild(placeholder);
+    pollChatReply(p.task_id, placeholder, p.ts);
+  });
+  scrollTranscript(true);
 }
 
 // ─── Text input ──────────────────────────────────────────
@@ -1145,12 +3126,11 @@ function sendText() {
   el.className = 't-entry t-user';
   el.textContent = text;
   $('transcript').appendChild(el);
-  $('transcript').scrollTop = $('transcript').scrollHeight;
+  scrollTranscript(true);
   input.value = '';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
-    ws.send(JSON.stringify({ type: 'text_input', text }));
+  if (voice && voice.sendTextInput(text)) {
+    // Voice connected — sent through the voice agent's live socket
     dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
   } else {
     // Voice disconnected — route through task bridge (same as Telegram/Discord)
@@ -1160,19 +3140,18 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                re.textContent = r.result;
-                $('transcript').appendChild(re);
-                $('transcript').scrollTop = $('transcript').scrollHeight;
-              }
-            }).catch(() => {});
-          }, 2000);
+          // Persist the in-flight send so a page reload during the core-pickup
+          // wait re-attaches and renders the reply instead of dropping it.
+          addPendingChatSend(d.task_id, text);
+          // Show a "working…" placeholder immediately so the 10-32s wait reads
+          // as in-progress, not failure. The placeholder is filled in place
+          // when the reply arrives.
+          const placeholder = document.createElement('div');
+          placeholder.className = 't-entry t-assistant t-working';
+          placeholder.textContent = 'working…';
+          $('transcript').appendChild(placeholder);
+          scrollTranscript();
+          pollChatReply(d.task_id, placeholder);
         }
       })
       .catch(() => {
@@ -1184,6 +3163,8 @@ function sendText() {
   }
 }
 
+try { resumePendingChatSends(); } catch {}
+
 // ─── Dynamic region: contextual generative UI ────────────
 // Priority: dynamic-content.json > pending questions > proactive status > chips
 // Supports: audio, image, video, document, html, and fallback chips
@@ -1191,15 +3172,42 @@ window._drQuestions = [];
 window._drProactive = null;
 window._drContent = null;
 const API_BASE = 'http://' + window.location.hostname + ':7843';
-const SUGGESTION_CHIPS = [
-  {label: 'Summon', desc: 'share screen on Zoom, join on your phone'},
-  {label: 'Join my next meeting'},
-  {label: 'What is on my screen?'},
-  {label: 'What is on my calendar today?'},
-  {label: 'Take a note: my first Sutando note'},
-  {label: 'Tutorial', desc: 'walk me through what you can do'},
-  {label: 'Bye', desc: 'disconnect voice'},
-];
+function getSuggestionChips() {
+  var h = new Date().getHours();
+  var usage = getChipUsage();
+  var chips = [];
+  // Time-based
+  if (h < 12) chips.push({label: 'Morning briefing'});
+  else chips.push({label: 'What is on my calendar today?'});
+  // Always useful
+  chips.push({label: 'Check my email'});
+  chips.push({label: 'What is on my screen?'});
+  // Actions (work via text or voice)
+  chips.push({label: 'Summon', desc: 'share screen on Zoom'});
+  chips.push({label: 'Join my next meeting'});
+  // Productivity
+  chips.push({label: 'Take a note'});
+  chips.push({label: 'Read my reminders'});
+  chips.push({label: 'Show tasks'});
+  chips.push({label: 'Show notes'});
+  // Evening wind-down
+  if (h >= 17) chips.push({label: 'What did I accomplish today?'});
+  // Voice disconnect
+  if (connected) chips.push({label: 'Bye', desc: 'disconnect voice'});
+  else chips.push({label: 'Tutorial'});
+  // Contextual: pending questions badge
+  var qCount = (window._drQuestions || []).length;
+  if (qCount > 0) chips.unshift({label: 'Show questions', desc: qCount + ' pending'});
+  // Contextual chips from core agent (written each loop pass)
+  var ctxChips = (window._contextualChips || []).slice().reverse();
+  ctxChips.forEach(function(c) { chips.unshift(c); });
+  // Sort static chips by usage frequency, keep contextual + time-based at top
+  var contextCount = ctxChips.length + 1; // +1 for time-based chip
+  var pinned = chips.slice(0, contextCount);
+  var rest = chips.slice(contextCount);
+  rest.sort(function(a, b) { return (usage[b.label] || 0) - (usage[a.label] || 0); });
+  return pinned.concat(rest);
+}
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
@@ -1241,40 +3249,433 @@ function renderDynamicContent(c) {
   }
 }
 
-function updateDynamicRegion() {
-  const dr = document.getElementById('dynamic-region');
+window._drActiveTab = window._drActiveTab || 'starter';
+window._drTaskCount = 0;
+window._drTabsRendered = false;
+
+function switchDRTab(tab) {
+  window._drQueueChecked = false;
+  window._drActiveTab = tab;
+  window._drLocalContent = true; // prevent poll from clearing content
+  updateTabHighlights();
+  renderTabContent();
+}
+window.switchDRTab = switchDRTab;
+
+function ensureTabStructure() {
+  var dr = document.getElementById('dynamic-region');
   if (!dr) return;
-  // Skip re-render if user is typing in a question input
+  if (!document.getElementById('dr-tabs')) {
+    dr.innerHTML = '<div id="dr-tabs" style="display:flex;gap:2px;margin-bottom:8px"></div>' +
+      '<div id="dr-content" style="min-width:100%;word-wrap:break-word;overflow-wrap:break-word;user-select:text;-webkit-user-select:text;cursor:text"></div>';
+  }
+  updateTabHighlights();
+}
+
+// Track last-seen counts per tab to detect new items
+window._lastSeenCounts = window._lastSeenCounts || {};
+function updateTabHighlights() {
+  var tabsEl = document.getElementById('dr-tabs');
+  if (!tabsEl) return;
+  var active = window._drActiveTab;
+  var questions = window._drQuestions || [];
+  var taskCount = window._drTaskCount || 0;
+  var noteCount = window._drNoteCount || 0;
+  var seen = window._lastSeenCounts;
+  // Mark current tab as seen
+  if (active === 'tasks') seen.tasks = taskCount;
+  if (active === 'questions') seen.questions = questions.length;
+  if (active === 'notes') seen.notes = noteCount;
+  var hasNewTasks = taskCount > (seen.tasks || 0);
+  var hasNewQuestions = questions.length > (seen.questions || 0);
+  var dot = '<span style="color:#4ecca3;font-size:8px;margin-left:2px">●</span>';
+  var tabs = [
+    {id:'starter', label:'Starter'},
+    {id:'tasks', label:'Tasks' + (taskCount > 0 ? ' (' + taskCount + ')' : '') + (hasNewTasks ? dot : '')},
+    {id:'notes', label:'Notes' + (noteCount > 0 ? ' (' + noteCount + ')' : '')},
+    {id:'questions', label:'Questions' + (questions.length > 0 ? ' (' + questions.length + ')' : '') + (hasNewQuestions ? dot : '')},
+    {id:'activity', label:'Activity'},
+  ];
+  tabsEl.style.display = 'flex';
+  tabsEl.style.gap = '2px';
+  tabsEl.innerHTML = tabs.map(function(t) {
+    var isActive = t.id === active;
+    var bg = isActive ? '#2a2a4e' : 'transparent';
+    var fg = isActive ? '#ccc' : '#666';
+    var border = isActive ? '#4a4a6e' : '#2a2a3e';
+    if (t.id === 'questions' && questions.length > 0 && !isActive) fg = '#f0ad4e';
+    if (t.id === 'tasks' && hasNewTasks && !isActive) fg = '#4ecca3';
+    return '<span onclick="switchDRTab(&quot;' + t.id + '&quot;)" style="cursor:pointer;padding:6px 0;border-radius:12px;font-size:14px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';flex:1;text-align:center">' + t.label + '</span>';
+  }).join('');
+}
+
+function renderTabContent() {
+  var container = document.getElementById('dr-content');
+  if (!container) return;
+  var tab = window._drActiveTab;
+
+  if (tab === 'starter') {
+    // Cap at 5 chips per Susan's "show fewer cards rather than shrink" rule.
+    // Also cap each chip's visible label at ~32 chars so "PR 470 — task-card
+    // redesign" stays terse — full text still available via title tooltip.
+    container.innerHTML = '<div class="dr-chips">' +
+      '<div class="suggestions-label" style="font-size:14px;color:#999;margin-bottom:28px">Try saying or typing</div>' +
+      getSuggestionChips().slice(0, 5).map(function(c) {
+        var full = c.label + (c.desc ? ' — ' + c.desc : '');
+        var short = full.length > 32 ? full.slice(0, 30) + '…' : full;
+        return '<span class="suggestion" title="' + esc(full) + '" onclick="trySuggestion(this)">' +
+          esc(short) + '</span>';
+      }).join('') + '</div>';
+    window._drLocalContent = false;
+
+  } else if (tab === 'tasks') {
+    // Render tasks using the shared .task-item classes + renderTasks()
+    // template (summarizeTaskText / userExpanded / hover / 18px). Previous
+    // inline-styled path was dead-code that bypassed all CSS work — see
+    // Maddy's 2026-04-19 16:07 ET root-cause writeup.
+    var entries = Object.entries(taskMap);
+    if (entries.length === 0) {
+      container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';
+    } else {
+      var display = groupedTaskDisplay(entries);
+      var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
+      container.innerHTML = renderTaskWorkstreamGroups(display, function(entry, i) {
+        var id = entry[0], t = entry[1];
+        var ago = Math.round((Date.now() - t.time) / 1000);
+        var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
+        // Render results whenever they exist — agent's task bookkeeping
+        // sometimes leaves tasks in 'working' state even after the result
+        // file is written. Same fix as the main renderTasks path above.
+        var hasResult = !!t.result;
+        var isExpanded = expandedTasks.has(id);
+        // Always emit data-taskid (matches primary renderTasks path) so flash
+        // + expand:N can target working tasks. cursor only when clickable.
+        var clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
+        var resultDisplay = isExpanded ? 'block' : 'none';
+        var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
+        var rawText = t.text || id;
+        // Tag un-prefixed tasks by their source field: voice -> [Voice],
+        // anything else (cron/system reminders, etc.) -> [System]. Replaces
+        // the old "every bare task is [Voice]" default that mislabeled
+        // non-voice items (#bugs 2026-06-25).
+        var taggedRaw = /^\\[/.test(rawText) ? rawText : ((t.source === 'voice' ? '[Voice] ' : '[System] ') + rawText);
+        // Prepend 1-based index — same as the primary renderTasks path,
+        // so voice can target tasks by number on this dynamic-region list too.
+        var numPrefix = (i + 1) + '. ';
+        var displayText = numPrefix + (isExpanded ? taggedRaw : summarizeTaskText(taggedRaw));
+        var textClass = isExpanded ? 'task-text expanded' : 'task-text';
+        var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
+        return '<div class="task-item"' + clickAttr + '>' +
+          '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
+          '<span class="' + textClass + '">' + esc(displayText) + '</span>' +
+          '<span class="task-time">' + timeStr + '</span>' +
+          expandChip +
+          '</div>' + resultHtml;
+      });
+    }
+    window._drLocalContent = false;
+
+  } else if (tab === 'notes') {
+    var DASH = 'http://' + window.location.hostname + ':7844';
+    fetch(DASH + '/notes').then(function(r){return r.json()}).then(function(notes) {
+      var searchHtml = '<div style="margin-bottom:8px"><input id="note-search" type="text" placeholder="Search notes..." style="width:100%;padding:6px 10px;border-radius:8px;border:1px solid #1e1e30;background:#0e0e18;color:#ccc;font-size:12px;outline:none" oninput="filterNotes(this.value)"></div>';
+      var html = '';
+      window._allNotes = notes;
+      notes.forEach(function(n) {
+        html += '<div class="note-item" data-title="' + esc(n.title).toLowerCase() + '" data-slug="' + n.slug + '" style="padding:12px 10px;margin:0 -10px;border-bottom:1px solid #2a2a3e;display:flex;align-items:center;font-size:16px;line-height:1.6;border-radius:6px">' +
+          '<span style="margin-right:10px;flex-shrink:0">&#128221;</span>' +
+          '<span style="color:#7c83ff;cursor:pointer;flex:1" onclick="showNoteContent(&quot;' + n.slug + '&quot;)">' + n.title + '</span>' +
+          '<span style="color:#666;font-size:13px;margin-right:8px">' + new Date(n.modified*1000).toLocaleDateString() + '</span>' +
+          '<span style="color:#e94560;font-size:13px;cursor:pointer;opacity:0.5" onclick="event.stopPropagation();deleteNoteFromUI(&quot;' + n.slug + '&quot;)">x</span></div>';
+      });
+      if (!html) html = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No notes</div>';
+      container.innerHTML = searchHtml + html;
+    });
+
+  } else if (tab === 'questions') {
+    // Re-check immediately before display, once per visit rather than per re-render.
+    // Renders directly on completion — updateDynamicRegion() would refuse while
+    // this tab is still the locally-set one, which is the entire time it's open.
+    if (!window._drQueueChecked) {
+      window._drQueueChecked = true;
+      refreshQuestionQueue().then(function() { updateTabHighlights(); renderTabContent(); });
+    }
+    if (!window._drQueue) window._drQueue = window._drQuestions || [];
+    container.innerHTML = renderQuestionQueue(window._drQueue, window._drQueueIndex || 0);
+
+  } else if (tab === 'activity') {
+    fetch(API_BASE + '/activity').then(function(r){return r.json()}).then(function(data) {
+      var items = data.activity || [];
+      if (items.length === 0) {
+        container.innerHTML = '<div style="color:#666;font-size:16px;text-align:center;padding:12px">No recent activity</div>';
+        return;
+      }
+      var html = '';
+      items.forEach(function(item) {
+        if (item.type === 'commit') {
+          html += '<div style="padding:6px 0;font-size:16px;line-height:1.5"><span style="color:#888;font-family:monospace;font-size:14px">' + item.hash + '</span> <span style="color:#7c83ff">' + esc(item.message) + '</span></div>';
+        } else if (item.type === 'task') {
+          html += '<div style="padding:6px 0;font-size:16px;line-height:1.5;color:#4ecca3">' + esc(item.preview) + '</div>';
+        }
+      });
+      container.innerHTML = html;
+    });
+  }
+}
+
+function showNoteContent(slug) {
+  var DASH = 'http://' + window.location.hostname + ':7844';
+  var container = document.getElementById('dr-content');
+  if (!container) return;
+  fetch(DASH + '/notes/' + slug).then(function(r){return r.text()}).then(function(text) {
+    // Notify the voice agent — raw markdown (before HTML transform) is what
+    // Gemini wants to reason about. Fire-and-forget; voice agent may or may
+    // not be connected.
+    try {
+      fetch('/note-viewing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: slug, content: text })
+      }).catch(function(){});
+    } catch (e) {}
+    // Extract the frontmatter title before stripping, so we can render it
+    // above the body. Without this, the only visible title on the page is
+    // the global stand-name H1 ("Sutando — <stand>"), which confused users
+    // into thinking that was the note's title.
+    var titleMatch = text.match(new RegExp('^---[\\s\\S]*?\\ntitle:\\s*([^\\n]+)'));
+    var noteTitle = titleMatch ? titleMatch[1].trim() : slug;
+    text = text.replace(new RegExp('^---[\\s\\S]*?---\\n'), '');
+    text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    text = text.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    text = text.replace(/^# (.+)$/gm, '<h1 style="font-size:16px">$1</h1>');
+    var codeBlockRe = new RegExp(String.fromCharCode(96,96,96) + '([\\s\\S]*?)' + String.fromCharCode(96,96,96), 'g');
+    text = text.replace(codeBlockRe, '<pre style="background:#1a1a2e;padding:8px;border-radius:4px;font-size:12px;overflow-x:auto"><code>$1</code></pre>');
+    var inlineCodeRe = new RegExp(String.fromCharCode(96) + '([^' + String.fromCharCode(96) + ']+)' + String.fromCharCode(96), 'g');
+    text = text.replace(inlineCodeRe, '<code style="background:#1a1a2e;padding:1px 4px;border-radius:2px">$1</code>');
+    // Images before links: ![alt](url) — else the link regex below eats the alt-text form.
+    // Two layers of backslash-eating: the outer TS template literal halves
+    // them once, then the inner JS string literal halves again. Need FOUR
+    // backslashes in source to get one literal backslash in the regex.
+    // See feedback_inline_js_escaping.md — PR #434 regression, hit Chi
+    // three times today including once blocking his voice connection.
+    text = text.replace(new RegExp('!\\\\[([^\\\\]]*)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<img src="$2" alt="$1" style="max-width:100%;border-radius:4px;margin:8px 0">');
+    text = text.replace(new RegExp('\\\\[([^\\\\]]+)\\\\]\\\\(([^)]+)\\\\)', 'g'), '<a href="$2" target="_blank" style="color:#7c83ff">$1</a>');
+    // Bold before italic: the bold regex eats two asterisks so the italic one sees none.
+    text = text.replace(new RegExp('[*][*](.+?)[*][*]', 'g'), '<strong>$1</strong>');
+    text = text.replace(new RegExp('(^|[^*])\\\\*([^*\\\\n]+)\\\\*', 'g'), '$1<em>$2</em>');
+    text = text.replace(new RegExp('^> ?(.+)$', 'gm'), '<blockquote style="border-left:3px solid #7c83ff;padding-left:10px;color:#a0a0b0;margin:8px 0;font-style:italic">$1</blockquote>');
+    text = text.replace(new RegExp('^---+$', 'gm'), '<hr style="border:none;border-top:1px solid #2a2a3e;margin:12px 0">');
+    text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
+    text = text.replace(new RegExp('\\n\\n', 'g'), '<br><br>');
+    container.innerHTML = '<span class="suggestion" onclick="renderTabContent()" style="font-size:11px;cursor:pointer;margin-bottom:8px;display:inline-block">&larr; Back</span>' +
+      '<h2 style="font-size:15px;color:#7c83ff;margin:8px 0 10px 0;border-bottom:1px solid #2a2a3e;padding-bottom:6px">' + esc(noteTitle) + '</h2>' +
+      '<div style="font-size:13px;line-height:1.5">' + text + '</div>';
+  });
+}
+window.showNoteContent = showNoteContent;
+
+function deleteNoteFromUI(slug) {
+  var DASH = 'http://' + window.location.hostname + ':7844';
+  fetch(DASH + '/notes/' + slug, {method: 'DELETE'}).then(function() {
+    renderTabContent(); // refresh notes list
+  });
+}
+window.deleteNoteFromUI = deleteNoteFromUI;
+
+function filterNotes(query) {
+  var items = document.querySelectorAll('.note-item');
+  var q = query.toLowerCase();
+  items.forEach(function(el) {
+    var title = el.getAttribute('data-title') || '';
+    var slug = el.getAttribute('data-slug') || '';
+    el.style.display = (!q || title.indexOf(q) >= 0 || slug.indexOf(q) >= 0) ? 'flex' : 'none';
+  });
+}
+window.filterNotes = filterNotes;
+
+function updateDynamicRegion() {
+  var dr = document.getElementById('dynamic-region');
+  if (!dr) return;
+  // Skip re-render if user is typing
   var activeInput = document.activeElement;
   if (activeInput && activeInput.classList && activeInput.classList.contains('q-input')) return;
-  const content = window._drContent;
-  const questions = window._drQuestions || [];
-  const proactive = window._drProactive;
 
+  // If API pushed real content, handle it
+  var content = window._drContent;
   if (content && content.type) {
+    // View switch command from voice agent
+    if (content.type === 'view' && content.view) {
+      window._drContent = null;
+      switchDRTab(content.view);
+      return;
+    }
+    // Real media content (video, image, etc.) — show directly (no tabs)
     dr.innerHTML = renderDynamicContent(content);
-  } else if (questions.length > 0) {
-    dr.innerHTML = '<div class="dr-questions">' +
-      '<div class="q-title">Pending Questions</div>' +
-      questions.map(q =>
-        '<div class="q-item"><b>' + esc(q.id) + '</b>: ' + esc(q.text) +
-        (q.detail ? '<div style="color:#999;font-size:11px;margin-top:2px;white-space:pre-wrap">' + esc(q.detail) + '</div>' : '') +
-        '<div class="q-actions">' +
-        '<button class="q-btn q-yes" data-qid="' + q.id + '" data-ans="Yes">Yes</button>' +
-        '<button class="q-btn q-no" data-qid="' + q.id + '" data-ans="No">No</button>' +
-        '<input class="q-input" data-qid="' + q.id + '" placeholder="Or type a response...">' +
-        '<button class="q-btn q-send" data-qid="' + q.id + '">Send</button>' +
-        '</div></div>'
-      ).join('') + '</div>';
-  } else {
-    // Proactive status now shown in #core-status-bar instead
-    dr.innerHTML = '<div class="dr-chips">' +
-      '<div class="suggestions-label">Try saying or typing</div>' +
-      SUGGESTION_CHIPS.map(c =>
-        '<span class="suggestion" onclick="trySuggestion(this)">' +
-        c.label + (c.desc ? ' — ' + c.desc : '') + '</span>'
-      ).join('') + '</div>';
+    return;
   }
+
+  // Ensure tab structure exists
+  ensureTabStructure();
+
+  // Auto-switch to questions tab ONCE per new-question arrival.
+  // Track which qids we've already auto-switched for so that clicking back to
+  // Starter doesn't get stolen on every poll. A NEW qid re-arms the switch.
+  var questions = window._drQuestions || [];
+  window._drAutoSwitchedQids = window._drAutoSwitchedQids || {};
+  var hasNewQuestion = false;
+  for (var i = 0; i < questions.length; i++) {
+    if (!window._drAutoSwitchedQids[questions[i].id]) { hasNewQuestion = true; break; }
+  }
+  if (hasNewQuestion && window._drActiveTab === 'starter') {
+    window._drActiveTab = 'questions';
+    for (var j = 0; j < questions.length; j++) {
+      window._drAutoSwitchedQids[questions[j].id] = true;
+    }
+    updateTabHighlights();
+    renderTabContent();
+    return;
+  }
+  // Even if we don't switch (user already on another tab, or set is known),
+  // record current qids so we don't double-fire when they land on Starter.
+  for (var k = 0; k < questions.length; k++) {
+    window._drAutoSwitchedQids[questions[k].id] = true;
+  }
+
+  // Update tab badges (task count, question count) without re-rendering content
+  updateTabHighlights();
+
+  // Only render content if not locally set (user clicked a tab)
+  if (!window._drLocalContent) {
+    renderTabContent();
+  }
+}
+
+// ─── Pending-question triage queue helpers
+// Pure: they take rows and a cursor and return HTML. The queue shows ONE question,
+// so every fact the owner needs to rank it has to be on the card itself.
+function questionWaitLabel(q) {
+  var age = q && q.age_days;
+  if (age === null || age === undefined) return 'age unknown';
+  if (age === 0) return 'asked today';
+  return 'waiting ' + age + (age === 1 ? ' day' : ' days');
+}
+
+function questionBlocksLabel(q) {
+  var refs = (q && q.refs) || [];
+  var blocks = (q && q.blocks) || 0;
+  if (!refs.length) return '';
+  if (!blocks) return 'nothing still blocked';
+  return 'blocking ' + blocks + (blocks === 1 ? ' item' : ' items');
+}
+
+// A re-check that could not decide returns nothing rather than a reassuring note:
+// silence here means "not checked", never "checked and fine".
+function questionRecheckHtml(q) {
+  var rc = q && q.recheck;
+  if (!rc || !rc.note) return '';
+  var stale = rc.status === 'stale';
+  var lead = stale ? 'Re-checked just now: everything this blocks is done ('
+                   : 'Re-checked just now: partly resolved (';
+  return '<div class="q-recheck' + (stale ? ' q-stale' : '') + '">' +
+    esc(lead + rc.note + ')') + '</div>';
+}
+
+function questionQueueCursor(rows, index) {
+  var n = (rows || []).length;
+  if (!n) return 0;
+  return ((index % n) + n) % n;
+}
+
+function renderQuestionQueue(rows, index) {
+  rows = rows || [];
+  if (!rows.length) {
+    return '<div class="q-empty">No pending questions</div>';
+  }
+  var i = questionQueueCursor(rows, index);
+  var q = rows[i];
+  var blocks = questionBlocksLabel(q);
+  var answerBtns = q.options
+    ? q.options.map(function(opt) {
+        return '<button class="q-btn" data-qid="' + esc(q.id) + '" data-ans="' + esc(opt) +
+          '" style="border-color:#4ecca366;color:#4ecca3">' + esc(opt) + '</button>';
+      }).join('')
+    : '<button class="q-btn q-yes" data-qid="' + esc(q.id) + '" data-ans="Approved">Approve</button>' +
+      '<button class="q-btn q-no" data-qid="' + esc(q.id) + '" data-ans="Rejected">Reject</button>';
+  return '<div class="dr-questions"><div class="q-item">' +
+    '<div class="q-queue-meta">' +
+      '<span>' + esc((i + 1) + ' of ' + rows.length) + '</span>' +
+      '<span class="q-wait">' + esc(questionWaitLabel(q)) + '</span>' +
+      (blocks ? '<span class="q-blocks">' + esc(blocks) + '</span>' : '') +
+    '</div>' +
+    '<b>' + esc(q.text) + '</b>' +
+    questionRecheckHtml(q) +
+    (q.detail && q.detail !== q.text
+      ? '<div style="color:#999;font-size:11px;margin-top:4px;white-space:pre-wrap">' + esc(q.detail) + '</div>'
+      : '') +
+    '<div class="q-actions">' + answerBtns +
+      '<input class="q-input" data-qid="' + esc(q.id) + '" placeholder="Or type a response...">' +
+      '<button class="q-btn q-send" data-qid="' + esc(q.id) + '">Send</button>' +
+    '</div>' +
+    '<div class="q-nav">' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="reply">Reply in chat</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="next">Next</button>' +
+      '<button class="q-btn" data-qid="' + esc(q.id) + '" data-qact="dismiss" style="border-color:#66333366;color:#c77">Dismiss</button>' +
+    '</div>' +
+    '</div></div>';
+}
+// ─── End pending-question triage queue helpers
+
+// Re-check runs when the queue is shown or advanced — human cadence, not the 3s poll.
+function refreshQuestionQueue() {
+  return fetch(API_BASE + '/questions/queue')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data && data.questions) {
+        window._drQueue = data.questions;
+        window._drQuestions = data.questions;
+      }
+      return window._drQueue;
+    })
+    .catch(function() { return window._drQueue; });
+}
+
+// Renders directly rather than via updateDynamicRegion(): that gate skips
+// rendering for as long as the questions tab is open (see PR body).
+function advanceQuestionQueue(step) {
+  window._drQueueIndex = questionQueueCursor(
+    window._drQueue || [], (window._drQueueIndex || 0) + step);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dropQuestionFromQueue(qid) {
+  window._drQueue = (window._drQueue || []).filter(function(q) { return q.id !== qid; });
+  window._drQuestions = (window._drQuestions || []).filter(function(q) { return q.id !== qid; });
+  window._drQueueIndex = questionQueueCursor(window._drQueue, window._drQueueIndex || 0);
+  updateTabHighlights();
+  renderTabContent();
+}
+
+function dismissQuestion(qid) {
+  fetch(API_BASE + '/question/dismiss', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: qid})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.ok) dropQuestionFromQueue(qid);
+    else alert('Failed: ' + ((d && d.error) || 'unknown error'));
+  }).catch(function() { alert('Could not reach agent API'); });
+}
+
+function replyToQuestionInChat(qid) {
+  var rows = window._drQueue || [];
+  var q = null;
+  for (var i = 0; i < rows.length; i++) { if (rows[i].id === qid) { q = rows[i]; break; } }
+  var input = document.getElementById('textInput');
+  if (!input) return;
+  input.value = 'Re: ' + ((q && q.text) || qid) + ' — ';
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
 }
 
 // Event delegation for question actions
@@ -1282,7 +3683,15 @@ document.addEventListener('click', function(e) {
   var btn = e.target.closest && e.target.closest('[data-qid]');
   if (!btn) return;
   var qid = btn.dataset.qid;
-  if (btn.dataset.ans) {
+  var qact = btn.dataset.qact;
+  if (qact === 'next') {
+    // Free by construction: no request, no write. The row stays and comes back round.
+    advanceQuestionQueue(1);
+  } else if (qact === 'dismiss') {
+    dismissQuestion(qid);
+  } else if (qact === 'reply') {
+    replyToQuestionInChat(qid);
+  } else if (btn.dataset.ans) {
     answerQuestion(qid, btn.dataset.ans);
   } else if (btn.classList.contains('q-send')) {
     var inp = document.querySelector('.q-input[data-qid="' + qid + '"]');
@@ -1301,26 +3710,93 @@ document.addEventListener('keydown', function(e) {
   setInterval(() => {
     Promise.all([
       fetch(API_BASE + '/dynamic-content').then(r => r.json()).catch(() => ({})),
-      fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'}))
-    ]).then(([dc, loopData]) => {
-      window._drContent = (dc && dc.type) ? dc : null;
+      fetch(API_BASE + '/core-status').then(r => r.json()).catch(() => ({status:'idle'})),
+      fetch('http://' + window.location.hostname + ':7844/notes').then(r => r.json()).catch(() => []),
+      fetch(API_BASE + '/contextual-chips').then(r => r.json()).catch(() => ({chips:[]}))
+    ]).then(([dc, loopData, notes, ctx]) => {
+      window._contextualChips = (ctx && ctx.chips) || [];
+      window._drNoteCount = Array.isArray(notes) ? notes.length : 0;
+      // Only overwrite content if API has real content; preserve local content (e.g. notes browser)
+      if (dc && dc.type) {
+        window._drContent = dc;
+        window._drLocalContent = false;
+      } else if (!window._drLocalContent) {
+        window._drContent = null;
+      }
       if (loopData.status === 'running') {
         window._drProactive = loopData.step || 'Working...';
       } else {
         window._drProactive = null;
       }
       updateDynamicRegion();
-      // Update persistent core status bar
+      // Update persistent core status bar (clickable to expand activity)
       var csBar = document.getElementById('core-status-bar');
       if (csBar) {
-        if (loopData.status === 'running') {
-          csBar.innerHTML = '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>';
-        } else {
-          csBar.innerHTML = '<span class="core-idle">Core: idle</span>';
-        }
+        var statusText = loopData.status === 'running'
+          ? '<span class="core-running">Core: ' + esc(loopData.step || 'working') + '</span>'
+          : '<span class="core-idle">Core: idle</span>';
+        var expandBtn = '';
+        csBar.innerHTML = statusText + expandBtn;
       }
+      // Avatar working state — blue spin when core is active
+      var av = document.getElementById('stand-avatar');
+      var hav = document.getElementById('hero-avatar');
+      var isWorking = loopData.status === 'running';
+      if (av) av.classList.toggle('working', isWorking);
+      if (hav) hav.classList.toggle('working', isWorking);
     });
   }, 3000);
+})();
+
+// Presenter-mode badge poll — hits the same-origin /presenter endpoint
+// that reads state/presenter-mode.sentinel. Override via
+// window._PRESENTER_URL at render time so a different skill (or different
+// port) can drive it without editing this file. Silent-fail when
+// unreachable — badge stays hidden.
+(function() {
+  var presenterUrl = (typeof window !== 'undefined' && window._PRESENTER_URL)
+    || '/presenter';
+  // Shared presenter-active cache so the composite mode badge can compose
+  // its label without a second fetch race.
+  var lastPresenterActive = false;
+  function renderModeBadge(voiceMode) {
+    var badge = document.getElementById('mode-badge');
+    if (!badge) return;
+    // Presenter ON is already shown by #presenter-badge — avoid duplicating.
+    // Meeting is the only extra state #mode-badge owns.
+    if (!lastPresenterActive && voiceMode === 'meeting') {
+      badge.textContent = '\u25CF Meeting';
+      badge.className = 'meeting';
+    } else {
+      badge.textContent = '';
+      badge.className = '';
+    }
+  }
+  setInterval(function() {
+    fetch(presenterUrl)
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var badge = document.getElementById('presenter-badge');
+        if (!badge) return;
+        var active = !!(data && data.active);
+        badge.classList.toggle('active', active);
+        lastPresenterActive = active;
+      })
+      .catch(function() {
+        var badge = document.getElementById('presenter-badge');
+        if (badge) badge.classList.remove('active');
+        lastPresenterActive = false;
+      });
+    // Same tick: poll voice-mode sentinel via our own server endpoint and
+    // render the composite mode badge.
+    fetch('/voice-mode')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var vm = (data && data.mode) || 'active';
+        renderModeBadge(vm);
+      })
+      .catch(function() { renderModeBadge('active'); });
+  }, 2000);
 })();
 
 // Initial render
@@ -1330,13 +3806,1001 @@ updateDynamicRegion();
 </body>
 </html>`;
 
-const server = createServer((_req, res) => {
-	res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+// SSE clients for remote toggle
+const sseClients: import('node:http').ServerResponse[] = [];
+// Server-side state tracking for menu bar indicator
+let _muteState = false;
+let _voiceState = false;
+// Semantic agent state. Two independent tracks:
+//   - _browserState: what the browser derives from local signals
+//     (connected+unmuted → listening, audio RMS → speaking, disconnected → idle).
+//     Refreshed ~1x/second by reportAgentState in the page.
+//   - _toolState: set by server-side tool code (voice-agent onToolCall →
+//     'working', screen-capture → 'seeing'). Only tool code writes this.
+// Effective state (returned by /sse-status + broadcast via SSE) is the
+// tool track when non-idle, else the browser track. This prevents the
+// browser's 1s poll from overwriting a tool-originated 'working' back
+// to 'listening' — the bug Chi hit after the SSE bridge shipped.
+type AgentState = 'idle' | 'listening' | 'speaking' | 'working' | 'seeing';
+let _browserState: AgentState = 'idle';
+let _toolState: AgentState = 'idle';
+// Optional label for the tool track, e.g. the specific tool name
+// ('describe_screen') or core-status step. Surfaced by /sse-status so
+// the menu-bar tooltip can say "running describe_screen" instead of
+// the generic "running a tool".
+let _toolLabel: string = '';
+// Saves the tool-track state at the moment seeing is set, so after the
+// seeing TTL expires we revert to whatever tool was running BEFORE the
+// capture — most commonly 'working'. Previously seeing → idle, which
+// killed the working pulse mid-tool and made Chi think seeing "happened
+// long after" (in fact, the next working state was the next tool call,
+// which registers as a new pulse well after seeing cleared the first).
+let _preSeeingToolState: AgentState = 'idle';
+// Timestamp of the last transition INTO 'seeing'. Screen capture is transient
+// (sub-second), so we want the 'seeing' state to flash briefly then auto-
+// revert. Without auto-revert, a single /capture call pins state=seeing
+// forever if nothing else POSTs.
+let _seeingUntil = 0;
+
+// Read `core-status.json` (written by the proactive loop + Claude Code passes)
+// to surface core work as a `working` state when no other track is active.
+// Without this, the menu bar stays solid while Claude Code is processing a
+// Discord/voice task even though the user would want to see that signal.
+// Lightweight: just a file read (one syscall) per /sse-status poll every 3s.
+// Read core-status.json and return { running, step, stale }.
+// - `running`: CLI is mid-pass (status == "running" and ts within grace).
+// - `step`: tooltip label when no tool label is set.
+// - `stale`: the file is unreliable — either older than 60s on disk, or
+//   status=="running" with ts older than 60s (a proactive-loop pass that
+//   crashed between step 0 write and idle write leaves a "running" sentinel
+//   that mtime moves but content lies). When stale, consumers should fall
+//   back to the tmux pane scrape for a fresh signal.
+const CORE_STATUS_STALE_SECONDS = 60;
+function readCoreStatus(): { running: boolean; step: string; stale: boolean } {
+	try {
+		// core-status.json is per-user runtime state under <workspace>/state/
+		// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
+		// Pre-fix this read from REPO_ROOT via import.meta.url-relative
+		// `../core-status.json` — but Python writers migrated to WORKSPACE_DIR in
+		// #836, so the TS reader silently saw stale or missing data. statusReadPath
+		// falls back to the legacy workspace-root location for one release.
+		const statusPath = statusReadPath('core-status.json', WORKSPACE_DIR);
+		const raw = readFileSync(statusPath, 'utf-8');
+		const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
+		const nowSec = Date.now() / 1000;
+		let stale = false;
+		try {
+			const mtimeSec = statSync(statusPath).mtimeMs / 1000;
+			if (nowSec - mtimeSec > CORE_STATUS_STALE_SECONDS) stale = true;
+		} catch { stale = true; }
+		// "Running with old ts" → loop likely crashed mid-pass, treat as stale.
+		if (s.status === 'running' && typeof s.ts === 'number' && nowSec - s.ts > CORE_STATUS_STALE_SECONDS) {
+			stale = true;
+		}
+		if (s.status !== 'running') return { running: false, step: '', stale };
+		if (typeof s.ts === 'number' && nowSec - s.ts > 600) return { running: false, step: '', stale };
+		return { running: true, step: typeof s.step === 'string' ? s.step : '', stale };
+	} catch {
+		return { running: false, step: '', stale: true };
+	}
+}
+
+const VOICE_STATE_STALE_SECONDS = 120;
+function readVoiceState(): boolean | null {
+	try {
+		// voice-state.json is per-user runtime state — lives under
+		// $SUTANDO_WORKSPACE. Pre-fix this read from REPO_ROOT via the
+		// import.meta.url-relative path — but voice-agent's writer also
+		// resolved relative to its cwd (= REPO_ROOT when launched from
+		// there), so both sides happened to align on the same install.
+		// On SUTANDO_WORKSPACE-set hosts (or cwd-drift), the two split.
+		// Same workspace-contract fix as #849 for core-status.json. Lives under
+		// state/ now; statusReadPath falls back to the legacy root for one release.
+		const statusPath = statusReadPath('voice-state.json', WORKSPACE_DIR);
+		const raw = readFileSync(statusPath, 'utf-8');
+		const s = JSON.parse(raw) as { connected?: boolean; ts?: number };
+		const nowSec = Date.now() / 1000;
+		if (typeof s.ts === 'number' && nowSec - s.ts > VOICE_STATE_STALE_SECONDS && s.connected) {
+			return null;
+		}
+		return typeof s.connected === 'boolean' ? s.connected : null;
+	} catch {
+		return null;
+	}
+}
+
+function effectiveAgentState(): AgentState {
+	if (_toolState === 'seeing' && Date.now() > _seeingUntil) {
+		// Revert to pre-seeing tool state (usually 'working' if a tool was
+		// running when the capture fired). Falling straight to 'idle' here
+		// would kill the working pulse mid-tool.
+		_toolState = _preSeeingToolState;
+		_preSeeingToolState = 'idle';
+	}
+	if (_toolState !== 'idle') return _toolState;
+	// Core-agent (Claude Code proactive-loop / task pass) running beats the
+	// browser track — if core is actively doing work, that's the truer state
+	// than "user is currently speaking". Chi's 2026-04-19 ask: "when working
+	// and listening at the same time, working should be the state". Previously
+	// _browserState short-circuited here and the core track only ran when the
+	// user was silent, so core-work during an active turn never surfaced.
+	const core = readCoreStatus();
+	if (core.running) return 'working';
+	// Core is idle OR the file is stale. If stale, ask the tmux scrape for a
+	// hint — useful when a pass crashed before writing idle, or when the CLI
+	// is actively doing something but forgot to write. Fresh-idle file wins
+	// over tmux to prevent the scrape from spuriously lighting up the pulse.
+	if (core.stale) {
+		const scrape = readTmuxStatus();
+		if (scrape.state === 'working') return 'working';
+	}
+	if (_browserState !== 'idle') return _browserState;
+	return 'idle';
+}
+
+// Heartbeat: ping every 30s, remove clients that fail to write (stale connections)
+setInterval(() => {
+	for (let i = sseClients.length - 1; i >= 0; i--) {
+		try {
+			sseClients[i].write(':\n\n'); // SSE comment = keep-alive ping
+		} catch {
+			sseClients.splice(i, 1);
+		}
+	}
+}, 30_000);
+
+// /paidsubscriptions page — full HTML, server-side rendered from
+// skills/subscription-scanner/state/subscriptions.json. Sortable table,
+// diff highlights from last scan, "Scan now" button.
+function renderSubscriptionsHtml(rawJson: string): string {
+	let data: any;
+	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, subscriptions: [], scan_history: [], _parse_error: e?.message }; }
+	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
+	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
+
+	return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paid Subscriptions — Sutando</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  h1 { font-size: 22px; font-weight: 700; }
+  .subtitle { color: #707080; font-size: 13px; }
+  .meta { display: flex; gap: 20px; font-size: 13px; color: #888; margin: 12px 0 20px; flex-wrap: wrap; align-items: center; }
+  .meta strong { color: #c0c0d0; font-weight: 600; }
+  .scan-btn { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .scan-btn:hover:not(:disabled) { background: #2a503a; }
+  .scan-btn:disabled { background: #1a1a2a; color: #444; border-color: #2a2a3e; cursor: wait; }
+  .scan-status { font-size: 12px; color: #4ecca3; margin-left: 8px; }
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat { background: #14141e; border: 1px solid #1e1e2a; border-radius: 10px; padding: 14px 16px; }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #707080; margin-bottom: 6px; }
+  .stat .value { font-size: 24px; font-weight: 700; color: #e8e8ee; }
+  .stat .sub { font-size: 11px; color: #888; margin-top: 4px; }
+  .stat.added .value { color: #4ecca3; }
+  .stat.removed .value { color: #e94560; }
+  .stat.uncertain .value { color: #f0ad4e; }
+
+  table { width: 100%; border-collapse: collapse; background: #14141e; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #1e1e2a; font-size: 13px; }
+  th { background: #1a1a26; color: #a0a0b0; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; cursor: pointer; user-select: none; position: relative; }
+  th:hover { color: #e8e8ee; }
+  th.sort-asc::after { content: ' ▲'; color: #4ecca3; }
+  th.sort-desc::after { content: ' ▼'; color: #4ecca3; }
+  tbody tr:hover { background: #181826; }
+  td.amount { text-align: right; font-variant-numeric: tabular-nums; }
+  td.amount .currency { color: #707080; font-size: 11px; margin-left: 2px; }
+
+  .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .status.active { background: #1e4028; color: #4ecca3; }
+  .status.cancelled { background: #2a1a20; color: #e94560; }
+  .status.uncertain { background: #2a2418; color: #f0ad4e; }
+
+  .vendor { color: #e8e8ee; font-weight: 600; }
+  .account { color: #888; font-size: 12px; }
+  .notes { color: #707080; font-size: 11px; font-style: italic; max-width: 320px; }
+  .freq { color: #a0a0b0; font-size: 12px; }
+
+  .row-added { background: rgba(78, 204, 163, 0.08); }
+  .row-cancelled { opacity: 0.55; }
+  .row-cancelled td { text-decoration: line-through; text-decoration-color: #e94560; }
+  .row-cancelled .vendor { color: #e94560; text-decoration-color: #e94560; }
+
+  .empty { text-align: center; padding: 40px; color: #555; }
+  footer { margin-top: 32px; color: #555; font-size: 11px; text-align: center; }
+  footer a { color: #888; text-decoration: none; }
+  footer a:hover { color: #4ecca3; }
+
+  details { margin-top: 24px; }
+  details summary { cursor: pointer; color: #707080; font-size: 12px; padding: 8px 0; }
+  details summary:hover { color: #a0a0b0; }
+  pre { background: #0a0a12; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 11px; color: #a0a0b0; margin-top: 8px; max-height: 300px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>💳 Paid Subscriptions</h1>
+      <div class="subtitle">Scanned from Gmail receipts</div>
+      <div style="margin-left:auto"><a href="/" style="color:#707080;font-size:12px;text-decoration:none;border:1px solid #2a2a3e;padding:5px 12px;border-radius:6px;">← Dashboard</a></div>
+    </header>
+
+    <div class="meta">
+      <span><strong>Last scan:</strong> ${escapeHtml(lastScan)}</span>
+      <button class="scan-btn" id="scanBtn" onclick="triggerScan()">⟳ Scan now</button>
+      <span class="scan-status" id="scanStatus"></span>
+    </div>
+
+    <div id="summary" class="summary"></div>
+
+    <div id="diff-banner"></div>
+
+    <table id="subs-table">
+      <thead>
+        <tr>
+          <th data-key="vendor">Vendor</th>
+          <th data-key="amount" class="amount">Amount</th>
+          <th data-key="frequency">Frequency</th>
+          <th data-key="account">Account</th>
+          <th data-key="last_charged">Last charged</th>
+          <th data-key="next_charge">Next charge</th>
+          <th data-key="status">Status</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody id="subs-tbody"></tbody>
+    </table>
+
+    <details>
+      <summary>Raw JSON</summary>
+      <pre id="raw-json"></pre>
+    </details>
+
+    <footer>
+      Subscription data lives at <code>skills/subscription-scanner/state/subscriptions.json</code> (gitignored).<br>
+      Auto-scan runs monthly via the <code>subscription-scan</code> cron. Source: Gmail receipts via Claude MCP.
+    </footer>
+  </div>
+
+<script>
+  const data = ${dataJson};
+  const tbody = document.getElementById('subs-tbody');
+  const summary = document.getElementById('summary');
+  const diffBanner = document.getElementById('diff-banner');
+  const rawJson = document.getElementById('raw-json');
+  const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { added: [], removed: [], amount_changed: [] };
+
+  let sortKey = 'amount';
+  let sortDir = 'desc';
+
+  function fmtMoney(amount, currency) {
+    if (amount === null || amount === undefined) return '<span style="color:#555">—</span>';
+    const sym = currency === 'EUR' ? '€' : currency === 'GBP' ? '£' : '$';
+    return sym + amount.toFixed(2) + (currency && currency !== 'USD' ? ' <span class="currency">' + currency + '</span>' : '');
+  }
+
+  function fmtDate(d) {
+    if (!d) return '<span style="color:#555">—</span>';
+    return d;
+  }
+
+  function escapeHtmlClient(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function monthlyEquivalent(sub) {
+    if (sub.amount === null || sub.amount === undefined) return null;
+    if (sub.frequency === 'monthly') return sub.amount;
+    if (sub.frequency === 'annual') return sub.amount / 12;
+    return sub.amount;
+  }
+
+  function renderSummary() {
+    const subs = data.subscriptions || [];
+    const active = subs.filter(s => s.status === 'active');
+    const uncertain = subs.filter(s => s.status === 'uncertain');
+    const cancelled = subs.filter(s => s.status === 'cancelled');
+
+    let monthlyTotal = 0, monthlyKnown = 0, monthlyUnknown = 0;
+    for (const s of active) {
+      const me = monthlyEquivalent(s);
+      if (me !== null) {
+        const usdRate = s.currency === 'EUR' ? 1.08 : (s.currency === 'GBP' ? 1.27 : 1.0);
+        monthlyTotal += me * usdRate;
+        monthlyKnown++;
+      } else {
+        monthlyUnknown++;
+      }
+    }
+
+    summary.innerHTML = \`
+      <div class="stat"><div class="label">Active</div><div class="value">\${active.length}</div><div class="sub">\${monthlyUnknown ? monthlyUnknown + ' missing price' : 'all priced'}</div></div>
+      <div class="stat"><div class="label">Monthly burn (~)</div><div class="value">$\${monthlyTotal.toFixed(0)}</div><div class="sub">\${monthlyKnown}/\${active.length} priced • \$\${(monthlyTotal*12).toFixed(0)}/yr</div></div>
+      <div class="stat uncertain"><div class="label">Uncertain</div><div class="value">\${uncertain.length}</div><div class="sub">verify these</div></div>
+      <div class="stat removed"><div class="label">Cancelled</div><div class="value">\${cancelled.length}</div><div class="sub">recent cancellations</div></div>
+    \`;
+  }
+
+  function renderDiffBanner() {
+    const a = lastDiff.added || [];
+    const r = lastDiff.removed || [];
+    const c = lastDiff.amount_changed || [];
+    if (a.length === 0 && r.length === 0 && c.length === 0) {
+      diffBanner.innerHTML = '<div style="font-size:12px;color:#555;margin-bottom:14px;">No changes since previous scan.</div>';
+      return;
+    }
+    const parts = [];
+    if (a.length) parts.push('<span style="color:#4ecca3">+' + a.length + ' added: ' + a.map(escapeHtmlClient).join(', ') + '</span>');
+    if (r.length) parts.push('<span style="color:#e94560">−' + r.length + ' removed: ' + r.map(escapeHtmlClient).join(', ') + '</span>');
+    if (c.length) parts.push('<span style="color:#f0ad4e">' + c.length + ' price changed</span>');
+    diffBanner.innerHTML = '<div style="font-size:13px;margin-bottom:14px;padding:10px 14px;background:#181826;border-radius:8px;border-left:3px solid #4ecca3;">Since last scan: ' + parts.join(' • ') + '</div>';
+  }
+
+  function renderTable() {
+    const subs = (data.subscriptions || []).slice();
+    const addedSet = new Set(lastDiff.added || []);
+
+    subs.sort((a, b) => {
+      let av = a[sortKey], bv = b[sortKey];
+      if (sortKey === 'amount') { av = monthlyEquivalent(a) ?? -1; bv = monthlyEquivalent(b) ?? -1; }
+      if (av === null || av === undefined) av = '';
+      if (bv === null || bv === undefined) bv = '';
+      if (typeof av === 'string') av = av.toLowerCase();
+      if (typeof bv === 'string') bv = bv.toLowerCase();
+      if (av < bv) return sortDir === 'asc' ? -1 : 1;
+      if (av > bv) return sortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+
+    tbody.innerHTML = '';
+    if (subs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No subscriptions found yet. Click "Scan now" to populate.</td></tr>';
+      return;
+    }
+    for (const s of subs) {
+      const tr = document.createElement('tr');
+      const isAdded = addedSet.has(s.vendor);
+      if (s.status === 'cancelled') tr.className = 'row-cancelled';
+      else if (isAdded) tr.className = 'row-added';
+      tr.innerHTML = \`
+        <td><div class="vendor">\${escapeHtmlClient(s.vendor)}</div><div class="account">\${escapeHtmlClient(s.category || '')}</div></td>
+        <td class="amount">\${fmtMoney(s.amount, s.currency)}</td>
+        <td><span class="freq">\${escapeHtmlClient(s.frequency || '')}</span></td>
+        <td><span class="account">\${escapeHtmlClient(s.account || '')}</span></td>
+        <td>\${fmtDate(s.last_charged)}</td>
+        <td>\${fmtDate(s.next_charge)}</td>
+        <td><span class="status \${escapeHtmlClient(s.status || '')}">\${escapeHtmlClient(s.status || '')}</span></td>
+        <td><span class="notes">\${escapeHtmlClient(s.notes || '')}</span></td>
+      \`;
+      tbody.appendChild(tr);
+    }
+    document.querySelectorAll('th[data-key]').forEach(th => {
+      th.classList.remove('sort-asc', 'sort-desc');
+      if (th.dataset.key === sortKey) th.classList.add(sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+    });
+  }
+
+  document.querySelectorAll('th[data-key]').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.key;
+      if (k === sortKey) sortDir = (sortDir === 'asc' ? 'desc' : 'asc');
+      else { sortKey = k; sortDir = (k === 'vendor' || k === 'frequency' || k === 'status' || k === 'account') ? 'asc' : 'desc'; }
+      renderTable();
+    });
+  });
+
+  async function triggerScan() {
+    const btn = document.getElementById('scanBtn');
+    const status = document.getElementById('scanStatus');
+    btn.disabled = true;
+    status.textContent = '⏳ queueing...';
+    try {
+      const r = await fetch('/paidsubscriptions/scan', { method: 'POST' });
+      const j = await r.json();
+      if (j.ok) {
+        status.textContent = '✓ ' + j.message;
+        // poll for fresh data every 5s for 3 minutes
+        let elapsed = 0;
+        const poll = setInterval(async () => {
+          elapsed += 5;
+          if (elapsed > 180) { clearInterval(poll); btn.disabled = false; status.textContent = '⚠ scan still running — refresh in a moment'; return; }
+          const fresh = await fetch('/paidsubscriptions/data').then(r => r.json()).catch(() => null);
+          if (fresh && fresh.last_scan && fresh.last_scan !== data.last_scan) {
+            clearInterval(poll);
+            status.textContent = '✓ scan complete — refreshing...';
+            setTimeout(() => location.reload(), 800);
+          }
+        }, 5000);
+      } else {
+        status.textContent = '✗ ' + (j.error || 'failed');
+        btn.disabled = false;
+      }
+    } catch (e) {
+      status.textContent = '✗ ' + (e.message || 'network error');
+      btn.disabled = false;
+    }
+  }
+
+  rawJson.textContent = JSON.stringify(data, null, 2);
+  renderSummary();
+  renderDiffBanner();
+  renderTable();
+</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(s: string): string {
+	return String(s).replace(/[<>&"']/g, c => (({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'} as Record<string, string>)[c] || c));
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+const server = createServer((req, res) => {
+	const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+	// Task history carries owner prompts and result bodies. Keep it behind the
+	// dashboard's same-origin server, forward the configured bearer token, and
+	// reject LAN callers unless the owner explicitly enabled LAN sharing.
+	if (url.pathname === '/api/task-history' || url.pathname === '/api/task-workstreams/infer') {
+		const isHistory = url.pathname === '/api/task-history';
+		const expectedMethod = isHistory ? 'GET' : 'POST';
+		if (req.method !== expectedMethod) {
+			res.writeHead(405, { 'Content-Type': 'application/json', 'Allow': expectedMethod });
+			res.end(JSON.stringify({ error: 'method not allowed' }));
+			return;
+		}
+		if (!LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: 'task history is local-only' }));
+			return;
+		}
+		const token = process.env.SUTANDO_API_TOKEN || '';
+		const headers: Record<string, string> = { 'Accept': 'application/json' };
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const proxyReq = httpRequest({
+			host: '127.0.0.1',
+			port: 7843,
+			path: isHistory ? '/tasks/history' : '/tasks/workstreams/infer',
+			method: expectedMethod,
+			headers,
+		}, (proxyRes) => {
+			res.writeHead(proxyRes.statusCode || 502, {
+				'Content-Type': 'application/json',
+				'Cache-Control': 'no-store',
+			});
+			proxyRes.pipe(res);
+		});
+		proxyReq.on('error', () => {
+			res.writeHead(502, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: 'agent api unavailable' }));
+		});
+		proxyReq.end();
+		return;
+	}
+
+	if (url.pathname === BROWSER_TRANSPORT_ROUTE) {
+		loadBrowserTransport().then(
+			js => {
+				res.writeHead(200, {
+					'Content-Type': 'application/javascript; charset=utf-8',
+					// Source mode recompiles per process; bundled mode ships a new
+					// artifact per release. Neither wants a browser holding an old
+					// copy across a restart, and this file is 14KB.
+					'Cache-Control': 'no-store',
+				});
+				res.end(js);
+			},
+			(err: Error) => {
+				// Fail loudly and in two places: the HTTP status so the page's
+				// loader can show the user something, and the server log so the
+				// operator sees the packaging error even if nobody opened the UI.
+				console.error(`[web-client] ${BROWSER_TRANSPORT_ROUTE} unavailable: ${err.message}`);
+				res.writeHead(503, { 'Content-Type': 'application/javascript; charset=utf-8' });
+				res.end(
+					`console.error(${JSON.stringify('Sutando voice transport unavailable: ' + err.message)});\n`,
+				);
+			},
+		);
+		return;
+	}
+
+	if (url.pathname === '/sse') {
+		res.writeHead(200, {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+			'Connection': 'keep-alive',
+			'Access-Control-Allow-Origin': '*',
+		});
+		res.write(':\n\n'); // heartbeat
+		// Send current agent state immediately so freshly-connected clients
+		// don't display stale DOM classes from the previous session.
+		// Before this, a browser that reconnected SSE after a server
+		// restart kept whatever .working/.seeing class it had when the
+		// previous connection dropped — producing the "web UI shows working
+		// but menu bar shows listening" inconsistency Chi hit today.
+		try {
+			res.write(`event: agent-state\ndata: ${effectiveAgentState()}\n\n`);
+		} catch {}
+		sseClients.push(res);
+		req.on('close', () => {
+			const idx = sseClients.indexOf(res);
+			if (idx >= 0) sseClients.splice(idx, 1);
+		});
+		return;
+	}
+
+	// SSE client count + mute/voice/agent state (safe for diagnostics + menu bar indicator)
+	if (url.pathname === '/sse-status') {
+		const eff = effectiveAgentState();
+		// Derive label: tool-track → _toolLabel; core-fallback → step from
+		// core-status.json. Empty otherwise. Swift menu-bar tooltip uses
+		// this for precision (e.g. "running describe_screen" vs generic
+		// "running a tool"). Per Chi's ask 2026-04-18: "running a tool is
+		// not precise."
+		let label = '';
+		if (_toolState !== 'idle') {
+			label = _toolLabel;
+		} else if (eff === 'working') {
+			// Core-agent working — surface the step label regardless of
+			// whether the user's mic is hot. Previously gated on
+			// `_browserState === 'idle'`, which meant the tooltip stayed
+			// generic ("running a tool") whenever the voice tab was open.
+			// After PR #465 flipped the precedence (core beats browser),
+			// this gate became stale — keep the label in sync with the
+			// state it describes.
+			const core = readCoreStatus();
+			label = core.step;
+			// If core is stale and we're in fallback territory, prefer the
+			// tmux-scrape label (usually a tool name) over the stale step.
+			if (core.stale && !core.step) {
+				const scrape = readTmuxStatus();
+				if (scrape.state === 'working') label = scrape.label;
+			}
+		}
+		// voice-state.json (written by voice-agent on connect/disconnect) is
+		// authoritative. Fall back to the browser-reported _voiceState cache
+		// if the file is missing or stale (see readVoiceState doc).
+		const vs = readVoiceState();
+		const voiceConnected = vs !== null ? vs : _voiceState;
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({
+			clients: sseClients.length,
+			muted: _muteState,
+			voiceConnected,
+			state: eff,
+			label,
+		}));
+		return;
+	}
+
+	// Voice-agent mode sentinel (state/voice-mode.txt written by voice-agent
+	// on switch_mode / zoom-auto-flip). Returns "active" or "meeting".
+	// Falls back to "active" if the file is missing. Combined with the
+	// presenter badge poll to render the composite 3-mode badge in the UI.
+	if (url.pathname === '/voice-mode') {
+		let mode = 'active';
+		try {
+			const raw = readFileSync(join(STATE_DIR, 'voice-mode.txt'), 'utf-8').trim();
+			if (raw === 'meeting' || raw === 'active') mode = raw;
+		} catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ mode }));
+		return;
+	}
+
+	// Hotkeys published by the Sutando app (state/hotkeys.json) — the single
+	// source the status-bar hints render from. Empty array if not yet written.
+	if (url.pathname === '/hotkeys') {
+		let hotkeys: unknown = [];
+		try { hotkeys = JSON.parse(readFileSync(join(STATE_DIR, 'hotkeys.json'), 'utf-8')); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify(hotkeys));
+		return;
+	}
+
+	// Presenter-mode sentinel (state/presenter-mode.sentinel written by
+	// scripts/presenter-mode.sh). Replaces the old localhost:7877 poll that
+	// required the iclr-highlight skill server. Uses the same malformed-
+	// sentinel guard as check-pending-questions.py / discord-bridge.py /
+	// telegram-bridge.py: first char must be a digit → fail CLOSED on garbage.
+	if (url.pathname === '/presenter') {
+		let active = false;
+		try {
+			const raw = readFileSync(join(STATE_DIR, 'presenter-mode.sentinel'), 'utf-8').trim();
+			if (raw && raw[0] >= '0' && raw[0] <= '9') {
+				const nowISO = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+				active = nowISO < raw;
+			}
+		} catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ active }));
+		return;
+	}
+
+	// Mute + voice + agent state report. `source=tool` writes the tool
+	// track (working/seeing) and takes precedence; everything else
+	// writes the browser track (idle/listening/speaking).
+	if (url.pathname === '/mute-state') {
+		const mState = url.searchParams.get('muted');
+		const vState = url.searchParams.get('voice');
+		const aState = url.searchParams.get('state');
+		const source = url.searchParams.get('source'); // 'tool' | null (browser)
+		if (mState !== null) _muteState = mState === 'true';
+		if (vState !== null) _voiceState = vState === 'true';
+		if (aState === 'idle' || aState === 'listening' || aState === 'speaking' || aState === 'working' || aState === 'seeing') {
+			const prevEffective = effectiveAgentState();
+			if (source === 'tool') {
+				const labelParam = url.searchParams.get('label');
+				if (aState === 'seeing') {
+					// Remember the tool state before overlaying seeing — most
+					// often 'working' when a describe_screen tool is in flight.
+					// Without this, the post-TTL revert would drop to idle
+					// mid-tool and kill the working pulse, which is what Chi
+					// hit ("fast blinking for seeing happened long after").
+					if (_toolState !== 'seeing') _preSeeingToolState = _toolState;
+					_toolState = 'seeing';
+					if (labelParam) _toolLabel = labelParam;
+					const ttlParam = url.searchParams.get('ttl_ms');
+					const ttl = ttlParam ? parseInt(ttlParam, 10) : 3000;
+					// Upper-bound via RelationalComparison, which CodeQL's
+					// js/resource-exhaustion recognizes as UpperBoundsCheckSanitizerGuard.
+					// #489 used `Math.min(ttl, MAX)`, which CodeQL treats as a
+					// numeric passthrough (isNumericFlowStep) and therefore does
+					// NOT close alert #43. `ttl <= MAX ? ttl : MAX` is the
+					// equivalent clamp expressed as a relational guard.
+					const MAX_TTL_MS = 60000;
+					const ttlMs = (isFinite(ttl) && ttl > 0)
+						? (ttl <= MAX_TTL_MS ? ttl : MAX_TTL_MS)
+						: 3000;
+					_seeingUntil = Date.now() + ttlMs;
+					// Schedule an auto-revert broadcast so the browser clears
+					// .seeing even if nothing else POSTs a state update.
+					setTimeout(() => {
+						if (_toolState === 'seeing' && Date.now() >= _seeingUntil) {
+							_toolState = _preSeeingToolState;
+							_preSeeingToolState = 'idle';
+							const eff = effectiveAgentState();
+							for (const client of sseClients) {
+								try { client.write(`event: agent-state\ndata: ${eff}\n\n`); } catch {}
+							}
+						}
+					}, ttlMs + 50);
+				} else {
+					// working or clear. Reset the pre-seeing memory too so a
+					// future seeing knows its true predecessor, not the stale
+					// one from a previous tool sequence.
+					_toolState = aState === 'working' ? 'working' : 'idle';
+					_preSeeingToolState = 'idle';
+					if (aState === 'working' && labelParam) _toolLabel = labelParam;
+					else if (aState !== 'working') _toolLabel = '';
+					// Sound cue (owner ask 2026-07-09): emit a short audible blip per
+					// tool/core invocation so the user hears the answer is grounded.
+					// Distinct pitch for cloud research vs local core (work) vs inline
+					// tool. Fires on the leading edge — this branch = one onToolCall's
+					// working post → one cue. A SEPARATE SSE event from agent-state so it
+					// still fires when effectiveAgentState() is unchanged (back-to-back
+					// tool calls stay 'working', which suppresses the agent-state
+					// broadcast at the prevEffective===nextEffective guard below).
+					if (aState === 'working' && labelParam) {
+						const l = labelParam.toLowerCase();
+						const cueKind = (l === 'work' || l === 'ask_sutando' || l === 'ask_core')
+							? 'work'
+							: (/search|research|ground|google/.test(l) ? 'research' : 'tool');
+						for (const client of sseClients) {
+							try { client.write(`event: tool-cue\ndata: ${cueKind}\n\n`); } catch {}
+						}
+					}
+				}
+			} else {
+				// Browser can't legitimately know working/seeing — those
+				// originate server-side. Clamp to listening if mislabeled
+				// so a confused browser can't trample the tool track.
+				_browserState = (aState === 'working' || aState === 'seeing') ? 'listening' : aState;
+			}
+			const nextEffective = effectiveAgentState();
+			if (prevEffective !== nextEffective) {
+				for (const client of sseClients) {
+					try { client.write(`event: agent-state\ndata: ${nextEffective}\n\n`); } catch {}
+				}
+			}
+		}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		const vs2 = readVoiceState();
+		res.end(JSON.stringify({ muted: _muteState, voiceConnected: vs2 !== null ? vs2 : _voiceState, state: effectiveAgentState() }));
+		return;
+	}
+
+	if (url.pathname === '/toggle' || url.pathname === '/mute') {
+		const event = url.pathname === '/toggle' ? 'toggle-voice' : 'toggle-mute';
+		for (const client of sseClients) {
+			client.write(`event: ${event}\ndata: 1\n\n`);
+		}
+		res.writeHead(200, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ ok: true, event, clients: sseClients.length }));
+		return;
+	}
+
+	// Vision control proxy. The voice-agent process exposes /vision/{state,
+	// start, stop, frame} on 127.0.0.1:VISION_CONTROL_PORT (default 7847); the
+	// browser hits us same-origin to avoid CORS and to keep one public surface.
+	// /vision/frame carries a binary JPEG body — preserve content-type and
+	// pass the buffer through. If voice-agent isn't up, the fetch fails and
+	// we surface a synthetic "session not ready" state so the Watch button
+	// can't get stuck mid-toggle.
+	if (
+		url.pathname === '/vision/state' ||
+		url.pathname === '/vision/start' ||
+		url.pathname === '/vision/stop' ||
+		url.pathname === '/vision/frame'
+	) {
+		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
+		const method = req.method === 'POST' ? 'POST' : 'GET';
+		const isFrame = url.pathname === '/vision/frame';
+		// This surface binds 0.0.0.0 by default, and every oversized frame it
+		// forwards costs a subprocess downstream — so the body is capped here,
+		// not just at the control server.
+		void readBodyCapped(req).then(async (body) => {
+			if (!body) {
+				res.writeHead(413, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ status: 'failed', error: 'body too large' }));
+				return;
+			}
+			try {
+				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
+				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
+					method,
+					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
+					// Uint8Array view, not the Buffer itself: fetch's BodyInit does not
+					// accept Buffer under @types/node's generic-backed Buffer type.
+					body: method === 'POST' ? (body.byteLength ? new Uint8Array(body) : (isFrame ? new Uint8Array(0) : '{}')) : undefined,
+				});
+				const text = await r.text();
+				res.writeHead(r.status, { 'Content-Type': 'application/json' });
+				res.end(text);
+			} catch {
+				const fallback = url.pathname === '/vision/state'
+					? { streaming: false, source: null, fps: 0, frames: 0, durationMs: 0, sessionReady: false }
+					: { status: 'failed', error: 'voice-agent not reachable' };
+				res.writeHead(url.pathname === '/vision/state' ? 200 : 503, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(fallback));
+			}
+		});
+		return;
+	}
+
+	// Note view event from the in-page note reader. Writes the current slug +
+	// content to /tmp/sutando-note-viewing.json; the voice-agent's
+	// startNoteViewingWatcher picks it up and injects into Gemini so the
+	// assistant can answer questions about whatever the user is looking at.
+	if (url.pathname === '/note-viewing' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+				if (!body.slug || typeof body.content !== 'string') {
+					res.writeHead(400, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify({ error: 'slug and content required' }));
+					return;
+				}
+				const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
+				writeFileSync(join(tmpdir(), 'sutando-note-viewing.json'), JSON.stringify(event));
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true }));
+			} catch (e) {
+				console.error('[web-client] /note-viewing parse failed:', e);
+				res.writeHead(400, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ error: 'note-viewing parse failed' }));
+			}
+		});
+		return;
+	}
+
+	// Clean chat-first UI — Gemini/Claude-app style. Same task-bridge
+	// backend as the dashboard textbox; markdown rendering + full-viewport
+	// chat + persistent history. Lives at /chat to leave / untouched.
+	if (url.pathname === '/chat') {
+		res.writeHead(200, {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+		});
+		res.end(CHAT_HTML);
+		return;
+	}
+
+	// Overlay Manager — lists/controls the desktop overlay applications
+	// (benchmark-overlay Electron app). The page itself is static; it talks
+	// to /api/overlays/* below.
+	if (url.pathname === '/overlays') {
+		res.writeHead(200, {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+		});
+		res.end(OVERLAY_MANAGER_HTML);
+		return;
+	}
+
+	// Proxy to the overlay app's control server. The overlay app writes its
+	// port to state/overlay-control.json; we forward same-origin requests so
+	// the browser needs no CORS or port discovery.
+	if (url.pathname === '/api/overlays' || url.pathname.startsWith('/api/overlays/')) {
+		let disc: { host?: string; port?: number } | null;
+		try {
+			disc = JSON.parse(readFileSync(join(STATE_DIR, 'overlay-control.json'), 'utf-8'));
+		} catch {
+			disc = null;
+		}
+		if (!disc || !disc.port) {
+			res.writeHead(503, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'overlay control server not running' }));
+			return;
+		}
+		const subPath = url.pathname.replace('/api/overlays', '/overlays') + (url.search || '');
+		const proxyReq = httpRequest(
+			{
+				host: disc.host || '127.0.0.1',
+				port: disc.port,
+				path: subPath,
+				method: req.method,
+				headers: { 'Content-Type': 'application/json' },
+			},
+			(proxyRes) => {
+				res.writeHead(proxyRes.statusCode || 502, { 'Content-Type': 'application/json' });
+				proxyRes.pipe(res);
+			},
+		);
+		proxyReq.on('error', (e) => {
+			console.error('[web-client] overlay control proxy failed:', e);
+			res.writeHead(502, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'overlay control proxy failed' }));
+		});
+		req.pipe(proxyReq);
+		return;
+	}
+
+	// Paid subscriptions dashboard. Reads skills/subscription-scanner/state/subscriptions.json
+	// and renders a sortable table with diff highlights from the previous scan.
+	// Trigger an out-of-cycle scan via POST to /paidsubscriptions/scan.
+	if (url.pathname === '/paidsubscriptions') {
+		try {
+			const dataPath = SUBSCRIPTIONS_PATH;
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"subscriptions":[],"scan_history":[]}';
+			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+			res.end(renderSubscriptionsHtml(raw));
+		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions render failed:', e);
+			res.writeHead(500, { 'Content-Type': 'text/plain' });
+			res.end('Error reading subscriptions');
+		}
+		return;
+	}
+	if (url.pathname === '/paidsubscriptions/data') {
+		try {
+			const dataPath = SUBSCRIPTIONS_PATH;
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"subscriptions":[],"scan_history":[]}';
+			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+			res.end(raw);
+		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions/data failed:', e);
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: 'failed to read subscriptions' }));
+		}
+		return;
+	}
+	if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
+		// Localhost-only: this endpoint writes an owner-tier task file that
+		// the watcher processes with full agent privileges. Without this
+		// guard, anyone on the same LAN or a tailscale-funnel'd public URL
+		// could `curl -X POST http://<host>:8080/paidsubscriptions/scan`
+		// and silently enqueue arbitrary work. Per PR #651 Blocker 1.
+		// Reads req.socket.remoteAddress directly rather than a header
+		// (X-Forwarded-For et al. are spoofable). IPv4-mapped IPv6
+		// (::ffff:127.0.0.1) and IPv6 loopback (::1) are both localhost.
+		const remote = req.socket?.remoteAddress || '';
+		const isLocalhost = (
+			remote === '127.0.0.1' ||
+			remote === '::1' ||
+			remote === '::ffff:127.0.0.1'
+		);
+		if (!isLocalhost) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /paidsubscriptions/scan accepts localhost connections only' }));
+			return;
+		}
+		try {
+			const taskId = `task-${Date.now()}`;
+			// Pointer (not inline) — prevents prompt-injection via
+			// header-shaped lines in scan-prompt.md (`source:`,
+			// `access_tier:`, etc.) being parsed as real task headers.
+			// Per PR #651 Blocker 2. The agent reads the file when it
+			// processes the task. `access_tier: owner` is explicit per
+			// Chi's review — relying on the absence-of-field default
+			// is fragile.
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: paidsubscriptions-ui\naccess_tier: owner\n`;
+			writeFileSync(join(TASK_DIR, `${taskId}.txt`), taskContent);
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
+		} catch (e: any) {
+			console.error('[web-client] /paidsubscriptions/scan failed:', e);
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'failed to enqueue scan' }));
+		}
+		return;
+	}
+
+	res.writeHead(200, {
+		'Content-Type': 'text/html; charset=utf-8',
+		'Cache-Control': 'no-cache, no-store, must-revalidate',
+		'Pragma': 'no-cache',
+		'Expires': '0',
+	});
 	res.end(HTML);
 });
 
+// LAN-share WS proxy: forward an upgrade on /ws to the loopback voice WS. Only
+// active when SUTANDO_LAN_SHARE is enabled; otherwise the upgrade is refused
+// (loopback clients connect to WS_PORT directly and never hit this path). The
+// handshake bytes (incl. Sec-WebSocket-Key) are replayed verbatim to WS_PORT
+// with the path rewritten to '/', then the two sockets are piped together.
+server.on('upgrade', (req, socket, head) => {
+	const path = (req.url || '').split('?')[0];
+	// Allow the /ws proxy when the upgrade arrives over LOOPBACK — i.e. from a
+	// same-host TLS-terminating reverse proxy (nginx/caddy) forwarding the
+	// pre-existing HTTPS `wss://<host>/ws` path — OR when LAN sharing is
+	// explicitly enabled. A direct remote/LAN client (non-loopback source) still
+	// needs SUTANDO_LAN_SHARE, so LAN_SHARE only gates the NEW LAN exposure and
+	// not the HTTPS reverse-proxy path. socket.remoteAddress is the real TCP
+	// source and can't be spoofed by a request header.
+	const remote = (socket as import('node:net').Socket).remoteAddress || '';
+	const fromLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+	if (path !== '/ws' || !(LAN_SHARE || fromLoopback)) {
+		socket.destroy();
+		return;
+	}
+	// Same-origin guard — applied only to DIRECT (non-loopback) clients, i.e. the
+	// LAN-share path. Browser WebSockets aren't CORS-protected, so a page on any
+	// site a LAN device visits could target ws://<core>:8080/ws; require the
+	// Origin to match the request Host so only the Sutando UI served from this
+	// host can open it. Loopback sources (a same-host reverse proxy) are trusted
+	// and skip this — Host/Origin can legitimately differ across proxying.
+	const origin = req.headers.origin;
+	if (!fromLoopback && origin) {
+		let originHost: string;
+		try {
+			originHost = new URL(origin).host;
+		} catch {
+			originHost = '\0'; // unparseable Origin → never matches
+		}
+		if (originHost !== req.headers.host) {
+			socket.destroy();
+			return;
+		}
+	}
+	const upstream = netConnect(WS_PORT, '127.0.0.1', () => {
+		const lines = [`${req.method} / HTTP/1.1`];
+		for (let i = 0; i < req.rawHeaders.length; i += 2) {
+			lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+		}
+		upstream.write(lines.join('\r\n') + '\r\n\r\n');
+		if (head && head.length) upstream.write(head);
+		socket.pipe(upstream);
+		upstream.pipe(socket);
+	});
+	upstream.on('error', () => socket.destroy());
+	socket.on('error', () => upstream.destroy());
+});
+
 server.listen(HTTP_PORT, HTTP_HOST, () => {
-	const serverUrl = HTTP_HOST === '0.0.0.0' 
+	const serverUrl = HTTP_HOST === '0.0.0.0'
 		? `http://localhost:${HTTP_PORT} (or use your server's IP/DNS)`
 		: `http://${HTTP_HOST}:${HTTP_PORT}`;
 	console.log(`\n  Sutando — Web Client`);

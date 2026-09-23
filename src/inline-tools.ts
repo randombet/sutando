@@ -1,111 +1,265 @@
 /**
- * Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
- * Shared between voice-agent.ts and phone conversation-server.ts.
+ * Inline tools — lightweight platform actions that execute instantly without
+ * going through the core agent. Shared between voice-agent.ts and the phone
+ * conversation-server.ts.
+ *
+ * Originally macOS-only (osascript, pbcopy/pbpaste, screencapture, …). On
+ * Windows, the platform-specific call sites delegate to src/platform.ts so
+ * clipboard, notifications, screen capture, and app switching work; AppleScript-only tools
+ * (type_text, press_key against a specific app, Chrome JS-injected
+ * scroll, QuickTime control) return a clear `macOSOnly` error rather than
+ * silently failing. The error is surfaced to Gemini so the voice/phone agent
+ * can fall back to telling the user instead of pretending it ran the action.
  *
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
 
-import { execSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
+import { join, extname, dirname, delimiter } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
+import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
+import { PLAYBACK_PATH } from './tmp-paths.js';
+import { presenterModeActive } from './presenter-mode.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
+
+// Tasks/, results/, state/, dynamic-content.json are per-user runtime state
+// — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
+// `process.cwd()` which only happened to match the workspace when the
+// voice-agent was launched from the repo with SUTANDO_WORKSPACE unset.
+// resolveWorkspace() is the canonical TS helper introduced in #821.
+const WORKSPACE_DIR = resolveWorkspace();
+
+// Gate slide-control + fullscreen on presenter-mode.sentinel.
+// Issue #1171: registering these globally causes Gemini to fire them on greetings.
+// Expiry-aware (#2501 policy twin): bare existsSync re-activated the gate
+// forever after a talk window lapsed without `presenter-mode.sh stop`, because
+// a naturally-expired sentinel stays on disk. Still evaluated once at module
+// load — the per-session registration semantics are unchanged.
+const _presenterActive = presenterModeActive(WORKSPACE_DIR);
+
+// Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
+// workspace. Compute REPO_ROOT from this file's URL so the resolution
+// survives any cwd drift at startup. Used by the skill-loader below.
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-// --- Browser tools ---
+// Re-export recording/screen/browser tools from browser-tools
+export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { keystrokeOutcome } from './osascript-setup-hint.js';
+import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
-export const scrollTool: ToolDefinition = {
-	name: 'scroll',
+// Vision: one-shot frame + start/stop live screen-to-Gemini video.
+export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+
+// Active artifact cache — load a file once, query repeatedly without task-bridge round-trips.
+export { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool, clearActiveArtifact } from './artifact-cache-tools.js';
+export { switchVoiceConfigTool } from './voice-config-switch.js';
+import { switchVoiceConfigTool } from './voice-config-switch.js';
+import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
+
+// --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
+
+export const openFileTool: ToolDefinition = {
+	name: 'open_file',
 	description:
-		'Scroll the Chrome browser page. Use for: "scroll down", "scroll up".',
+		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
+		'Use for: "open the file", "open that", "can you open it". ' +
+		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
+		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
+		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
+		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
+		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. ' +
+		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.',
 	parameters: z.object({
-		direction: z.enum(['down', 'up']).describe('Scroll direction'),
+		path: z.string().describe('Absolute file path to open.'),
+		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
+		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { direction } = args as { direction: 'down' | 'up' };
-		const keyCode = direction === 'down' ? 125 : 126;
-		const presses = 10; // fixed: ~10cm on a 13" screen
+		const { path, app, fullscreen } = args as { path: string; app?: string; fullscreen?: boolean };
+		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, app=${app || 'default'}, fullscreen=${fullscreen || false})`);
 		try {
-			const keyPresses = Array(presses).fill(`key code ${keyCode}`).join('\n');
-			execSync(`osascript -e 'tell application "Google Chrome" to activate' -e 'delay 0.2' -e 'tell application "System Events"
-${keyPresses}
-end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [Scroll] ${direction} (${presses} keys)`);
-			return { status: 'scrolled', direction };
-		} catch (err) {
-			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// Tab keyword aliases — map common names to URL patterns
-const TAB_ALIASES: Record<string, string> = {
-	'github': 'github.com', 'repo': 'github.com', 'github repo': 'github.com',
-	'gmail': 'mail.google.com', 'email': 'mail.google.com', 'inbox': 'mail.google.com',
-	'calendar': 'calendar.google.com', 'gcal': 'calendar.google.com',
-	'twitter': 'x.com', 'x': 'x.com',
-	'dashboard': 'localhost:7844', 'sutando': 'localhost:8080', 'web client': 'localhost:8080',
-	'gemini': 'gemini.google.com',
-};
-
-export const switchTabTool: ToolDefinition = {
-	name: 'switch_tab',
-	description:
-		'Switch to a Chrome tab by keyword. Searches both tab titles and URLs. Use for: "switch to GitHub", "go to Gmail", "open the calendar tab".',
-	parameters: z.object({
-		keyword: z.string().describe('Keyword to match in tab title or URL (e.g., "GitHub", "Gmail", "calendar")'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { keyword } = args as { keyword: string };
-		// Resolve aliases to URL patterns
-		const alias = TAB_ALIASES[keyword.toLowerCase()];
-		const searchTerms = alias ? [keyword, alias] : [keyword];
-		const conditions = searchTerms.map(t => {
-			const safe = t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			return `title of t contains "${safe}" or URL of t contains "${safe}"`;
-		}).join(' or ');
-		try {
-			const script = `tell application "Google Chrome"\nset tabIndex to 0\nrepeat with w in windows\nset tabIndex to 0\nrepeat with t in tabs of w\nset tabIndex to tabIndex + 1\nignoring case\nif ${conditions} then\nset active tab index of w to tabIndex\nset index of w to 1\nactivate\nreturn title of t\nend if\nend ignoring\nend repeat\nend repeat\nreturn "not found"\nend tell`;
-			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
-			writeFileSync(tmpFile, script);
-			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
-			try { unlinkSync(tmpFile); } catch {}
-			if (result === 'not found') {
-				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
-				return { error: `No Chrome tab found matching "${keyword}"` };
+			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
+			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
+			// can pass paths like "$SUTANDO_MEMORY_DIR/voice-contexts/X.txt"
+			// without us hardcoding a fallback root. Track any unset variables so
+			// we can surface them as a clear diagnostic rather than letting the
+			// silently-empty substitution flow through to a generic "file not
+			// found" error below.
+			const unresolvedVars: string[] = [];
+			const filePath = expandHome(path)
+				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => {
+					const name = a || b;
+					const val = process.env[name];
+					if (val === undefined) unresolvedVars.push(name);
+					return val || '';
+				});
+			if (unresolvedVars.length > 0) {
+				console.log(`${ts()} [OpenFile] path "${path}" has unset env var(s): ${unresolvedVars.join(', ')}`);
+				return { error: `Unresolved env var(s) in path: ${unresolvedVars.join(', ')}. Set them before calling open_file, or pass a fully-expanded absolute path.` };
 			}
-			console.log(`${ts()} [SwitchTab] switched to: ${result}`);
-			return { status: 'switched', tab: result };
+			if (!existsSync(filePath)) {
+				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
+				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
+			}
+			// execFileSync — no shell interpolation of caller-controlled filePath
+			// or caller-controlled app name (same CodeQL js/command-line-injection
+			// class as #27). Both are passed as separate argv entries, never spliced
+			// into a shell string.
+			//
+			// Resolution per issue #560:
+			//   1. Explicit `app` arg → `open -a <app> <path>` (macOS)
+			//   2. No `app` → `open <path>` (macOS LaunchServices picks default) / ShellExecute (Windows)
+			// Contextual inference (rule 2 from issue) is the model's job — Gemini
+			// reads the conversation and decides whether to pass `app`. The tool
+			// only honors what it's told.
+			if (isMacOS()) {
+				const openArgs = app ? ['-a', app, filePath] : [filePath];
+				execFileSync('open', openArgs, { timeout: 5_000 });
+			} else {
+				// Windows + Linux: app-specific open isn't portable; defer to default
+				// handler via ShellExecute / xdg-open. Surfaced in the tool description.
+				openWithDefault(filePath);
+			}
+			if (fullscreen && isMacOS()) {
+				// Brief delay so the just-opened app becomes frontmost before
+				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
+				// toggle — every app that supports fullscreen handles it (QT
+				// enters Present mode, Preview/Chrome/Pages all enter fullscreen).
+				// No app-specific logic — open_file is generic.
+				await new Promise(r => setTimeout(r, 1500));
+				try {
+					execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
+					console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
+				} catch (err) {
+					console.log(`${ts()} [OpenFile] fullscreen keystroke failed (non-fatal): ${err}`);
+				}
+			}
+			const size = statSync(filePath).size;
+			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+			// If we just opened a video file, write the path to the playback-path
+			// marker so the existing video-control tools (pause_video / replay_video
+			// / etc.) work against the open_file-opened video. Without this, those
+			// tools fall back to findRecording() which only finds phone-call
+			// recordings — so any "pause" / "replay" cue after open_file returns
+			// "No video to play". This makes the existing tool surface QuickTime-
+			// aware, regardless of whether the video came from a phone-call
+			// recording or open_file.
+			const ext = extname(filePath).toLowerCase();
+			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
+				try {
+					const fs = await import('node:fs');
+					fs.writeFileSync(PLAYBACK_PATH, filePath);
+					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
+				} catch {}
+			}
+			return {
+				status: 'opened',
+				path: filePath,
+				size_mb: +(size / 1024 / 1024).toFixed(1),
+				fullscreen: !!fullscreen,
+			};
 		} catch (err) {
-			return { error: `Failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
 
-export const openUrlTool: ToolDefinition = {
-	name: 'open_url',
+// Zoom tools (summon, dismiss, join_zoom) are NOT imported here — they live in
+// the manifest-loaded skill `skills/zoom/` (manifest.json + tools.ts) and reach
+// `inlineTools` / `ownerOnlyTools` via the loadSkillManifestTools() path below
+// (#976 conformance). Core no longer has a compile-time dependency on the skill,
+// so it is genuinely optional.
+// Re-export remaining meeting tools
+export { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+import { joinGmeetTool, lookupMeetingIdTool, callContactTool } from './meeting-tools.js';
+
+// --- Keyboard tool ---
+
+export const pressKeyTool: ToolDefinition = {
+	name: 'press_key',
 	description:
-		'Open a URL in a new Chrome tab. Use for: "open github.com", "go to that link".',
+		'Press a keyboard key or shortcut in the frontmost app. Use for: "press enter", "press escape", ' +
+		'"press tab", "send the message" (Enter), "close the dialog" (Escape), "select all" (Cmd+A), ' +
+		'"clear the input" (Cmd+A then Delete). Instant — do NOT use work for simple keystrokes. ' +
+		'Call this ONLY on an explicit key/shortcut request. NEVER when the user is addressing another ' +
+		'assistant or device ("Hey Google", "Alexa", "Siri"), and never on filler or garbled speech — ' +
+		'a spurious keystroke acts on whatever app is frontmost. When unsure, fire nothing.',
 	parameters: z.object({
-		url: z.string().describe('The URL to open'),
+		key: z.string().describe('Key to press: enter, escape, tab, delete, space, up, down, left, right, or a letter'),
+		modifiers: z.array(z.enum(['command', 'shift', 'control', 'option'])).optional().describe('Modifier keys'),
+		app: z.string().optional().describe('Target app name (e.g. "QuickTime Player"). If set, activates it first.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { url } = args as { url: string };
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		try {
-			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
-			console.log(`${ts()} [OpenURL] opened: ${url}`);
-			return { status: 'opened', url };
-		} catch (err) {
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
+		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
+		// Cross-platform note: this tool drives macOS AppleScript System Events.
+		// Windows has no portable equivalent for "send keystroke X with modifiers
+		// to app Y" from the command line — gate cleanly so Gemini knows to fall
+		// back rather than silently dropping the keystroke.
+		if (!isMacOS()) return macOSOnlyError('press_key');
+		// Activate target app if specified. Escape `app` before embedding
+		// in the AppleScript string literal — without this, a value like
+		// `"; do shell script "rm -rf ~"; tell application "Finder` would
+		// break out of `tell application "..."` and run arbitrary
+		// AppleScript (and AppleScript can `do shell script`, so this is
+		// arbitrary code execution from a tool-call argument). Same
+		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
+		if (app) {
+			const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			try { execFileSync('osascript', ['-e', `tell application "${safeApp}" to activate`], { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
 		}
+		const keyMap: Record<string, number> = {
+			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
+			'delete': 51, 'backspace': 51, 'space': 49,
+			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			// Common voice-spoken aliases — without these, the fallthrough to
+			// `keystroke "<key>"` types the literal string into the focused
+			// field instead of pressing the arrow. Observed 2026-05-13 voice
+			// call: Gemini called press_key(key="downarrow"); nothing scrolled.
+			'uparrow': 126, 'downarrow': 125, 'leftarrow': 123, 'rightarrow': 124,
+			'arrowup': 126, 'arrowdown': 125, 'arrowleft': 123, 'arrowright': 124,
+			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
+		};
+		const keyCode = keyMap[key.toLowerCase()];
+		if (keyCode === undefined) {
+			// Use keystroke for unknown keys
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			// Escape for AppleScript string literal — no shell layer needed with execFileSync.
+			const safeKey = key.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+			try {
+				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
+			} catch (err) {
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
+			}
+		} else {
+			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
+			try {
+				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
+			} catch (err) {
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
+			}
+		}
+		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
+		return { status: 'pressed', key, modifiers, app };
 	},
 };
+
+// --- Browser tools (scroll, switchTab) imported from browser-tools.ts above ---
+// They include STT corrections for speech-garbled names and Chrome JS-based scrolling.
+
+// Placeholder to maintain the export shape — the real tools are imported at the top
+const _browserToolsImported = { switchTabTool, scrollTool }; // eslint-disable-line @typescript-eslint/no-unused-vars
+
+// openUrlTool moved to browser-tools.ts — imported via the re-export at top.
 
 // --- macOS system tools ---
 
@@ -124,19 +278,35 @@ const PROCESS_NAMES: Record<string, string> = {
 export const switchAppTool: ToolDefinition = {
 	name: 'switch_app',
 	description:
-		'Switch to (activate) a macOS application. Use for: "switch to Chrome", "open Slack", "go to Terminal".',
+		'Switch to (activate) a macOS or Windows application. Use for: "switch to Chrome", "open Slack", "go to Terminal".',
 	parameters: z.object({
 		app: z.string().describe('Application name (e.g. "Google Chrome", "Slack", "Terminal", "Finder")'),
 	}),
 	execution: 'inline',
-	async execute(args) {
+	async execute(args, ctx) {
 		let { app } = args as { app: string };
+		if (isWindows()) {
+			try {
+				const windowsAliases: Record<string, string> = {
+					...APP_ALIASES, terminal: 'Terminal', explorer: 'File Explorer',
+					edge: 'Microsoft Edge', calculator: 'Calculator',
+				};
+				app = windowsAliases[app.toLowerCase()] ?? app;
+				return await activateWindowsApp(app, fileURLToPath(new URL('./windows-app-launcher.ps1', import.meta.url)), ctx?.abortSignal);
+			} catch (err) {
+				return { error: `Failed to switch to ${app}: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		if (!isMacOS()) return macOSOnlyError('switch_app');
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeApp = app.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
-		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		// Escape for AppleScript string literals — no shell layer needed with execFileSync.
+		const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
-			execSync(`osascript -e 'tell application "${safeApp}" to activate' -e 'tell application "System Events" to set frontmost of process "${processName}" to true'`, { timeout: 10_000 });
+			execFileSync('osascript', [
+				'-e', `tell application "${safeApp}" to activate`,
+				'-e', `tell application "System Events" to set frontmost of process "${processName}" to true`,
+			], { timeout: 10_000 });
 			console.log(`${ts()} [SwitchApp] activated: ${app}`);
 			return { status: 'switched', app };
 		} catch (err) {
@@ -148,15 +318,27 @@ export const switchAppTool: ToolDefinition = {
 export const captureScreenTool: ToolDefinition = {
 	name: 'capture_screen',
 	description:
-		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Instant.',
-	parameters: z.object({}),
+		'Capture a screenshot of the screen. Use for: "take a screenshot", "what\'s on my screen", "look at this". Supports multi-monitor: pass display=2 for secondary screen, display=3 for third, etc. Default captures the main display. Instant.',
+	parameters: z.object({
+		display: z.number().optional().describe('Display number: 1=main, 2=secondary, 3=third. Default: main display.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
 		try {
-			const res = await fetch('http://localhost:7845/capture');
-			const data = await res.json() as { status: string; path?: string; error?: string };
+			const { display } = args as { display?: number };
+			// If no display specified, capture all displays
+			const query = display ? `?display=${display}` : '?all=true';
+			const _capTok = readCaptureToken();
+			const res = await fetch(`http://localhost:7845/capture${query}`, _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
+			const data = await res.json() as { status: string; path?: string; all_paths?: string[]; displays?: number; error?: string };
 			if (data.status === 'ok' && data.path) {
-				console.log(`${ts()} [Screen] Captured: ${data.path}`);
+				const label = data.displays && data.displays > 1
+					? ` (${data.displays} displays)`
+					: display ? ` display ${display}` : '';
+				console.log(`${ts()} [Screen] Captured${label}: ${data.path}`);
+				if (data.all_paths && data.all_paths.length > 1) {
+					return { status: 'captured', paths: data.all_paths, displays: data.displays, note: 'Multiple displays captured. Each path is a separate screen.' };
+				}
 				return { status: 'captured', path: data.path };
 			}
 			return { status: 'failed', error: data.error || 'unknown error' };
@@ -169,20 +351,91 @@ export const captureScreenTool: ToolDefinition = {
 export const typeTextTool: ToolDefinition = {
 	name: 'type_text',
 	description:
-		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant.',
+		'Type text into the currently focused field. Use for: "type hello", "enter my email". Instant. ' +
+		'Pass `mode` to control how the text lands relative to existing content. `mode: "replace_all"` selects ' +
+		'everything in the field first, then writes the new text — pick this for in-place edits (rewrite the ' +
+		'draft, shorten, add words to the existing paragraph; compute the FULL edited version and call with ' +
+		'replace_all). `mode: "append"` collapses any selection to its end before writing — pick this when the ' +
+		'user says "add", "append", "type at the end". `mode: "at_caret"` (default) inserts at the current ' +
+		'caret position — pick this for fill-in-a-blank ("type hello", "enter my email"). The legacy ' +
+		'`append: true` is still honored and treated as `mode: "append"` for backward compat.',
 	parameters: z.object({
-		text: z.string().describe('The text to type'),
+		text: z.string().describe('The text to type. For mode="replace_all" this is the FULL new content of the field (compute the edited version locally before calling).'),
+		mode: z.enum(['replace_all', 'append', 'at_caret']).optional().describe('How the text lands: "replace_all" selects all + writes new content (in-place edits); "append" collapses selection to end + writes (add-to-end); "at_caret" (default) inserts at caret.'),
+		append: z.boolean().optional().describe('Deprecated — pass `mode: "append"` instead. Still honored: if true (and mode is unset), behaves like mode="append".'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { text } = args as { text: string };
+		const a = args as { text: string; mode?: 'replace_all' | 'append' | 'at_caret'; append?: boolean };
+		if (!isMacOS()) return macOSOnlyError('type_text');
+		const text = a.text;
+		// Resolve effective mode. Explicit `mode` wins; legacy `append: true` → 'append';
+		// otherwise default to 'at_caret' (the long-standing default behavior pre-2026-06-01).
+		const mode: 'replace_all' | 'append' | 'at_caret' = a.mode ?? (a.append ? 'append' : 'at_caret');
+		// Multi-line, long, or non-ASCII text: use clipboard paste.
+		// AppleScript's `keystroke "..."` routes through virtual-key codes that
+		// can't represent characters outside the basic ASCII typing range —
+		// em-dashes (U+2014), curly quotes (U+2018-U+201D), and emoji all get
+		// corrupted (UTF-8 bytes reinterpreted as Mac Roman → e.g. 🤖 mojibake,
+		// — → "‚Äî"). The paste branch round-trips through the system pasteboard
+		// which preserves bytes. Per Chi 2026-05-13 frustration with emoji corruption.
+		// Gemini sends literal \n (two chars backslash+n), not actual newlines.
+		const hasNonAscii = /[^\x00-\x7f]/.test(text);
+		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || hasNonAscii;
+		if (needsPaste) {
+			try {
+				// Force UTF-8 locale for the child shell — voice-agent runs under
+				// launchd which doesn't inherit terminal LANG/LC_CTYPE, so the
+				// default POSIX/C locale would make `pbcopy < file` treat
+				// multi-byte UTF-8 sequences as garbled single-byte and put
+				// "??" on the pasteboard instead of 🤖. Pipe via stdin (input:)
+				// to bypass shell redirection entirely. Per Chi 2026-05-13 (PR #660
+				// follow-up: the first fix routed emoji to paste-branch but
+				// pbcopy still mangled bytes in launchd context).
+				const utf8Env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
+				let savedClipboard = '';
+				try { savedClipboard = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
+				// Convert literal \n to actual newlines
+				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+				execFileSync('pbcopy', [], { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				// replace_all: emit Cmd+A first so the subsequent Cmd+V replaces the
+				// entire field content (closes the selection-state ambiguity that
+				// 'replace' default had — relied on caller to have selected).
+				// append: collapse selection to its end via Right-arrow before Cmd+V.
+				// at_caret (default): paste at current caret / replace current selection per macOS Cmd+V semantics.
+				if (mode === 'replace_all') {
+					execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000, env: utf8Env });
+				} else if (mode === 'append') {
+					execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000, env: utf8Env });
+				}
+				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "v" using command down'], { timeout: 5_000, env: utf8Env });
+				execFileSync('sleep', ['0.3']);
+				if (savedClipboard) {
+					execFileSync('pbcopy', [], { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				}
+				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
+				return { status: 'typed', text };
+			} catch (err) {
+				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
+			}
+		}
+		// Single-line short text: use keystroke
+		// Escape for AppleScript string literal only — no shell layer needed with execFileSync.
 		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 		try {
-			execSync(`osascript -e 'tell application "System Events" to keystroke "${safeText}"'`, { timeout: 5_000 });
-			console.log(`${ts()} [TypeText] typed: ${text.slice(0, 40)}`);
+			// replace_all: Cmd+A first so the keystroke replaces the entire field.
+			// append: collapse selection to its end via Right-arrow before typing.
+			// at_caret (default): keystroke at caret / replaces current selection per System Events behavior.
+			if (mode === 'replace_all') {
+				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000 });
+			} else if (mode === 'append') {
+				execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000 });
+			}
+			execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeText}"`], { timeout: 5_000 });
+			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
 		}
 	},
 };
@@ -198,21 +451,22 @@ export const volumeTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { level, mute } = args as { level?: number; mute?: boolean };
+		if (!isMacOS()) return macOSOnlyError('volume');
 		try {
 			if (mute === true) {
-				execSync(`osascript -e 'set volume with output muted'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', 'set volume with output muted'], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] muted`);
 				return { status: 'muted' };
 			}
 			if (mute === false) {
-				execSync(`osascript -e 'set volume without output muted'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', 'set volume without output muted'], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] unmuted`);
 				return { status: 'unmuted' };
 			}
 			if (level !== undefined) {
 				// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 				const normalizedLevel = level <= 1 && level > 0 ? Math.round(level * 100) : Math.round(level);
-				execSync(`osascript -e 'set volume output volume ${normalizedLevel}'`, { timeout: 5_000 });
+				execFileSync('osascript', ['-e', `set volume output volume ${normalizedLevel}`], { timeout: 5_000 });
 				console.log(`${ts()} [Volume] set to ${normalizedLevel}%`);
 				return { status: 'set', level: normalizedLevel };
 			}
@@ -222,6 +476,98 @@ export const volumeTool: ToolDefinition = {
 		}
 	},
 };
+
+// The smooth ramp lands within a rounding step of the request; wider than that
+// means the display did not take the change.
+const BRIGHTNESS_TOLERANCE_PCT = 2;
+
+// Identifies the target display before choosing a mechanism: DisplayServices
+// drives the built-in panel only, and external panels need DDC over I2C. Prints
+// "<kind> <level>" so the caller can report which path ran; exits 2 for an
+// external display, which it cannot drive itself.
+const BRIGHTNESS_PY = `
+import ctypes, ctypes.util, sys, time
+cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGDisplayIsBuiltin.argtypes = [ctypes.c_uint32]
+did = cg.CGMainDisplayID()
+if not cg.CGDisplayIsBuiltin(did):
+    # Report how many displays are attached: the caller cannot safely pick one
+    # for DDC when several are, so it refuses rather than driving the wrong panel.
+    n = ctypes.c_uint32()
+    arr = (ctypes.c_uint32 * 16)()
+    cg.CGGetActiveDisplayList(16, arr, ctypes.byref(n))
+    print("external", n.value)
+    sys.exit(2)
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
+ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+ds.DisplayServicesSetBrightnessSmooth.argtypes = [ctypes.c_uint32, ctypes.c_float]
+before = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(before)) != 0:
+    sys.exit(1)
+if ds.DisplayServicesSetBrightnessSmooth(did, ctypes.c_float(float(sys.argv[1]) - before.value)) != 0:
+    sys.exit(1)
+time.sleep(0.6)
+after = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(after)) != 0:
+    sys.exit(1)
+print("builtin", after.value, before.value)
+`;
+
+/**
+ * DDC brightness for a single external panel, 0-100. Both tools address a
+ * display by their own index, which no CoreGraphics id maps onto, so this
+ * refuses when more than one display is attached rather than guessing which
+ * panel `display 1` denotes.
+ *
+ * Reads the level back where the tool supports it. DDC is widely half-implemented
+ * in monitor firmware, so a command can be accepted and ignored — reporting the
+ * REQUESTED level here would reproduce the silent-success bug this file exists to
+ * fix, on the one path that cannot be hardware-tested. When no readback is
+ * available the result says `requested`, never `set`.
+ */
+type ExternalResult =
+	| { status: 'set' | 'partial' | 'requested'; method: string; level: number; requested: number; verified: boolean }
+	| { error: string };
+
+function setExternalBrightness(level: number, displayCount: number): ExternalResult {
+	if (displayCount > 1) {
+		return { error: `${displayCount} displays attached — refusing to guess which external panel to dim. Set it on the monitor, or attach one display.` };
+	}
+	const failures: string[] = [];
+	for (const [bin, setArgs, getArgs] of [
+		['m1ddc', ['display', '1', 'set', 'luminance', String(level)], ['display', '1', 'get', 'luminance']],
+		['ddcctl', ['-d', '1', '-b', String(level)], null],
+	] as const) {
+		try {
+			execFileSync(bin, [...setArgs], { timeout: 5_000, stdio: ['ignore', 'ignore', 'pipe'] });
+		} catch (err) {
+			// ENOENT (absent) and a non-zero exit (present but refused) are different
+			// diagnoses; collapsing them tells a user who HAS the tool to install it.
+			const e = err as { code?: string; stderr?: Buffer; status?: number };
+			if (e?.code === 'ENOENT') continue;
+			failures.push(`${bin} exited ${e?.status ?? '?'}: ${String(e?.stderr ?? '').trim() || 'no stderr'}`);
+			continue;
+		}
+		if (getArgs) {
+			try {
+				const out = execFileSync(bin, [...getArgs], { timeout: 5_000, encoding: 'utf8' });
+				const actual = parseInt(out.trim(), 10);
+				if (Number.isFinite(actual)) {
+					return Math.abs(actual - level) <= BRIGHTNESS_TOLERANCE_PCT
+						? { status: 'set', method: bin, level: actual, requested: level, verified: true }
+						: { status: 'partial', method: bin, level: actual, requested: level, verified: true };
+				}
+			} catch { /* readback unsupported by this panel — fall through unverified */ }
+		}
+		return { status: 'requested', method: bin, level, requested: level, verified: false };
+	}
+	return {
+		error: failures.length
+			? `External display: DDC command failed — ${failures.join('; ')}`
+			: 'External display needs a DDC tool. Install one with: brew install m1ddc',
+	};
+}
 
 export const brightnessTool: ToolDefinition = {
 	name: 'brightness',
@@ -233,27 +579,51 @@ export const brightnessTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		let { level } = args as { level: number };
+		if (!isMacOS()) return macOSOnlyError('brightness');
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
+		level = Math.max(0, Math.min(100, level));
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execSync(`osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false'`, { timeout: 1_000 }).toString();
-		} catch {} // ignore — just trying to ensure display is active
-		try {
-			execSync(`brightness ${bLevel}`, { timeout: 5_000 });
-			console.log(`${ts()} [Brightness] set to ${level}%`);
-			return { status: 'set', level };
-		} catch {
-			// Fallback: use AppleScript key codes
+			// DisplayServicesSetBrightnessSmooth takes a RELATIVE delta and persists;
+			// the absolute setter is reverted by the display daemon within ~30s.
+			const out = execFileSync(requirePython(), ['-c', BRIGHTNESS_PY, bLevel], { timeout: 5_000, encoding: 'utf8' });
+			const [, afterRaw, beforeRaw] = out.trim().split(/\s+/);
+			const actual = Math.round(parseFloat(afterRaw) * 100);
+			const before = Math.round(parseFloat(beforeRaw) * 100);
+			if (!Number.isFinite(actual) || !Number.isFinite(before)) throw new Error(`unreadable brightness: ${out.trim()}`);
+			// A readback alone cannot tell "set" from "did nothing" — that was the
+			// original silent-success bug. Require the display to have reached the
+			// target, or at least moved toward it.
+			if (Math.abs(actual - level) > BRIGHTNESS_TOLERANCE_PCT) {
+				const moved = actual !== before;
+				console.log(`${ts()} [Brightness] builtin: requested ${level}%, reads ${actual}% (was ${before}%) — ${moved ? 'partial' : 'no movement'}`);
+				return moved
+					? { status: 'partial', level: actual, requested: level, was: before, display: 'builtin' }
+					: { error: `Brightness did not move: still ${actual}% after requesting ${level}%.` };
+			}
+			console.log(`${ts()} [Brightness] builtin: requested ${level}%, display reads ${actual}%`);
+			return { status: 'set', level: actual, requested: level, display: 'builtin' };
+		} catch (err) {
+			// Exit 2 means the probe identified an EXTERNAL main display, which
+			// DisplayServices cannot drive at all — route to DDC rather than retrying.
+			if ((err as { status?: number })?.status === 2) {
+				const count = parseInt(String((err as { stdout?: string }).stdout ?? '').trim().split(/\s+/)[1] ?? '1', 10);
+				const outcome = setExternalBrightness(level, Number.isFinite(count) ? count : 1);
+				if ('error' in outcome) return outcome;
+				console.log(`${ts()} [Brightness] external: requested ${level}% via ${outcome.method} — ${outcome.verified ? `display reads ${outcome.level}%` : 'NOT verified (no readback)'}`);
+				return { ...outcome, display: 'external' };
+			}
+			// Last resort when the probe itself could not run. nriley/brightness has no
+			// readback we use here, so this reports `requested`, never `set` — the same
+			// rule the external path follows, and the reason the review found this
+			// class in the first place.
 			try {
-				const steps = Math.round(level / 100 * 16);
-				// Reset to 0 then go up
-				for (let i = 0; i < 16; i++) execSync(`osascript -e 'tell application "System Events" to key code 107'`, { timeout: 1_000 }); // brightness down
-				for (let i = 0; i < steps; i++) execSync(`osascript -e 'tell application "System Events" to key code 113'`, { timeout: 1_000 }); // brightness up
-				console.log(`${ts()} [Brightness] set to ~${level}% via key codes`);
-				return { status: 'set', level, method: 'key_codes' };
-			} catch (err) {
-				return { error: `Brightness failed: ${err instanceof Error ? err.message : err}` };
+				execFileSync('brightness', [bLevel], { timeout: 5_000 });
+				console.log(`${ts()} [Brightness] requested ${level}% via brightness CLI — NOT verified`);
+				return { status: 'requested', level, requested: level, method: 'cli', verified: false };
+			} catch (e) {
+				return { error: `Brightness failed: ${e instanceof Error ? e.message : e}` };
 			}
 		}
 	},
@@ -262,7 +632,7 @@ export const brightnessTool: ToolDefinition = {
 export const clipboardTool: ToolDefinition = {
 	name: 'clipboard',
 	description:
-		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant.',
+		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant. Cross-platform (macOS pbcopy/pbpaste, Windows PowerShell Get-Clipboard/Set-Clipboard).',
 	parameters: z.object({
 		action: z.enum(['read', 'write']).describe('"read" to get clipboard contents, "write" to set them'),
 		text: z.string().optional().describe('Text to write to clipboard (only for action="write")'),
@@ -272,12 +642,12 @@ export const clipboardTool: ToolDefinition = {
 		const { action, text } = args as { action: 'read' | 'write'; text?: string };
 		try {
 			if (action === 'read') {
-				const content = execSync(`pbpaste`, { timeout: 5_000 }).toString();
+				const content = clipboardRead();
 				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				execSync(`echo ${JSON.stringify(text)} | pbcopy`, { timeout: 5_000 });
+				clipboardWrite(text);
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}
@@ -289,22 +659,101 @@ export const clipboardTool: ToolDefinition = {
 
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
-	description: 'Cancel the most recent pending task. Use when someone says "cancel", "nevermind", "stop that".',
-	parameters: z.object({}),
+	description:
+		'Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. ' +
+		'Default (no args) cancels the most recent. ' +
+		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
+		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
+		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X". ' +
+		'Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — ' +
+		'this prevents future pickup + tells core to abort if mid-task, but doesn\'t interrupt a single LLM turn.',
+	parameters: z.object({
+		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
+		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
+		list: z.boolean().optional().describe('If true, list pending tasks (id + 60-char preview) without cancelling.'),
+	}),
 	execution: 'inline',
-	async execute() {
+	async execute(args) {
+		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
-			const tasksDir = join(process.cwd(), 'tasks');
-			const resultsDir = join(process.cwd(), 'results');
+			const tasksDir = join(WORKSPACE_DIR, 'tasks');
+			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
-			if (files.length === 0) return { status: 'nothing_to_cancel' };
-			const mostRecent = files[files.length - 1];
-			const taskId = mostRecent.replace('.txt', '');
-			// Write a cancelled result so the web UI shows it with the cancelled icon
-			writeFileSync(join(resultsDir, mostRecent), 'Cancelled.');
-			unlinkSync(join(tasksDir, mostRecent));
-			console.log(`${ts()} [CancelTask] cancelled: ${taskId}`);
-			return { status: 'cancelled', taskId };
+
+			// list mode: return id + preview, no cancel
+			if (list) {
+				if (files.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
+				const items = files.map(f => {
+					const id = f.replace('.txt', '');
+					let preview = '';
+					try {
+						const body = readFileSync(join(tasksDir, f), 'utf-8');
+						const taskLine = body.split('\n').find(l => l.startsWith('task:')) ?? body;
+						preview = taskLine.replace(/^task:\s*/, '').slice(0, 60);
+					} catch { /* ignore */ }
+					return { id, preview };
+				});
+				console.log(`${ts()} [CancelTask] list: ${items.length} pending`);
+				return { status: 'pending_tasks', count: items.length, tasks: items };
+			}
+
+			// Targeting: by exact id, by query, or default-to-most-recent.
+			// IMPORTANT: target can be a file in `tasks/` OR a recently-archived task whose
+			// processing is in-flight (file already moved). For id-based cancels we accept
+			// either case; for query-based we need the file present to grep its content.
+			let targetId: string | undefined;
+			let targetFile: string | undefined;
+			if (taskId) {
+				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
+				targetId = wantFile.replace('.txt', '');
+				if (files.includes(wantFile)) targetFile = wantFile;
+				// else: accept the cancel even if file is gone (in-flight); core sees CANCEL and decides
+			} else if (query) {
+				if (files.length === 0) return { status: 'nothing_pending' };
+				const needle = query.toLowerCase();
+				for (const f of files) {
+					try {
+						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
+						if (body.includes(needle)) { targetFile = f; targetId = f.replace('.txt', ''); break; }
+					} catch { /* ignore */ }
+				}
+				if (!targetId) return { status: 'not_found', query };
+			} else {
+				// default: most recent pending file
+				if (files.length === 0) return { status: 'nothing_pending' };
+				targetFile = files[files.length - 1];
+				targetId = targetFile.replace('.txt', '');
+			}
+
+			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
+			// the named target. Design (Chi 2026-05-13): reuse the task pipeline as the
+			// cancel signal channel instead of building a parallel one.
+			const cancelTs = Date.now();
+			const cancelFilename = `task-${cancelTs}.txt`;
+			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
+			// in practice but defence-in-depth). task: field is placed LAST so a
+			// forged line in the body cannot shadow the real source/access_tier above it.
+			// Same header writer as the work tool, so the confirmation follows the session's origin.
+			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
+			const cancelOrigin = getVoiceSessionOrigin();
+			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
+			const cancelBody =
+				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', cancelOrigin) +
+				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
+			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
+
+			// Also unlink the original task file if it's still present — prevents
+			// double-pickup if core hadn't started yet. Best-effort.
+			if (targetFile) {
+				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
+			}
+
+			// Touch a cancelled result for the web UI's cancel icon (best-effort).
+			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
+
+			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
+			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -314,17 +763,21 @@ export const cancelTaskTool: ToolDefinition = {
 export const toggleTasksTool: ToolDefinition = {
 	name: 'toggle_tasks',
 	description:
-		'Collapse or expand all tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks". Instant.',
+		'Collapse or expand tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks", "expand only the first task". Pass taskIndex=1 for "the first task", 2 for "the second", etc. (1-based, by display order); omit for all-tasks. Instant.',
 	parameters: z.object({
-		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide all task results, "expand" to show them'),
+		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide task results, "expand" to show them'),
+		taskIndex: z.number().int().min(1).optional().describe('1-based index of a single task to act on (by display order). Omit to act on all tasks.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { action } = args as { action: 'collapse' | 'expand' };
-		// Set data attribute on body — MutationObserver in the page picks it up and updates state
-		const js = `document.body.dataset.taskAction = \\\"${action}\\\"; \\\"done\\\"`;
+		const { action, taskIndex } = args as { action: 'collapse' | 'expand'; taskIndex?: number };
+		if (!isMacOS()) return macOSOnlyError('toggle_tasks');
+		// Set data attribute on body — MutationObserver in the page picks it up and updates state.
+		// When taskIndex is set, encode as "expand:N" / "collapse:N"; handler in web-client.ts parses the suffix.
+		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
+		const js = `document.body.dataset.taskAction = \\\"${actionStr}\\\"; \\\"done\\\"`;
 		try {
-			execSync(`osascript -e 'tell application "Google Chrome"
+			execFileSync('osascript', ['-e', `tell application "Google Chrome"
 				repeat with w in windows
 					repeat with t in tabs of w
 						if URL of t contains "localhost:8080" then
@@ -334,8 +787,8 @@ export const toggleTasksTool: ToolDefinition = {
 					end repeat
 				end repeat
 				return "not found"
-			end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [ToggleTasks] ${action}`);
+			end tell`], { timeout: 5_000 });
+			console.log(`${ts()} [ToggleTasks] ${actionStr}`);
 			return { status: action === 'collapse' ? 'collapsed' : 'expanded' };
 		} catch (err) {
 			return { error: `Toggle tasks failed: ${err instanceof Error ? err.message : err}` };
@@ -345,7 +798,11 @@ export const toggleTasksTool: ToolDefinition = {
 
 export const getCurrentTimeTool: ToolDefinition = {
 	name: 'get_current_time',
-	description: 'Get the current date and time. Instant.',
+	description:
+		'Get the current date and time. Instant. Call this ONLY when the user explicitly asks for ' +
+		'the time, date, or day. NEVER call it for any other question, on filler ("hm", "okay"), or ' +
+		'as a fallback when you are unsure what the user wants — answering an unrelated question ' +
+		'(e.g. about a paper) by announcing the time is always wrong; when unsure, fire nothing.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -353,738 +810,691 @@ export const getCurrentTimeTool: ToolDefinition = {
 	},
 };
 
-const ZOOM_PMI = process.env.ZOOM_PERSONAL_MEETING_ID ?? '';
+// The pending queue's fresh snapshot (src/task_queue.py write_snapshot):
+// {ts, depth, pending}. Older than 10 minutes, or absent, is unknown — a
+// stale depth is worse than none. Exported for the test.
+export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.now() / 1000)): number | null {
+	try {
+		const p = statusReadPath('task-queue.json', workspaceDir);
+		if (!existsSync(p)) return null;
+		const q = JSON.parse(readFileSync(p, 'utf-8')) as { ts?: number; depth?: number };
+		if (typeof q.ts !== 'number' || nowSec - q.ts > 600 || typeof q.depth !== 'number') return null;
+		return q.depth;
+	} catch { return null; }
+}
 
-const ZOOM_PASSCODE = process.env.ZOOM_PERSONAL_PASSCODE ?? '';
-
-const PHONE_PORT = Number(process.env.PHONE_PORT) || 3100;
-const ZOOM_DEFAULT_SHARE_SCREEN = process.env.ZOOM_DEFAULT_SHARE_SCREEN !== 'false'; // default true
-
-export const summonTool: ToolDefinition = {
-	name: 'summon',
+// Get what the core agent (Claude Code proactive-loop) is currently doing.
+// Lets voice-agent Gemini answer "what are you working on?" truthfully
+// instead of guessing. Reads core-status.json written by the core agent, and
+// the queue depth from state/task-queue.json.
+export const getCoreStatusTool: ToolDefinition = {
+	name: 'get_core_status',
 	description:
-		'Summon Sutando\'s screen — opens Zoom with screen sharing so the user can see and control remotely. ' +
-		'Use when user says "summon", "share my screen", "start zoom", "let me see your screen". ' +
-		'Instant — do NOT use work for this.' +
-		(ZOOM_PMI ? ` Default meeting: ${ZOOM_PMI}.` : ''),
-	parameters: z.object({
-		meetingId: z.string().optional().describe('Zoom meeting ID. Omit for personal room.'),
-		passcode: z.string().optional().describe('Passcode. Omit for personal room.'),
-		shareScreen: z.boolean().optional().describe('Share screen after joining (default: true)'),
-		dialIn: z.boolean().optional().describe('Also dial into the meeting via phone for voice (default: false). Only if user explicitly asks.'),
-	}),
-	execution: 'inline',
-	async execute(args, ctx) {
-		const { meetingId, passcode, shareScreen = ZOOM_DEFAULT_SHARE_SCREEN, dialIn = false } = args as { meetingId?: string; passcode?: string; shareScreen?: boolean; dialIn?: boolean };
-		const pwd = passcode ?? ZOOM_PASSCODE;
-		const cleanId = (meetingId ?? ZOOM_PMI).replace(/\D/g, '');
-		if (!cleanId || cleanId.length < 6) return { error: `Invalid meeting ID: "${meetingId}"` };
-
-		try {
-			// Check if already in a Zoom meeting
-			let alreadyInMeeting = false;
-			try {
-				const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
-				alreadyInMeeting = winNames.includes('Zoom Meeting') || winNames.includes('zoom share') || winNames.includes('floating video');
-			} catch {}
-
-			if (alreadyInMeeting) {
-				console.log(`${ts()} [Summon] Already in a Zoom meeting — skipping join, going straight to screen share`);
-			} else {
-				// Use the running Zoom app if available — avoids login prompt from zoommtg:// protocol
-				const zoomRunning = (() => { try { execSync('pgrep -f "zoom.us"', { timeout: 2_000 }); return true; } catch { return false; } })();
-
-				if (zoomRunning) {
-					console.log(`${ts()} [Summon] Zoom running — joining via app`);
-					const joinUrl = `https://zoom.us/j/${cleanId}${pwd ? '?pwd=' + pwd : ''}`;
-					execSync(`open "${joinUrl}"`, { timeout: 10_000 });
-				} else {
-					console.log(`${ts()} [Summon] Launching Zoom`);
-					let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-					if (pwd) zoomUrl += `&pwd=${pwd}`;
-					execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
-				}
-
-				// Wait for Zoom preview window, then click Join button
-				console.log(`${ts()} [Summon] Waiting for Zoom preview window...`);
-			await new Promise(r => setTimeout(r, 2000));
-			try {
-				execSync(`/usr/bin/python3 -c "
-import Quartz, subprocess, time
-
-# Get the Zoom meeting preview window position
-result = subprocess.run(['osascript', '-e', '''
-tell application \\\"zoom.us\\\" to activate
-tell application \\\"System Events\\\"
-    tell process \\\"zoom.us\\\"
-        repeat with w in windows
-            try
-                set wName to name of w
-                if wName contains \\\"Meeting\\\" or wName contains \\\"Personal\\\" then
-                    set wPos to position of w
-                    set wSize to size of w
-                    return (item 1 of wPos as text) & \\\",\\\" & (item 2 of wPos as text) & \\\",\\\" & (item 1 of wSize as text) & \\\",\\\" & (item 2 of wSize as text)
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return \\\"not_found\\\"
-'''], capture_output=True, text=True, timeout=10)
-
-coords = result.stdout.strip()
-if coords and coords != 'not_found':
-    x0, y0, w, h = [int(float(v)) for v in coords.split(',')]
-    # Join button is at bottom-right of preview: roughly 80% across, 93% down
-    bx = x0 + int(w * 0.80)
-    by = y0 + int(h * 0.93)
-    print(f'Preview at ({x0},{y0}) size ({w},{h}), clicking Join at ({bx},{by})')
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    time.sleep(0.1)
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    print('Join clicked')
-else:
-    print('No preview window found — may have auto-joined')
-"`, { timeout: 20_000 });
-				console.log(`${ts()} [Summon] Join button clicked`);
-			} catch (err) {
-				console.log(`${ts()} [Summon] Join click failed (may have auto-joined): ${err}`);
-			}
-			} // end: not already in meeting
-
-			// If phone dial-in requested, wait for host to join before dialing
-			if (dialIn) {
-				console.log(`${ts()} [Summon] Waiting for desktop to join as host...`);
-				let hostJoined = false;
-				for (let i = 0; i < 20; i++) {
-					try {
-						const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
-						if (winNames.includes('Zoom Meeting') || winNames.includes('Meeting')) {
-							hostJoined = true;
-							break;
-						}
-					} catch {}
-					await new Promise(r => setTimeout(r, 1000));
-				}
-				console.log(`${ts()} [Summon] Host joined: ${hostJoined}`);
-				if (hostJoined) {
-					console.log(`${ts()} [Summon] Waiting 3s for Zoom server to register host...`);
-					await new Promise(r => setTimeout(r, 3000));
-				}
-			}
-
-			// Phone dial-in only when explicitly requested (not all meetings support it)
-			let phoneJoined = false;
-			if (dialIn) try {
-				const ping = await fetch(`http://localhost:${PHONE_PORT}/health`, { signal: AbortSignal.timeout(2000) });
-				if (ping.ok) {
-					console.log(`${ts()} [Summon] Phone server available — dialing into meeting for voice`);
-					const res = await fetch(`http://localhost:${PHONE_PORT}/meeting`, {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ meetingId: cleanId, passcode: pwd, platform: 'zoom' }),
-					});
-					const data = await res.json() as { callSid?: string; error?: string };
-					if (data.callSid) {
-						phoneJoined = true;
-						console.log(`${ts()} [Summon] Phone call placed: ${data.callSid} — voice agent stays connected until phone joins`);
-						// Mute Zoom mic + speaker so voice agent doesn't pick up Zoom audio
-						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										-- Mute mic (Cmd+Shift+A)
-										keystroke "a" using {command down, shift down}
-									end tell
-								end tell
-								-- Mute system audio so Zoom speaker doesn\'t bleed into voice agent mic
-								set volume output volume 0
-							'`, { timeout: 5_000 });
-							console.log(`${ts()} [Summon] Zoom mic + system audio muted`);
-						} catch { console.log(`${ts()} [Summon] Zoom mute failed`); }
-						// Voice agent stays alive — system audio muted prevents Zoom speaker
-						// from being picked up by voice agent mic
-					} else {
-						console.log(`${ts()} [Summon] Phone join failed: ${data.error}`);
-					}
-				}
-			} catch {
-				console.log(`${ts()} [Summon] Phone server not available — screen share only`);
-			}
-
-			// Handle audio dialogs
-			await new Promise(r => setTimeout(r, 1000));
-			if (dialIn) {
-				// Phone handles audio — close the "Join audio" window
-				try {
-					execSync(`osascript -e '
-						tell application "zoom.us" to activate
-						delay 0.5
-						tell application "System Events"
-							tell process "zoom.us"
-								repeat with w in windows
-									if name of w is "Join audio" then
-										click button 1 of w
-										return "closed Join audio"
-									end if
-								end repeat
-							end tell
-						end tell
-					'`, { timeout: 5_000 });
-					console.log(`${ts()} [Summon] Join audio window closed (phone handles audio)`);
-				} catch { console.log(`${ts()} [Summon] No Join audio window to close`); }
-			} else {
-				// No phone dial-in — join computer audio so voice agent can hear the meeting
-				try {
-					execSync(`osascript -e '
-						tell application "zoom.us" to activate
-						delay 0.5
-						tell application "System Events"
-							tell process "zoom.us"
-								repeat with w in windows
-									if name of w is "Join audio" then
-										-- Click "Join with Computer Audio" button
-										try
-											click button "Join with Computer Audio" of w
-											return "joined computer audio"
-										end try
-										-- Fallback: look for any button containing "Computer Audio"
-										repeat with b in buttons of w
-											if name of b contains "Computer Audio" then
-												click b
-												return "joined computer audio"
-											end if
-										end repeat
-										-- Last resort: close the window
-										click button 1 of w
-										return "closed (no computer audio button found)"
-									end if
-								end repeat
-							end tell
-						end tell
-					'`, { timeout: 5_000 });
-					console.log(`${ts()} [Summon] Joined computer audio`);
-				} catch { console.log(`${ts()} [Summon] No Join audio window found`); }
-			}
-
-			// Wait for Zoom meeting window to appear (adaptive, up to 30s)
-			console.log(`${ts()} [Summon] Waiting for Zoom meeting window...`);
-			let zoomReady = false;
-			for (let i = 0; i < 30; i++) {
-				try {
-					const check = execSync(`osascript -e 'tell application "System Events" to return (count of windows of process "zoom.us")'`, { timeout: 3_000 }).toString().trim();
-					if (parseInt(check) > 0) { zoomReady = true; break; }
-				} catch {}
-				await new Promise(r => setTimeout(r, 1000));
-			}
-
-			if (shareScreen && zoomReady) {
-				console.log(`${ts()} [Summon] Zoom ready — sharing screen...`);
-				try {
-					// Pure keyboard: Cmd+Shift+S opens share dialog, Tab to Share button, Enter to confirm
-					execSync(`osascript -e '
-						tell application "zoom.us" to activate
-						delay 2
-						tell application "System Events"
-							tell process "zoom.us"
-								keystroke "s" using {command down, shift down}
-							end tell
-						end tell
-						delay 3
-						-- Tab to the Share button and press Enter
-						tell application "System Events"
-							keystroke tab
-							delay 0.3
-							keystroke return
-						end tell
-					'`, { timeout: 15_000 });
-					console.log(`${ts()} [Summon] Screen share started`);
-					// Handle "audio conference" panel after screen share
-					await new Promise(r => setTimeout(r, 2000));
-					if (dialIn) {
-						// Phone handles audio — dismiss the panel
-						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										repeat with w in windows
-											if name of w contains "audio conference" then
-												set focused of w to true
-												keystroke "w" using command down
-												return "closed"
-											end if
-										end repeat
-										return "not found"
-									end tell
-								end tell
-							'`, { timeout: 5_000 });
-							console.log(`${ts()} [Summon] Audio conference panel dismissed (phone handles audio)`);
-						} catch {
-							console.log(`${ts()} [Summon] No audio conference panel to dismiss`);
-						}
-					} else {
-						// No phone — join computer audio
-						try {
-							execSync(`osascript -e '
-								tell application "System Events"
-									tell process "zoom.us"
-										repeat with w in windows
-											if name of w contains "audio conference" then
-												try
-													click button "Join with Computer Audio" of w
-													return "joined computer audio"
-												end try
-												repeat with b in buttons of w
-													if name of b contains "Computer Audio" then
-														click b
-														return "joined computer audio"
-													end if
-												end repeat
-												set focused of w to true
-												keystroke "w" using command down
-												return "closed (no computer audio button)"
-											end if
-										end repeat
-										return "not found"
-									end tell
-								end tell
-							'`, { timeout: 5_000 });
-							console.log(`${ts()} [Summon] Audio conference panel — joined computer audio`);
-						} catch {
-							console.log(`${ts()} [Summon] No audio conference panel found`);
-						}
-					}
-				} catch (err) {
-					console.log(`${ts()} [Summon] Screen share failed: ${err}`);
-				}
-			} else if (shareScreen) {
-				console.log(`${ts()} [Summon] Zoom window not detected after 30s — skipping screen share`);
-			}
-
-			return {
-				status: 'summoned',
-				meetingId: cleanId,
-				screenShare: shareScreen,
-				phoneAgent: phoneJoined,
-				instruction: phoneJoined
-					? 'Screen is shared and Sutando is dialing in via phone. Voice stays connected.'
-					: 'Zoom meeting joined with screen sharing and computer audio. Voice stays connected.',
-			};
-		} catch (err) {
-			return { error: `Summon failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// Join Zoom via desktop app + computer audio (no screen share)
-export const joinZoomTool: ToolDefinition = {
-	name: 'join_zoom',
-	description: 'Join a Zoom meeting via the desktop app with computer audio. No screen sharing. Use when user says "join the zoom", "join meeting", or provides a Zoom meeting ID.',
-	parameters: z.object({
-		meetingId: z.string().optional().describe('Zoom meeting ID. Omit for personal room.'),
-		passcode: z.string().optional().describe('Meeting passcode. Omit for personal room.'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { meetingId, passcode } = args as { meetingId?: string; passcode?: string };
-		const pwd = passcode ?? ZOOM_PASSCODE;
-		const cleanId = (meetingId ?? ZOOM_PMI).replace(/\D/g, '');
-		if (!cleanId || cleanId.length < 6) return { error: `Invalid meeting ID: "${meetingId}"` };
-
-		try {
-			// Check if already in meeting
-			let alreadyIn = false;
-			try {
-				const winNames = execSync(`osascript -e 'tell application "System Events" to return name of every window of process "zoom.us"'`, { timeout: 3_000 }).toString().trim();
-				alreadyIn = winNames.includes('Zoom Meeting') || winNames.includes('zoom share');
-			} catch {}
-
-			if (!alreadyIn) {
-				const zoomRunning = (() => { try { execSync('pgrep -f "zoom.us"', { timeout: 2_000 }); return true; } catch { return false; } })();
-				if (zoomRunning) {
-					execSync(`open "https://zoom.us/j/${cleanId}${pwd ? '?pwd=' + pwd : ''}"`, { timeout: 10_000 });
-				} else {
-					let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-					if (pwd) zoomUrl += `&pwd=${pwd}`;
-					execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
-				}
-
-				// Click Join button if preview window appears
-				await new Promise(r => setTimeout(r, 3000));
-				try {
-					execSync(`/usr/bin/python3 -c "
-import Quartz, subprocess, time
-result = subprocess.run(['osascript', '-e', '''
-tell application \\\"zoom.us\\\" to activate
-tell application \\\"System Events\\\"
-    tell process \\\"zoom.us\\\"
-        repeat with w in windows
-            try
-                set wName to name of w
-                if wName contains \\\"Meeting\\\" or wName contains \\\"Personal\\\" then
-                    set wPos to position of w
-                    set wSize to size of w
-                    return (item 1 of wPos as text) & \\\",\\\" & (item 2 of wPos as text) & \\\",\\\" & (item 1 of wSize as text) & \\\",\\\" & (item 2 of wSize as text)
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-'''], capture_output=True, text=True)
-if result.stdout.strip():
-    parts = result.stdout.strip().split(',')
-    x, y, w, h = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
-    bx = x + w * 0.5
-    by = y + h * 0.85
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    time.sleep(0.05)
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (bx, by), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-"`, { timeout: 15_000 });
-				} catch {}
-
-				// Handle "Continue without audio?" dialog if it appears
-				await new Promise(r => setTimeout(r, 1500));
-				try {
-					execSync(`osascript -e '
-						tell application "System Events"
-							tell process "zoom.us"
-								repeat with w in windows
-									if name of w contains "without audio" then
-										click button 1 of w
-										return "dismissed"
-									end if
-								end repeat
-							end tell
-						end tell
-					'`, { timeout: 3_000 });
-				} catch {}
-			}
-
-			// Click "Join with Computer Audio"
-			await new Promise(r => setTimeout(r, 1000));
-			try {
-				execSync(`osascript -e '
-					tell application "zoom.us" to activate
-					delay 0.5
-					tell application "System Events"
-						tell process "zoom.us"
-							repeat with w in windows
-								if name of w is "Join audio" then
-									try
-										click button "Join with Computer Audio" of w
-										return "joined"
-									end try
-									repeat with b in buttons of w
-										if name of b contains "Computer Audio" then
-											click b
-											return "joined"
-										end if
-									end repeat
-								end if
-							end repeat
-						end tell
-					end tell
-				'`, { timeout: 5_000 });
-				console.log(`${ts()} [join_zoom] Joined computer audio`);
-			} catch {}
-
-			// Handle "audio conference" variant
-			await new Promise(r => setTimeout(r, 500));
-			try {
-				execSync(`osascript -e '
-					tell application "System Events"
-						tell process "zoom.us"
-							repeat with w in windows
-								if name of w contains "audio conference" then
-									try
-										click button "Join with Computer Audio" of w
-										return "joined"
-									end try
-									repeat with b in buttons of w
-										if name of b contains "Computer Audio" then
-											click b
-											return "joined"
-										end if
-									end repeat
-								end if
-							end repeat
-						end tell
-					end tell
-				'`, { timeout: 5_000 });
-			} catch {}
-
-			return { status: 'joined', meetingId: cleanId, method: 'computer_audio', instruction: 'Joined Zoom with computer audio. No screen sharing.' };
-		} catch (err) {
-			return { error: `join_zoom failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// Join Google Meet via browser + computer audio
-export const joinGmeetTool: ToolDefinition = {
-	name: 'join_gmeet',
-	description: 'Join a Google Meet meeting via browser with computer audio. Use when user says "join the meet" or provides a Google Meet link/code.',
-	parameters: z.object({
-		meetingCode: z.string().describe('Google Meet code (e.g., "abc-defg-hij") or full URL'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { meetingCode } = args as { meetingCode: string };
-		// Extract code from URL or use as-is
-		const code = meetingCode.replace(/^https?:\/\/meet\.google\.com\//, '').replace(/\?.*$/, '').trim();
-		if (!code) return { error: 'Invalid meeting code' };
-
-		const meetUrl = `https://meet.google.com/${code}`;
-
-		try {
-			// Open in Chrome
-			execSync(`open -a "Google Chrome" "${meetUrl}"`, { timeout: 10_000 });
-			console.log(`${ts()} [join_gmeet] Opened ${meetUrl} in Chrome`);
-
-			// Wait for page to load
-			await new Promise(r => setTimeout(r, 5000));
-
-			// Focus the Meet tab and disable camera on preview screen
-			try {
-				execSync(`osascript -e '
-					tell application "Google Chrome"
-						set windowList to every window
-						repeat with w in windowList
-							set tabList to every tab of w
-							set tabIdx to 1
-							repeat with t in tabList
-								if URL of t contains "meet.google.com" then
-									set active tab index of w to tabIdx
-									set index of w to 1
-									activate
-									return "focused"
-								end if
-								set tabIdx to tabIdx + 1
-							end repeat
-						end repeat
-					end tell
-				'`, { timeout: 5_000 });
-			} catch {}
-
-			// Disable camera by clicking the camera toggle button on the preview
-			// The button is in the center-bottom of the preview area
-			await new Promise(r => setTimeout(r, 1000));
-			try {
-				execSync(`/usr/bin/python3 -c "
-import Quartz, subprocess, time
-
-# Get Chrome window position and size
-result = subprocess.run(['osascript', '-e', '''
-tell application \\\"System Events\\\"
-    tell process \\\"Google Chrome\\\"
-        set winPos to position of front window
-        set winSize to size of front window
-        return (item 1 of winPos as text) & \\\",\\\" & (item 2 of winPos as text) & \\\",\\\" & (item 1 of winSize as text) & \\\",\\\" & (item 2 of winSize as text)
-    end tell
-end tell
-'''], capture_output=True, text=True, timeout=5)
-
-if result.stdout.strip():
-    parts = result.stdout.strip().split(',')
-    wx, wy, ww, wh = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
-    # Camera button is roughly at 36% across, 68% down in the window
-    cx = wx + ww * 0.36
-    cy = wy + wh * 0.68
-    # Click the camera button
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (cx, cy), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    time.sleep(0.05)
-    evt = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (cx, cy), 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
-    print(f'Clicked camera at ({cx},{cy})')
-"`, { timeout: 10_000 });
-				console.log(`${ts()} [join_gmeet] Camera button clicked`);
-			} catch { console.log(`${ts()} [join_gmeet] Could not click camera button`); }
-
-			await new Promise(r => setTimeout(r, 500));
-
-			// Click Join now button
-			try {
-				execSync(`osascript -e '
-					tell application "Google Chrome"
-						tell active tab of front window
-							execute javascript "
-								const btns = document.querySelectorAll(\\\"button\\\");
-								for (const b of btns) {
-									if (b.textContent.includes(\\\"Join now\\\") || b.textContent.includes(\\\"Ask to join\\\")) {
-										b.click();
-										\\\"clicked\\\";
-									}
-								}
-							"
-						end tell
-					end tell
-				'`, { timeout: 10_000 });
-				console.log(`${ts()} [join_gmeet] Clicked Join button`);
-			} catch {
-				await new Promise(r => setTimeout(r, 3000));
-				try {
-					execSync(`osascript -e '
-						tell application "Google Chrome"
-							tell active tab of front window
-								execute javascript "
-									const btns = document.querySelectorAll(\\\"button\\\");
-									for (const b of btns) {
-										if (b.textContent.includes(\\\"Join now\\\") || b.textContent.includes(\\\"Ask to join\\\")) {
-											b.click();
-											\\\"clicked\\\";
-										}
-									}
-								"
-							end tell
-						end tell
-					'`, { timeout: 10_000 });
-				} catch {}
-			}
-
-			return { status: 'joined', meetingCode: code, method: 'browser_audio', instruction: 'Joined Google Meet via browser with computer audio. Camera off.' };
-		} catch (err) {
-			return { error: `join_gmeet failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
-
-// --- Meeting ID lookup (inline, bypasses task bridge) ---
-
-export const lookupMeetingIdTool: ToolDefinition = {
-	name: 'lookup_meeting_id',
-	description:
-		'Look up the Zoom personal meeting ID from the environment. Instant — does NOT go through the task bridge. ' +
-		'Use for: "what\'s the Zoom meeting ID", "find the meeting ID", "get the Zoom ID".',
+		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
+		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
+		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
+		'a fallback when unsure what the user wants; fire nothing instead.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
-		const meetingId = process.env.ZOOM_PERSONAL_MEETING_ID;
-		if (!meetingId) {
-			return { error: 'No ZOOM_PERSONAL_MEETING_ID found in environment.' };
+		try {
+			// core-status.json is per-user runtime state under <workspace>/state/
+			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
+			// statusReadPath falls back to the legacy workspace-root location for one release.
+			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
+			const queued = readQueueDepth(WORKSPACE_DIR);
+			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
+			if (!existsSync(corePath)) {
+				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
+			}
+			const raw = readFileSync(corePath, 'utf-8');
+			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
+			const nowSec = Math.floor(Date.now() / 1000);
+			const ageSec = typeof s.ts === 'number' ? nowSec - s.ts : null;
+			if (s.status === 'running' && ageSec !== null && ageSec < 600) {
+				return {
+					status: 'running',
+					step: s.step || '(no step label)',
+					ageSec,
+					queued,
+					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
+				};
+			}
+			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
+		} catch (e) {
+			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
-		const passcode = process.env.ZOOM_PERSONAL_PASSCODE || process.env.ZOOM_PASSCODE || null;
-		console.log(`${ts()} [LookupMeetingId] found: ${meetingId}${passcode ? ' (with passcode)' : ''}`);
-		return { meetingId, passcode, source: 'ZOOM_PERSONAL_MEETING_ID from .env', instruction: passcode ? `Meeting ID: ${meetingId}, Passcode: ${passcode}. Include BOTH when telling someone to join.` : `Meeting ID: ${meetingId}. No passcode needed.` };
 	},
 };
 
-// --- Contact lookup + phone call (inline, bypasses task bridge) ---
 
-export const callContactTool: ToolDefinition = {
-	name: 'call_contact',
+// Slide control — navigate presentation slides
+export const slideControlTool: ToolDefinition = {
+	name: 'slide_control',
 	description:
-		'Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. ' +
-		'Use for ANY contact lookup or phone call — "find Bob\'s number", "call Mary", "look up Susan\'s phone".',
+		'Control presentation slides. Use when user says "next slide", "previous slide", "go back", "go to slide 3". ' +
+		'Mutates the active slide via DOM (Chrome execute javascript) — works regardless of which element has focus, ' +
+		'so it is safe to call even when a textarea or contenteditable on the deck has focus (e.g. live-edit demos). ' +
+		'PREFER this over press_key("leftarrow"/"rightarrow"/"space") for slide navigation: arrow / space keystrokes ' +
+		'get captured by focused editables (cursor moves within the field) and may be suppressed by deck-side ' +
+		'focus-guard handlers — slide_control sidesteps both.',
 	parameters: z.object({
-		name: z.string().describe('Contact name to search for (e.g. "Bob", "Mary Smith")'),
-		message: z.string().optional().describe('What to tell the person. They have no tools — include all details they might need.'),
+		action: z.enum(['next', 'previous', 'goto']).describe('Navigation action'),
+		slideNumber: z.number().optional().describe('Slide number for goto action'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { name, message } = args as { name: string; message?: string };
+		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		if (!isMacOS()) return macOSOnlyError('slide_control');
 		try {
-			// Ensure Contacts.app is running
-			execSync('open -ga Contacts', { timeout: 5_000 });
-
-			// Search contacts via AppleScript — use first name for fuzzy matching
-			// (voice transcription often garbles last names, e.g. "Gmeets" vs "GMeet")
-			const firstName = name.split(/\s+/)[0];
-			const safeName = firstName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			const script = `tell application "Contacts"
-	set output to ""
-	set results to (every person whose name contains "${safeName}")
-	if (count of results) > 10 then set results to items 1 thru 10 of results
-	repeat with p in results
-		set pName to name of p
-		set pPhones to ""
-		repeat with ph in phones of p
-			set pPhones to pPhones & (value of ph) & ","
+			// All slide navigation uses DOM manipulation for reliability, and is
+			// LAYOUT-AGNOSTIC: it addresses slides by VISUAL POSITION (1-indexed) via the
+			// deck's live querySelectorAll('.slide') order — never by id="s"+N. The deck
+			// owns its own id-map; slide IDs are non-contiguous and deck-specific, so
+			// id-based addressing would silently misroute "go to slide N" cues. Reading the
+			// live .slide DOM keeps this tool correct across any deck with no per-deck edits.
+			let js: string;
+			if (action === 'goto' && slideNumber) {
+				js = `var ss=document.querySelectorAll(\\".slide\\");for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};var idx=${slideNumber}-1;if(idx>=0&&idx<ss.length){ss[idx].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(${slideNumber})}`;
+			} else {
+				// next/previous: read current slide number, compute target visual position, set it.
+				const dir = action === 'next' ? 1 : -1;
+				js = `var cur=parseInt(document.getElementById(\\"cur\\").textContent)||1;var ss=document.querySelectorAll(\\".slide\\");var total=ss.length;var next=((cur-1+${dir}+total)%total)+1;for(var j=0;j<ss.length;j++){ss[j].classList.remove(\\"active\\")};ss[next-1].classList.add(\\"active\\");document.getElementById(\\"cur\\").textContent=String(next)`;
+			}
+			const script = `tell application "Google Chrome"
+	repeat with w in windows
+		set tabList to tabs of w
+		repeat with i from 1 to count of tabList
+			if URL of item i of tabList contains "index-sutando" or URL of item i of tabList contains "localhost:8888" or URL of item i of tabList contains "localhost:7877" or URL of item i of tabList contains "iclr-slides" then
+				tell item i of tabList to execute javascript "${js}"
+				return "done"
+			end if
 		end repeat
-		set output to output & pName & "|||" & pPhones & "\\n"
 	end repeat
-	return output
 end tell`;
-			const raw = execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15_000 }).toString().trim();
-
-			// Parse results
-			const contacts: { name: string; phones: string[] }[] = [];
-			for (const line of raw.split('\n')) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				const parts = trimmed.split('|||');
-				if (parts.length < 2) continue;
-				const cName = parts[0].trim();
-				const phones = parts[1].split(',').map(p => p.trim()).filter(Boolean);
-				if (phones.length > 0) contacts.push({ name: cName, phones });
-			}
-
-			if (contacts.length === 0) {
-				console.log(`${ts()} [CallContact] no contacts with phone found for "${name}"`);
-				return { error: `No contacts with a phone number found for "${name}". Ask the user for the number or a different name.` };
-			}
-
-			if (contacts.length > 1) {
-				console.log(`${ts()} [CallContact] multiple matches for "${name}": ${contacts.map(c => c.name).join(', ')}`);
-				return {
-					status: 'multiple_matches',
-					matches: contacts.map(c => ({ name: c.name, phones: c.phones })),
-					instruction: 'Multiple contacts found. Ask the user which one to call.',
-				};
-			}
-
-			// Single match — look up and call
-			const contact = contacts[0];
-			const phone = contact.phones[0];
-
-			const purpose = message || `Calling ${contact.name}`;
-
-			console.log(`${ts()} [CallContact] calling ${contact.name}`);
-			const res = await fetch(`http://localhost:${PHONE_PORT}/call`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ to: phone, message: purpose }),
-			});
-			const data = await res.json() as { callSid?: string; status?: string; error?: string };
-
-			if (!res.ok) {
-				return { error: `Phone server error: ${data.error || res.statusText}` };
-			}
-
-			console.log(`${ts()} [CallContact] call started: ${data.callSid}, purpose: ${purpose}`);
-			return { status: 'calling', contact: contact.name, callSid: data.callSid, messageSent: purpose };
+			execFileSync('osascript', ['-e', script], { timeout: 15_000 });
+			console.log(`${ts()} [Slides] ${action}${slideNumber ? ` → slide ${slideNumber}` : ''}`);
+			return { status: 'done', action, slideNumber };
 		} catch (err) {
-			return { error: `call_contact failed: ${err instanceof Error ? err.message : err}` };
+			return { error: `Slide control failed: ${err instanceof Error ? err.message : err}` };
 		}
+	},
+};
+
+// Toggle fullscreen on whatever app the user is currently looking at — generic.
+// Picks the frontmost app, skips Zoom (which steals focus during screen share),
+// and routes Cmd+Ctrl+F (macOS standard fullscreen) directly to that app's
+// process. Process-explicit routing bypasses the keystroke focus race that
+// otherwise defeats fullscreen during a Zoom screen-share.
+export const fullscreenTool: ToolDefinition = {
+	name: 'fullscreen',
+	description:
+		'Toggle fullscreen on whatever app the user is currently looking at — generic, works for the slide deck (Chrome) AND any other window (QuickTime, VSCode, Slack, etc). Skips Zoom when it has focus during screen-share. Use when user says "fullscreen", "enter fullscreen", "exit fullscreen", "make it full screen", "full screen". DO NOT call open_file with fullscreen=true to enter fullscreen on an already-open video — call this tool instead.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		if (!isMacOS()) return macOSOnlyError('fullscreen');
+		try {
+			const script = `
+tell application "System Events"
+	-- Find the user's actual focus target. During Zoom screen share, Zoom's
+	-- floating control bar can be the frontmost UI even when the user is
+	-- interacting with a different window — skip Zoom and pick the next
+	-- visible app the user was using.
+	set frontApp to name of first application process whose frontmost is true
+	if frontApp contains "zoom" then
+		set candidates to name of every application process whose visible is true and (name does not contain "zoom") and background only is false
+		if (count of candidates) > 0 then
+			set frontApp to item 1 of candidates
+		end if
+	end if
+end tell
+tell application frontApp to activate
+delay 0.2
+-- Cmd+Ctrl+F is the macOS standard fullscreen keystroke and works for every
+-- native + browser window (QuickTime, Chrome, VSCode, Slack, Mail, etc).
+-- Route through the target process explicitly — that bypasses the focus
+-- race that defeats a plain System Events keystroke when Zoom or another
+-- overlay app holds keyboard focus through the activate.
+tell application "System Events"
+	tell process frontApp
+		keystroke "f" using {command down, control down}
+	end tell
+end tell
+return frontApp`;
+			const target = execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 5_000 }).toString().trim();
+			console.log(`${ts()} [Fullscreen] Toggled ${target}`);
+			return { status: 'toggled', target };
+		} catch (err) {
+			return { error: `Fullscreen toggle failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// --- Chat task creation (future hook) ------------------------------------------
+// Definition kept here for when /chat gets a tool-calling surface (SSE wiring +
+// UI handler). Currently NOT registered in inlineTools / ownerOnlyTools because
+// no caller in the architecture can reach it — /chat connects to agent-api, not
+// voice-agent. The active chat-path tracking is the shell snippet in CLAUDE.md.
+// See round-5 discussion on PR #695 for the architectural analysis.
+export const createChatTaskTool: ToolDefinition = {
+	name: 'create_chat_task',
+	description:
+		'Create a tracked task entry for the /chat web UI route. ' +
+		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
+		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
+		'Voice tasks have their own tracking (source: voice).',
+	parameters: z.object({
+		task: z.string().describe('Description of the task being tracked'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { task } = args as { task: string };
+		const { writeChatTask } = await import('./task-bridge.js');
+		const taskId = writeChatTask(task);
+		return { status: 'created', taskId, message: `Chat task created: ${taskId}` };
 	},
 };
 
 /** All inline tools — import and spread into your tools list */
-export const inlineTools = [
-	scrollTool, switchTabTool, openUrlTool,
+// ─── Notes tools ─────────────────────────────────────────
+// Resolve at module-init: $SUTANDO_MEMORY_DIR/notes (canonical) when set
+// (legacy $SUTANDO_PRIVATE_DIR honored via sharedPersonalPath()), else
+// <workspace>/notes fallback. Notes are SHARED across the fleet so they live
+// at the top-level memory dir, not under machine-<host>/.
+import { sharedPersonalPath, memoryDirEnv, readCaptureToken, expandHome } from './util_paths.js';
+const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
+
+export const showViewTool: ToolDefinition = {
+	name: 'show_view',
+	description: 'Switch the web UI to a specific view. Use when user says "show notes", "show tasks", "show activity", etc.',
+	parameters: z.object({
+		view: z.enum(['starter', 'tasks', 'notes', 'questions', 'activity']).describe('Which view to show'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { view } = args as { view: string };
+		const dcPath = statusPath('dynamic-content.json', WORKSPACE_DIR);
+		writeFileSync(dcPath, JSON.stringify({ type: 'view', view }));
+		// Auto-clear after 3 seconds so it doesn't persist
+		setTimeout(() => { try { unlinkSync(dcPath); } catch {} }, 3000);
+		const labels: Record<string, string> = { starter: 'home', tasks: 'tasks', notes: 'notes', questions: 'questions', activity: 'activity' };
+		return { status: 'ok', message: `Showing ${labels[view] || view}` };
+	},
+};
+
+export const readNoteTool: ToolDefinition = {
+	name: 'read_note',
+	description: 'Read a specific note by name or slug. Speak the content to the user.',
+	parameters: z.object({
+		name: z.string().describe('Note name or slug to search for'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { name } = args as { name: string };
+		try {
+			const files = readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
+			const query = name.toLowerCase().replace(/\s+/g, '-');
+			const match = files.find(f => f.toLowerCase().includes(query));
+			if (!match) return { error: `No note matching "${name}" found` };
+			let content = readFileSync(join(NOTES_DIR, match), 'utf-8');
+			content = content.replace(/^---[\s\S]*?---\n/, ''); // strip frontmatter
+			return { title: match.replace('.md', ''), content: content.slice(0, 2000) };
+		} catch (e) { return { error: String(e) }; }
+	},
+};
+
+export const saveNoteTool: ToolDefinition = {
+	name: 'save_note',
+	description: 'Save a note. Use for "take a note", "remember this", "save this".',
+	parameters: z.object({
+		title: z.string().describe('Short title for the note'),
+		content: z.string().describe('The note content'),
+		tags: z.string().optional().describe('Comma-separated tags'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { title, content, tags } = args as { title: string; content: string; tags?: string };
+		const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+		const date = new Date().toISOString().slice(0, 10);
+		const tagList = tags ? tags.split(',').map(t => t.trim()) : ['personal'];
+		const md = `---\ntitle: ${title}\ndate: ${date}\ntags: [${tagList.join(', ')}]\n---\n\n${content}\n`;
+		try {
+			// NOTES_DIR resolves against the workspace, which may not have a
+			// notes/ subdir yet on a fresh install — create it before writing
+			// so the first save_note never fails with ENOENT.
+			mkdirSync(NOTES_DIR, { recursive: true });
+			writeFileSync(join(NOTES_DIR, `${slug}.md`), md);
+			return { status: 'saved', title, slug, path: `notes/${slug}.md` };
+		} catch (e) { return { error: String(e) }; }
+	},
+};
+
+export const deleteNoteTool: ToolDefinition = {
+	name: 'delete_note',
+	description: 'Delete a specific note by name or slug.',
+	parameters: z.object({
+		name: z.string().describe('Note name or slug to delete'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { name } = args as { name: string };
+		try {
+			const files = readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
+			const query = name.toLowerCase().replace(/\s+/g, '-');
+			const match = files.find(f => f.toLowerCase().includes(query));
+			if (!match) return { error: `No note matching "${name}" found` };
+			unlinkSync(join(NOTES_DIR, match));
+			return { status: 'deleted', title: match.replace('.md', '') };
+		} catch (e) { return { error: String(e) }; }
+	},
+};
+
+// --- Voice session context (Chi 2026-05-13: voice agent loses context across turns) ---
+//
+// Background: voice-agent's Gemini context window is independent from core's. After
+// ~10 minutes of turns earlier transcript rolls off and voice "forgets" specifics
+// like "the post" or "Mini Draft A". The fix is a small JSON file at
+// `state/voice-session-context.json` that core writes whenever a durable decision
+// lands (active draft, pending paste, today's selected option). Voice can ask for
+// the file's contents at any time via `recent_context`.
+//
+// Schema (informal):
+//   {
+//     "updated_at": "<ISO ts>",
+//     "active_drafts": [
+//       { "name": "Mini Draft A", "summary": "...", "path": "/tmp/sutando-draft.txt" }
+//     ],
+//     "pending_action": { "kind": "paste", "what": "Mini Draft A", "where": "Cursor / X compose" } | null,
+//     "last_results": [
+//       { "task_id": "task-...", "subject": "DeepMind post drafted", "ts": "<ISO>" }
+//     ]
+//   }
+//
+// Core writes the file by direct fs operations — no inline tool needed for the writer
+// path (core is this Claude Code session and already has fs access). The tool here
+// is the READ path that voice-agent's Gemini can call when it senses confusion
+// ("what was the post we picked?" / "what's pending?").
+
+const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
+
+// Anything older than this is almost certainly a PREVIOUS session's context.
+// The file exists to bridge voice's ~10-minute Gemini window inside one live
+// session, so a multi-hour gap means the session that wrote it is long gone.
+export const VOICE_CONTEXT_STALE_HOURS = 6;
+
+// Clocks between the writing process and the reading one disagree by seconds in
+// practice. Inside this window a future timestamp is ordinary skew and the age is
+// clamped to 0; beyond it the stamp is untrustworthy and degrades to 'unknown'.
+export const VOICE_CONTEXT_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * Stamp the context payload with its own age.
+ *
+ * WHY: the writer is a PROSE INSTRUCTION, not code — CLAUDE.md tells core to
+ * update this file "whenever a durable decision lands". That is a discipline,
+ * and disciplines lapse silently. Measured 2026-08-03: the canonical file was
+ * **97 hours old and still carried `pending_action`**, and the legacy copy was
+ * 878 hours old. `recent_context` returned both verbatim, so voice would answer
+ * "what's pending?" with a four-day-old action stated as current — while the
+ * tool's own description promises "the CURRENT voice-session context".
+ *
+ * The payload is deliberately NOT withheld when stale: dropping it would hide
+ * context that is often still correct, and the failure this guards against is
+ * voice asserting currency it cannot verify. So it returns everything and adds
+ * the one fact the caller could not otherwise know.
+ */
+export function annotateContextFreshness(
+	parsed: Record<string, unknown> | null | undefined,
+	nowMs: number = Date.now(),
+): Record<string, unknown> {
+	const base: Record<string, unknown> = { ...(parsed ?? {}) };
+	const rawTs = base.updated_at;
+	const updatedMs = typeof rawTs === 'string' ? Date.parse(rawTs) : Number.NaN;
+	if (!Number.isFinite(updatedMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context has no parseable updated_at — age unknown, so treat pending_action and active_drafts as historical unless the user confirms them.';
+		return base;
+	}
+	// A FUTURE timestamp fails both branches below unless it is caught here: the age
+	// goes negative, so it is never >= the stale threshold, and Number.isFinite() is
+	// true so it never reaches 'unknown'. A skewed or corrupt clock would therefore
+	// bypass the guard completely and let voice assert an old pending_action as
+	// current until wall time caught up — the very defect this function exists to
+	// close, through the one input I had not considered (qingyun-wu + john-the-dev,
+	// review of #2560).
+	//
+	// The tolerance matters as much as the check: machine clocks routinely disagree
+	// by seconds, so treating ANY future stamp as untrusted would flag healthy
+	// contexts and train the reader to ignore the marker. Inside the window the age
+	// is clamped to 0 (healthy, never negative); beyond it the stamp cannot be
+	// trusted at all, so it degrades to unknown rather than to fresh.
+	const ageMs = nowMs - updatedMs;
+	// Close the CLASS, not the case. The reviewed defect was a future timestamp
+	// producing a negative age that satisfied neither branch; a non-finite `nowMs`
+	// (NaN/Infinity, e.g. a caller passing a parsed value) fails both the same way
+	// and reads as fresh. Found by enumerating this function's inputs rather than
+	// waiting for a fourth review round. Any age arithmetic that is not a finite
+	// number means the age is unknowable, so it degrades to unknown — never fresh.
+	if (!Number.isFinite(ageMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context age could not be computed (the current time was not a finite value), so it ' +
+			'cannot be trusted. Treat pending_action and active_drafts as historical unless the ' +
+			'user confirms them.';
+		return base;
+	}
+	if (ageMs < -VOICE_CONTEXT_SKEW_TOLERANCE_MS) {
+		const aheadHours = Math.round((-ageMs / 3_600_000) * 10) / 10;
+		base.age_hours = Math.round((ageMs / 3_600_000) * 10) / 10;
+		base.freshness = 'unknown';
+		base.note =
+			`this context is timestamped ${aheadHours}h in the FUTURE — a skewed or corrupt clock, ` +
+			'so its age cannot be trusted. Treat pending_action and active_drafts as historical ' +
+			'unless the user confirms them.';
+		return base;
+	}
+	const ageHours = Math.max(0, ageMs) / 3_600_000;
+	base.age_hours = Math.round(ageHours * 10) / 10;
+	if (ageHours >= VOICE_CONTEXT_STALE_HOURS) {
+		base.stale = true;
+		base.note =
+			`this context is ${base.age_hours}h old — almost certainly written by an EARLIER session, ` +
+			'not the one you are in. Do not present pending_action or active_drafts as current; ' +
+			'say how old it is, or confirm with the user before acting on it.';
+	}
+	return base;
+}
+
+export const recentContextTool: ToolDefinition = {
+	name: 'recent_context',
+	description:
+		'Return the current voice-session context — active drafts, pending actions, recent task results — so you can pick up a thread even if it predates your Gemini context window. ' +
+		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
+		'Also fine to call proactively at the start of an active session to ground yourself. ' +
+		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
+		'If the file is missing or empty, returns {note: "no context recorded yet"}. ' +
+		'The response also carries age_hours, and stale:true with a note when the context predates this session. ' +
+		'Age is load-bearing: when stale is set, do NOT state pending_action or active_drafts as current — ' +
+		'say how old it is, or ask the user to confirm, before acting on it.',
+	parameters: z.object({}),
+	execution: 'inline',
+	async execute() {
+		try {
+			if (!existsSync(VOICE_SESSION_CONTEXT_PATH)) {
+				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
+			}
+			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
+			const parsed = annotateContextFreshness(JSON.parse(raw));
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, age=${parsed.age_hours ?? '?'}h${parsed.stale ? ' STALE' : ''}, ${((parsed.active_drafts as unknown[]) || []).length} drafts, ${((parsed.last_results as unknown[]) || []).length} results)`);
+			return parsed;
+		} catch (err) {
+			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
+		}
+	},
+};
+
+// IMPORTANT: Every tool defined in browser-tools.ts MUST be added to BOTH arrays below.
+// Tools not registered here are invisible to Gemini — it will hallucinate actions instead
+// of calling them (e.g. "I've closed the video" without actually closing it).
+// screenRecordTool re-added — descriptions now clearly distinguish plain recording
+// ("start recording") from narrated demo ("record for N seconds").
+//
+// Duplicate-name guard: gemini-3.1-flash-live-preview rejects duplicate tool
+// names at bidiGenerateContent setup with ws code 1011 "Internal error
+// encountered"; gemini-2.5 silently tolerated dupes (exact pattern of the
+// Apr 9 migration bug #2 + an Apr 22-23 re-occurrence after a local skill
+// re-registered an existing name). Throws loudly at module load so any
+// future collision is caught in seconds, not after the next voice-agent
+// restart fails to connect.
+function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
+	const counts = new Map<string, number>();
+	for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+	const dupes = [...counts.entries()].filter(([, n]) => n > 1).map(([name]) => name);
+	if (dupes.length > 0) {
+		throw new Error(
+			`[inline-tools] duplicate tool name(s): ${dupes.join(', ')}. ` +
+			`Gemini 3.1 Live rejects dup names at setup (1011). ` +
+			`Rename one side and retry.`
+		);
+	}
+	return tools;
+}
+
+// Load tools from any skill that has a `manifest.json` with "enabled": true.
+// Manifest shape:
+//   { "name": "skill-name", "enabled": true, "access_tier": "owner",
+//     "tools": "./tools.ts", "config": { "ENV_VAR": "value" } }
+// - "enabled": false (or missing) → skill skipped
+// - "tools" path → dynamic-imported, expects `export const tools: ToolDefinition[]`
+// - "config" entries → surfaced to process.env (only set if not already defined)
+// Originally added 2026-04-20, accidentally stripped by PR #505 (dup-name guard
+// commit). Restored 2026-04-25 after the iclr-highlight skill went silent on
+// the autonav cue — voice-agent had no way to call highlight_slide because the
+// skill's tools were never being merged into inlineTools.
+// Split by manifest `access_tier` so phone-conversation can include
+// owner-tier tools only when the caller is the verified owner. Manifest
+// access_tier values: "owner" (default if omitted) | "any_caller".
+// OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
+// session so the skill registers session handlers without importing core.
+export type { SkillSetupCtx, SkillSetup, VoiceSurfaceContribution, VoiceSurfaceHook } from './skill-setup-runner.js';
+import { collectVoiceSurface } from './skill-setup-runner.js';
+import type { SkillSetup, VoiceSurfaceHook } from './skill-setup-runner.js';
+
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[]; voiceSurfaces: VoiceSurfaceHook[] }> {
+	// Scan the public-repo `skills/` dir, the per-user workspace
+	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
+	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
+	// honored via memoryDirEnv(); e.g. `~/.sutando/memory-sync/skills/`). The
+	// private dir lets users keep personal tooling with real per-file git
+	// history outside the public repo. Order: public first, then workspace,
+	// then private — last-write-wins for same-name skills.
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
+	const privateRoot = memoryDirEnv();
+	if (privateRoot) {
+		const expanded = expandHome(privateRoot);
+		dirsToScan.push(join(expanded, 'skills'));
+	}
+	// External plugin checkouts: an optional voice-surface plugin can live
+	// ENTIRELY in its own sibling repo, so this host keeps no in-repo copy and
+	// names no plugin. Mirrors src/discord-bridge.py's hook loader — scan
+	// $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated) + every sibling
+	// checkout's skills/. The dedupe-by-name below makes a stray duplicate safe.
+	for (const d of (process.env.SUTANDO_EXTERNAL_PLUGIN_DIRS || '').split(delimiter)) {
+		if (d.trim()) dirsToScan.push(join(d.trim(), 'skills'));
+	}
+	try {
+		const siblingsRoot = dirname(REPO_ROOT); // dir holding sibling checkouts
+		const ownSkills = join(REPO_ROOT, 'skills');
+		for (const sib of readdirSync(siblingsRoot)) {
+			const sibSkills = join(siblingsRoot, sib, 'skills');
+			if (sibSkills !== ownSkills && existsSync(sibSkills)) dirsToScan.push(sibSkills);
+		}
+	} catch { /* siblings root unreadable — skip */ }
+	const owner: ToolDefinition[] = [];
+	const anyCaller: ToolDefinition[] = [];
+	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
+	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
+	const setups = new Map<string, SkillSetup>();
+	const voiceSurfaces = new Map<string, VoiceSurfaceHook>();
+	for (const skillsDir of dirsToScan) {
+		if (!existsSync(skillsDir)) continue;
+		let dirs: string[];
+		try {
+			dirs = readdirSync(skillsDir).filter(n => {
+				try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
+			});
+		} catch { continue; }
+		for (const dirName of dirs) {
+			const manifestPath = join(skillsDir, dirName, 'manifest.json');
+			if (!existsSync(manifestPath)) continue;
+			let manifest: { enabled?: boolean; tools?: string; config?: Record<string, string>; name?: string; access_tier?: string };
+			try {
+				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+			} catch (err) {
+				console.warn(`[skill-loader] bad manifest ${dirName} in ${skillsDir}:`, err instanceof Error ? err.message : err);
+				continue;
+			}
+			if (!manifest.enabled) continue;
+			for (const [k, v] of Object.entries(manifest.config || {})) {
+				if (process.env[k] === undefined) process.env[k] = v;
+			}
+			if (!manifest.tools) continue;
+			const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
+			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
+			try {
+				// @ts-ignore — dynamic relative import resolved at runtime by tsx
+				// Node's ESM loader rejects raw Windows drive paths (`Q:\...`)
+				// because it interprets the drive letter as a URL scheme. A
+				// file URL works on every platform and preserves spaces safely.
+				const mod = await import(pathToFileURL(toolsPath).href);
+				if (Array.isArray(mod.tools)) {
+					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
+					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
+				}
+				if (typeof mod.setup === 'function') {
+					// DISCOVERY, not registration: a skill in N roots hits this line N times
+					// but registers once. The authoritative count is logged after the scan.
+					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
+					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
+				}
+				if (typeof mod.voiceSurface === 'function') voiceSurfaces.set(manifest.name || dirName, mod.voiceSurface as VoiceSurfaceHook);
+			} catch (err) {
+				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
+			}
+		}
+	}
+	// Dedupe by tool name (last-write-wins, matching the public→workspace→private
+	// scan order). The SAME skill present in two scanned dirs, or two skills
+	// declaring the same tool name (e.g. summon/dismiss/copres_*), otherwise yields
+	// duplicate names → assertUniqueToolNames(inlineTools) throws at module load →
+	// Gemini 3.1 Live closes with 1011 at setup → voice / plugin surfaces can't start.
+	// See reference_gemini_1011_tool_name_conflict.
+	const dedupeByName = (arr: ToolDefinition[]): ToolDefinition[] => {
+		const byName = new Map<string, ToolDefinition>();
+		for (const t of arr) byName.set(t.name, t);
+		return [...byName.values()];
+	};
+	// One authoritative line for what actually got registered, after dedupe.
+	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()], voiceSurfaces: [...voiceSurfaces.values()] };
+}
+const personalTools = await loadSkillManifestTools();
+// Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
+const personalAllTools = (() => {
+	const seen = new Set<string>();
+	return [...personalTools.owner, ...personalTools.anyCaller].filter(t => (seen.has(t.name) ? false : (seen.add(t.name), true)));
+})();
+
+// Names of env-dependent tools (manifest-loaded per install, plus the
+// presenter-sentinel conditionals) — exported so behavior-anchor tests can
+// pin the STATIC tool surface portably (CI has no personal skill manifests;
+// see tests/voice-behavior-anchors.test.ts).
+// macOS automation only; other hosts must not be shown tools that cannot run there.
+const MACOS_ONLY_TOOLS = new Set(['press_key', 'type_text', 'volume', 'brightness', 'toggle_tasks', 'slide_control', 'fullscreen']);
+export const envDependentToolNames: ReadonlySet<string> = new Set([
+	...personalAllTools.map(t => t.name), ...MACOS_ONLY_TOOLS,
+]);
+// voice-agent invokes each once per session with {session, injectText}.
+// Empty when no skill exports setup().
+export const personalSkillSetups: SkillSetup[] = personalTools.setups;
+// Voice-session-only tools, prompt rules and context lines from skills' voiceSurface().
+export const personalVoiceSurface = collectVoiceSurface(personalTools.voiceSurfaces);
+
+// Manifest-driven discovery of skills that core (not voice-inline) runs.
+// When a manifest has `documented_for_core: true` and a `core_description`,
+// the description is exposed to voice-agent's system-prompt assembly so
+// Gemini knows the capability exists and to delegate via `work` instead
+// of saying "I can't do that". The skill itself is NOT loaded inline — it
+// stays as docs+scripts and the core agent runs it when the work-task
+// arrives. Same scan-paths as loadSkillManifestTools.
+//
+// SYNC vs ASYNC NOTE (Mini's #592 review): this helper is sync because
+// we never need to import any module — we just read manifest.json files.
+// loadSkillManifestTools is async because it dynamically `await import()`s
+// a tools.ts. Don't try to align them — they're correctly sync/async for
+// what each one does.
+function loadCoreDocumentedSkills(): { name: string; description: string }[] {
+	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
+	const privateRoot = memoryDirEnv();
+	if (privateRoot) {
+		const expanded = expandHome(privateRoot);
+		dirsToScan.push(join(expanded, 'skills'));
+	}
+	// Last-write-wins map so private (later in dirsToScan) overrides public —
+	// same precedence convention as loadSkillManifestTools above.
+	const byName = new Map<string, { name: string; description: string }>();
+	for (const skillsDir of dirsToScan) {
+		if (!existsSync(skillsDir)) continue;
+		let dirs: string[];
+		try {
+			dirs = readdirSync(skillsDir).filter(n => {
+				try { return statSync(join(skillsDir, n)).isDirectory(); } catch { return false; }
+			});
+		} catch { continue; }
+		for (const dirName of dirs) {
+			const manifestPath = join(skillsDir, dirName, 'manifest.json');
+			if (!existsSync(manifestPath)) continue;
+			let manifest: { documented_for_core?: boolean; core_description?: string; name?: string; tools?: string };
+			try {
+				manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+			} catch { continue; }
+			if (!manifest.documented_for_core || !manifest.core_description) continue;
+			// Dedup against inline-loaded skills: if the manifest also exposes
+			// a `tools:` entry, the skill is already inline-listed and
+			// double-listing here would teach Gemini both "call this inline"
+			// AND "delegate via work" simultaneously. Pick the inline path.
+			if (manifest.tools) continue;
+			const name = manifest.name || dirName;
+			byName.set(name, { name, description: manifest.core_description });
+		}
+	}
+	return Array.from(byName.values());
+}
+export const coreDocumentedSkills = loadCoreDocumentedSkills();
+
+export function forHostPlatform<T extends { name: string }>(tools: T[], platform: NodeJS.Platform = process.platform): T[] {
+	return platform === 'darwin' ? tools : tools.filter(t => !MACOS_ONLY_TOOLS.has(t.name));
+}
+
+export const inlineTools = forHostPlatform(assertUniqueToolNames([
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
-	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, summonTool,
-	joinZoomTool, joinGmeetTool, lookupMeetingIdTool, callContactTool,
-];
+	cancelTaskTool, toggleTasksTool, getCurrentTimeTool, getCoreStatusTool,
+	joinGmeetTool, lookupMeetingIdTool, callContactTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	recentContextTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	switchVoiceConfigTool,
+	...personalAllTools ]));
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
 	getCurrentTimeTool,
+	getCoreStatusTool,
+	...personalTools.anyCaller,
 ];
 
 /** Owner-only tools (require isOwner) */
-export const ownerOnlyTools = [
+export const ownerOnlyTools = forHostPlatform([
 	volumeTool, brightnessTool,
-	scrollTool, switchTabTool, openUrlTool,
+	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
-	clipboardTool, cancelTaskTool, toggleTasksTool, summonTool,
-	joinZoomTool, joinGmeetTool, callContactTool,
-];
+	clipboardTool, cancelTaskTool, toggleTasksTool,
+	joinGmeetTool, callContactTool, ...(_presenterActive ? [slideControlTool, fullscreenTool] : []),
+	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
+	recentContextTool,
+	describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
+	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
+	switchVoiceConfigTool,
+	...personalTools.owner,
+]);
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
 export const configurableTools = [

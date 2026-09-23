@@ -1,0 +1,274 @@
+import { describe, it, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseTmuxPane, readTmuxStatus, buildCaptureArgs, resolveSock, _resetTmuxCacheForTests } from '../src/tmux-status.js';
+
+/**
+ * Tests for `parseTmuxPane` — the pane-capture parser used as a fallback
+ * signal for `effectiveAgentState()` when `core-status.json` is stale.
+ *
+ * Observer-effect aside (noted in the design collab 2026-04-18): any harness
+ * that calls the parser while itself running under Claude Code's tmux pane
+ * will find the harness's own Bash invocation in the capture. Canned
+ * fixtures sidestep that entirely — each test passes a synthesized pane
+ * string and asserts the parser's return shape, no live CLI needed.
+ *
+ * Fixtures are inlined as TS string constants (tests/fixtures/ is gitignored
+ * per repo convention; see discussion on feat/tmux-status-fallback).
+ */
+
+// ── Fixtures (synthesized pane captures) ────────────────────────────────────
+
+const TOOL_IN_PROGRESS = `⏺ Bash(npm install 2>&1 | tail -6)
+  ⎿  Running…
+✳ Nebulizing… (16s · ↓ 111 tokens · thought for 5s)
+──── sutando-core ──
+❯ `;
+
+const TOOL_BG = `⏺ Bash(bash src/watch-tasks-stream.sh)
+  ⎿  Running in the background (↓ to manage)
+──── sutando-core ──
+❯ `;
+
+const TOOL_JUST_FINISHED = `⏺ Read(~/Desktop/sutando/README.md)
+  ⎿  Read 23 lines
+⏺ All done.
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+──── sutando-core ──
+❯ `;
+
+const IDLE_PROMPT = `⏺ All done.
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+──── sutando-core ──
+❯ `;
+
+const THINKING_ONLY = `✳ Cogitated for 7s
+──── sutando-core ──
+❯ `;
+
+const THINKING_THOUGHT_FOR = `✳ Pondering… (8s · ↓ 42 tokens · thought for 4s)
+──── sutando-core ──
+❯ `;
+
+const MULTIPLE_TOOLS_LAST_WINS = `⏺ Read(foo.ts)
+  ⎿  Read 12 lines
+⏺ Grep(pattern=\"hello\")
+  ⎿  1 match
+⏺ Edit(foo.ts)
+  ⎿  Running…
+──── sutando-core ──
+❯ `;
+
+const ALT_BULLET_GLYPH = `● WebSearch(query=\"gemini pricing\")
+  ⎿  Running in the background
+──── sutando-core ──
+❯ `;
+
+const AMBIGUOUS_UNRELATED = `some random shell output
+not a claude-code pane at all
+$ ls foo bar
+foo: no such file
+`;
+
+const EMPTY = '';
+const WHITESPACE_ONLY = '   \n\t\n  \n';
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+describe('parseTmuxPane', () => {
+	beforeEach(() => _resetTmuxCacheForTests());
+
+	it('tool-in-progress → working with tool name', () => {
+		const r = parseTmuxPane(TOOL_IN_PROGRESS);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'Bash');
+	});
+
+	it('background tool → working with tool name (not label=thinking)', () => {
+		const r = parseTmuxPane(TOOL_BG);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'Bash');
+	});
+
+	it('tool just finished (no Running/BG marker) → idle', () => {
+		const r = parseTmuxPane(TOOL_JUST_FINISHED);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('idle prompt with no tool markers → idle', () => {
+		const r = parseTmuxPane(IDLE_PROMPT);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('thinking (Cogitated for Ns) → working label=thinking', () => {
+		const r = parseTmuxPane(THINKING_ONLY);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'thinking');
+	});
+
+	it('thinking (thought for Ns) → working label=thinking', () => {
+		const r = parseTmuxPane(THINKING_THOUGHT_FOR);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'thinking');
+	});
+
+	it('multiple tools → label is the LAST tool in the pane', () => {
+		const r = parseTmuxPane(MULTIPLE_TOOLS_LAST_WINS);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'Edit');
+	});
+
+	it('alt bullet glyph (●) recognized as tool marker', () => {
+		const r = parseTmuxPane(ALT_BULLET_GLYPH);
+		assert.equal(r.state, 'working');
+		assert.equal(r.label, 'WebSearch');
+	});
+
+	it('ambiguous / non-Claude-Code output → idle (silent fallback)', () => {
+		const r = parseTmuxPane(AMBIGUOUS_UNRELATED);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('empty string → idle (never throws)', () => {
+		const r = parseTmuxPane(EMPTY);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('whitespace-only → idle', () => {
+		const r = parseTmuxPane(WHITESPACE_ONLY);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('null input → idle (defensive)', () => {
+		// @ts-expect-error — contract explicitly says never throw on malformed input
+		const r = parseTmuxPane(null);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('undefined input → idle (defensive)', () => {
+		// @ts-expect-error - deliberately passing undefined to test the defensive guard
+		const r = parseTmuxPane(undefined);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+
+	it('non-string input → idle (defensive)', () => {
+		// @ts-expect-error - deliberately passing a non-string to test the defensive guard
+		const r = parseTmuxPane(42);
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+	});
+});
+
+describe('buildCaptureArgs', () => {
+	// Regression guard: Sutando.app / start-cli.sh run tmux on a custom socket
+	// (`tmux -S /tmp/sutando-tmux.sock`). A bare `tmux capture-pane` hits the
+	// DEFAULT server, never finds `sutando-core`, throws, and the scraper falls
+	// back to `idle` on every call — so the status widget reads "idle" even
+	// while the core is working. The `-S <socket>` server flag must be present
+	// AND precede the `capture-pane` command word.
+
+	it('includes -S <socket> and it precedes capture-pane', () => {
+		const args = buildCaptureArgs('/tmp/sutando-tmux.sock', 'sutando-core');
+		const sIdx = args.indexOf('-S');
+		const capIdx = args.indexOf('capture-pane');
+		assert.notEqual(sIdx, -1, '-S socket flag must be present');
+		assert.equal(args[sIdx + 1], '/tmp/sutando-tmux.sock', '-S must be followed by the socket path');
+		assert.ok(sIdx < capIdx, '-S (server flag) must come before the capture-pane command');
+	});
+
+	it('targets the given session with -t', () => {
+		const args = buildCaptureArgs('/sock', 'my-session');
+		const tIdx = args.indexOf('-t');
+		assert.notEqual(tIdx, -1);
+		assert.equal(args[tIdx + 1], 'my-session');
+	});
+});
+
+describe('resolveSock', () => {
+	// #2087 unified start-cli.sh / main.swift / watch-tasks-stream.sh on
+	// SUTANDO_TMUX_SOCKET; SUTANDO_TMUX_SOCK is kept as a one-release fallback
+	// so a straggler setter still works.
+	const saved = {
+		SOCKET: process.env.SUTANDO_TMUX_SOCKET,
+		SOCK: process.env.SUTANDO_TMUX_SOCK,
+	};
+
+	beforeEach(() => {
+		delete process.env.SUTANDO_TMUX_SOCKET;
+		delete process.env.SUTANDO_TMUX_SOCK;
+	});
+
+	function restore() {
+		if (saved.SOCKET === undefined) delete process.env.SUTANDO_TMUX_SOCKET;
+		else process.env.SUTANDO_TMUX_SOCKET = saved.SOCKET;
+		if (saved.SOCK === undefined) delete process.env.SUTANDO_TMUX_SOCK;
+		else process.env.SUTANDO_TMUX_SOCK = saved.SOCK;
+	}
+
+	it('neither set → default socket', () => {
+		try {
+			assert.equal(resolveSock(), '/tmp/sutando-tmux.sock');
+		} finally {
+			restore();
+		}
+	});
+
+	it('legacy SUTANDO_TMUX_SOCK set → used as fallback', () => {
+		process.env.SUTANDO_TMUX_SOCK = '/tmp/legacy.sock';
+		try {
+			assert.equal(resolveSock(), '/tmp/legacy.sock');
+		} finally {
+			restore();
+		}
+	});
+
+	it('canonical SUTANDO_TMUX_SOCKET takes priority over legacy SUTANDO_TMUX_SOCK', () => {
+		process.env.SUTANDO_TMUX_SOCKET = '/tmp/canonical.sock';
+		process.env.SUTANDO_TMUX_SOCK = '/tmp/legacy.sock';
+		try {
+			assert.equal(resolveSock(), '/tmp/canonical.sock');
+		} finally {
+			restore();
+		}
+	});
+});
+
+describe('readTmuxStatus', () => {
+	beforeEach(() => _resetTmuxCacheForTests());
+
+	it('SUTANDO_TMUX_SCRAPE=0 kill-switch → idle, no cache touch', () => {
+		const prev = process.env.SUTANDO_TMUX_SCRAPE;
+		process.env.SUTANDO_TMUX_SCRAPE = '0';
+		try {
+			const r = readTmuxStatus();
+			assert.equal(r.state, 'idle');
+			assert.equal(r.label, '');
+		} finally {
+			if (prev === undefined) delete process.env.SUTANDO_TMUX_SCRAPE;
+			else process.env.SUTANDO_TMUX_SCRAPE = prev;
+		}
+	});
+
+	it('cold-start cache miss returns idle fallback without blocking for capture timeout', () => {
+		// With cache cleared and no refresh yet complete, the sync call must
+		// return with the idle fallback WITHOUT blocking on the full
+		// execFile capture — the whole point of the async refactor. The old
+		// execSync path blocked for up to CAPTURE_TIMEOUT_MS (500ms) per
+		// call; the new path fires an async refresh and returns immediately.
+		const start = Date.now();
+		const r = readTmuxStatus();
+		const elapsed = Date.now() - start;
+		assert.equal(r.state, 'idle');
+		assert.equal(r.label, '');
+		// Threshold generous for slow CI containers. The regression-signal
+		// we care about is: if this ever climbs to ~500ms, someone
+		// accidentally reverted to the sync path.
+		assert.ok(elapsed < 300, `readTmuxStatus blocked for ${elapsed}ms (should be <300ms)`);
+	});
+});
