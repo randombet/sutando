@@ -400,16 +400,17 @@ describe('applySessionContextFrame — last frame wins, a DM frame clears, notic
 	});
 });
 
-// The room notice asks for `turnComplete: false`. Whether that is silent is the
-// transport's business: the pinned Gemini transport ignores the flag.
-describe('room notices ask for an open turn', () => {
-	it('injectSilentContext sends an open turn (turnComplete=false) and reports when it cannot', () => {
-		const sent: Array<{ turns: unknown; turnComplete: unknown }> = [];
-		const session = { transport: { sendContent: (turns: unknown, turnComplete: unknown) => sent.push({ turns, turnComplete }) } };
-		assert.equal(injectSilentContext(session, '[System: hi]'), true);
-		assert.deepEqual(sent, [{ turns: [{ role: 'user', text: '[System: hi]' }], turnComplete: false }]);
-		assert.equal(injectSilentContext({ transport: { session: { sendRealtimeInput: () => {} } } }, 'x'), false,
-			'without sendContent the notice is dropped, not sent as realtime input');
+// The room notice is quiet context: it completes no turn, so it prompts no reply.
+describe('room notices are quiet context', () => {
+	it('injectSilentContext sends quiet text and reports whether it was sent', async () => {
+		const sent: Array<{ text: unknown; opts: unknown }> = [];
+		let accepted = true;
+		const session = { injectText: async (text: unknown, opts: unknown) => (sent.push({ text, opts }), accepted) };
+		assert.equal(await injectSilentContext(session, '[System: hi]'), true);
+		assert.deepEqual(sent, [{ text: '[System: hi]', opts: { mode: 'quiet' } }]);
+		accepted = false;
+		assert.equal(await injectSilentContext(session, 'x'), false,
+			'a notice the session did not send is reported, so the caller retries');
 	});
 
 	it('the frame handler acks the client and injects one context notice per change', async () => {

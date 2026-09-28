@@ -1,7 +1,8 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { ffmpegSubtitleCandidates, ffprobeCandidates, selectFfprobe } from '../src/recording-tools.js';
+import { ffmpegSubtitleCandidates, ffprobeCandidates, selectFfprobe, startRecordingNarration } from '../src/recording-tools.js';
 
 /**
  * Regression guard for the ffmpeg subtitle-probe bundled-runtime fix.
@@ -113,5 +114,33 @@ describe('selectFfprobe', () => {
 
 	it('returns the literal ffprobe when there is neither an absolute nor a bare candidate', () => {
 		assert.equal(selectFfprobe(['/opt/x/ffprobe'], () => false), 'ffprobe');
+	});
+});
+
+// Narration prompts are live input through the session, never a raw transport send.
+// Skipped while a real recording runs: its pid file would make the controller scroll the screen.
+describe('recording narration injects live text', () => {
+	const recordingLive = existsSync('/tmp/sutando-screen-record.pid');
+	it('sends the end-of-recording prompt with injectText in live mode', { skip: recordingLive && 'a screen recording is running' }, () => {
+		const calls: Array<{ text: string; opts: unknown }> = [];
+		const transportCalls: string[] = [];
+		const session = {
+			injectText: async (text: string, opts: unknown) => (calls.push({ text, opts }), true),
+			transport: {
+				session: { sendRealtimeInput: () => { transportCalls.push('sendRealtimeInput'); } },
+				sendContent: () => { transportCalls.push('sendContent'); },
+			},
+		};
+		mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+		try {
+			startRecordingNarration(session);
+			for (let ms = 0; ms < 3_600_000 && calls.length === 0; ms += 1000) mock.timers.tick(1000);
+		} finally {
+			mock.timers.reset();
+		}
+		assert.deepEqual(calls, [
+			{ text: '[System: Recording just ended. Say "The recording is complete." immediately.]', opts: { mode: 'live' } },
+		]);
+		assert.deepEqual(transportCalls, []);
 	});
 });

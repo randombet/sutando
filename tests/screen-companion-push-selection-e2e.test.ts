@@ -2,7 +2,7 @@
 // `_frameHook` in isolation. Neither it nor anything else verifies the wiring
 // this PR actually depends on: that vision-tools' `captureAndSend()` FIRES the
 // screen-companion hook AFTER sending the frame, with a working `sendUserCtx`
-// bound to `transport.sendContent`. This test drives the real capture path
+// bound to the session's quiet `injectText`. This test drives the real capture path
 // (`captureSendFrame` → `captureAndSend`) with the real registered hook and a
 // fake session, asserting a real call delivers the selected text to the model
 // in the right order (frame first, then selection). Only the unavoidable AX
@@ -43,11 +43,8 @@ test('captureAndSend fires the screen-companion hook and injects selection after
 
 	const events: string[] = [];
 	setVisionSession({
-		transport: {
-			sendFile: (_b64: string, mime: string) => events.push(`frame:${mime}`),
-			sendContent: (turns: Array<{ role: string; text: string }>) =>
-				events.push(`inject:${turns[0].text}`),
-		},
+		sendRealtimeMedia: (_b64: string, mime: string) => (events.push(`frame:${mime}`), true),
+		injectText: async (text: string, opts: { mode: string }) => (events.push(`inject:${opts.mode}:${text}`), true),
 	});
 	registerSource({
 		name: 'testsrc',
@@ -71,22 +68,20 @@ test('captureAndSend fires the screen-companion hook and injects selection after
 
 	// Three frames sent; the selection is injected exactly once, and only AFTER
 	// the third frame — proving the hook is fired by captureAndSend post-send
-	// and its sendUserCtx reaches transport.sendContent.
+	// and its sendUserCtx reaches the session's quiet injectText.
 	assert.deepEqual(events, [
 		'frame:image/jpeg',
 		'frame:image/jpeg',
 		'frame:image/jpeg',
-		'inject:[Selected text: HELLO]',
+		'inject:quiet:[Selected text: HELLO]',
 	]);
 });
 
-test('no injection when the session transport has no sendContent (graceful)', async () => {
+test('no injection when the session has no injectText (graceful)', async () => {
 	const frames: string[] = [];
 	setVisionSession({
-		transport: {
-			sendFile: (_b64: string, mime: string) => frames.push(mime),
-			// no sendContent — hook must not throw the capture path
-		},
+		sendRealtimeMedia: (_b64: string, mime: string) => (frames.push(mime), true),
+		// no injectText — hook must not throw the capture path
 	});
 	registerSource({
 		name: 'testsrc2',
@@ -102,11 +97,11 @@ test('no injection when the session transport has no sendContent (graceful)', as
 	try {
 		await pacedCapture('testsrc2');
 		await pacedCapture('testsrc2');
-		r = await pacedCapture('testsrc2'); // probe tick — would inject if sendContent existed
+		r = await pacedCapture('testsrc2'); // probe tick — would inject if injectText existed
 	} finally {
 		_resetVisionQueryDeps();
 	}
 
-	assert.equal(r?.ok, true, 'capture still succeeds without sendContent');
+	assert.equal(r?.ok, true, 'capture still succeeds without injectText');
 	assert.deepEqual(frames, ['image/jpeg', 'image/jpeg', 'image/jpeg']);
 });

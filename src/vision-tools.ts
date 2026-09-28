@@ -12,7 +12,7 @@
  * voice and phone agents.
  *
  * Frame path: source.capture() → JPEG bytes → base64 →
- * (session as any).transport.sendFile(b64, 'image/jpeg'). Gemini Live's
+ * session.sendRealtimeMedia(b64, 'image/jpeg'). Gemini Live's
  * realtime_input.video slot accepts single-frame images.
  */
 
@@ -28,7 +28,7 @@ import { createServer, type Server } from 'node:http';
 import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import type { ToolDefinition } from 'bodhi-realtime-agent';
+import type { ToolDefinition, VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 
 const execFileAsync = promisify(execFile);
@@ -354,13 +354,8 @@ function resolveSource(name?: string): VisionSource {
 // --- Session wiring -------------------------------------------------------
 
 interface MinimalSession {
-	transport?: {
-		sendFile?: (base64: string, mimeType: string) => void;
-		// turnComplete is IGNORED by the transport — it always sends realtime
-		// input, so the model may answer this injection aloud.
-		sendContent?: (turns: Array<{ role: 'user' | 'assistant'; text: string }>, turnComplete?: boolean) => void;
-		isConnected?: boolean;
-	};
+	sendRealtimeMedia?: VoiceSession['sendRealtimeMedia'];
+	injectText?: VoiceSession['injectText'];
 }
 
 let sessionRef: MinimalSession | null = null;
@@ -479,12 +474,11 @@ export function getFullToolSurface(): ToolDefinition[] {
 	return fullToolSurface;
 }
 
-function getSendFile(): ((b64: string, mime: string) => void) | null {
-	const t = sessionRef?.transport;
-	if (!t || !t.sendFile) return null;
-	// isConnected is optional — if exposed and false, skip; otherwise trust the call.
-	if (t.isConnected === false) return null;
-	return t.sendFile.bind(t);
+function getSendFile(): ((b64: string, mime: string) => boolean) | null {
+	const session = sessionRef;
+	if (!session || typeof session.sendRealtimeMedia !== 'function') return null;
+	// False when the session is not listening (transport down, transcription mode).
+	return (b64, mime) => session.sendRealtimeMedia!(b64, mime);
 }
 
 // --- Streaming controller -------------------------------------------------
@@ -601,9 +595,8 @@ function refillBucket(now: number): void {
  * awaits reconnect replay.
  */
 function visionGate(): { open: boolean; reason: string } {
-	// Same trust contract as getSendFile's isConnected: if the session
-	// exposes a state and it is not ACTIVE, gate; a session object without a
-	// sessionManager (integration fakes/bridges) is trusted.
+	// If the session exposes a state and it is not ACTIVE, gate; a session
+	// object without a sessionManager (integration fakes/bridges) is trusted.
 	const sm = (sessionRef as unknown as { sessionManager?: { state?: string } } | null)
 		?.sessionManager;
 	if (sm && sm.state !== 'ACTIVE') return { open: false, reason: `session=${sm.state ?? '?'}` };
@@ -697,11 +690,14 @@ function sendFrameGated(
 	// The residual voice-loop cost — base64 + the SDK's synchronous
 	// JSON.stringify (~1-3 ms per 720p frame at ≤1 fps) — is named in D7.4,
 	// bounded by the capture-server downscale, and covered by the budget test.
+	let accepted: boolean;
 	try {
-		sendFile(data.toString('base64'), mimeType);
+		accepted = sendFile(data.toString('base64'), mimeType);
 	} catch (err) {
 		return { ok: false, error: (err as Error)?.message ?? 'sendFile threw' };
 	}
+	// Refused while the agent was not listening: this moment's frame is dropped, never parked.
+	if (!accepted) return { ok: true, deferred: false, reason: 'not-listening' };
 	bucketBytes = Math.max(0, bucketBytes - wireBytes);
 	lastFrameSentAt = now;
 	egressStats.sent++;
@@ -710,11 +706,11 @@ function sendFrameGated(
 		console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(data.byteLength / 1024)}KB ${mimeType})`);
 	}
 	if (fireHooks && visionFrameHooks.length > 0) {
-		const transport = sessionRef?.transport;
-		if (transport && typeof transport.sendContent === 'function') {
+		const session = sessionRef;
+		if (session && typeof session.injectText === 'function') {
 			const sendUserCtx = (text: string): void => {
 				try {
-					transport.sendContent!([{ role: 'user', text }], false);
+					void session.injectText!(text, { mode: 'quiet' });
 				} catch {}
 			};
 			for (const hook of visionFrameHooks) {
@@ -811,8 +807,8 @@ export function startStreaming(
 			// registerVisionOnContributor. If no skills register, the model
 			// gets just the base note and operates in default screen-aware
 			// mode. Symmetric to the stop-side cache-clear in stopStream().
-			const transport = sessionRef?.transport;
-			if (transport && typeof transport.sendContent === 'function') {
+			const session = sessionRef;
+			if (session && typeof session.injectText === 'function') {
 				try {
 					const baseNote =
 						`[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, briefly acknowledge that you can see their shared screen and ask what they're trying to do. Keep it to one sentence. Do not describe the screen in detail unless the user asks.`;
@@ -827,7 +823,7 @@ export function startStreaming(
 					const fullText = contributions.length > 0
 						? `${baseNote}\n\n${contributions.join('\n\n')}`
 						: baseNote;
-					transport.sendContent([{ role: 'user', text: fullText }], false);
+					void session.injectText(fullText, { mode: 'quiet' });
 					console.log(`${ts()} [Vision] injected screen-share-started context hint (${contributions.length} contributor(s))`);
 				} catch (err) {
 					console.warn(`${ts()} [Vision] failed to inject screen-share-started hint: ${(err as Error).message}`);
@@ -875,18 +871,14 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	deferredSlot = null;
 	stopDrainTimer();
 	// Stale frames STAY in context — this only tells the model they are stale.
-	// turnComplete is ignored by the transport, so it may answer the hint aloud.
 	if (wasPush) {
-		const transport = sessionRef?.transport;
-		// Call as a method (not via an extracted reference) so `this` binds
-		// to the transport — GeminiLiveTransport.sendContent uses `this.session`
-		// internally and throws otherwise.
-		if (transport && typeof transport.sendContent === 'function') {
+		const session = sessionRef;
+		if (session && typeof session.injectText === 'function') {
 			try {
-				transport.sendContent([{
-					role: 'user',
-					text: '[system note] User has stopped sharing their screen. Previously-streamed video frames are stale — do not describe them as the current view. If the user now asks "what do you see", call send_vision_frame to capture a fresh image.',
-				}], false);
+				void session.injectText(
+					'[system note] User has stopped sharing their screen. Previously-streamed video frames are stale — do not describe them as the current view. If the user now asks "what do you see", call send_vision_frame to capture a fresh image.',
+					{ mode: 'quiet' },
+				);
 				console.log(`${ts()} [Vision] injected screen-share-ended context hint`);
 			} catch (err) {
 				console.warn(`${ts()} [Vision] failed to inject screen-share-ended hint: ${(err as Error).message}`);
@@ -901,7 +893,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
  *  hit /vision/start with source='browser' first. */
 export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok: boolean; deferred?: boolean; reason?: string; error?: string } {
 	if (!getSendFile()) {
-		console.warn(`${ts()} [Vision] frame dropped: no active voice session (sessionRef=${!!sessionRef}, transport=${!!sessionRef?.transport})`);
+		console.warn(`${ts()} [Vision] frame dropped: no active voice session (sessionRef=${!!sessionRef})`);
 		return { ok: false, error: 'no active voice session' };
 	}
 	if (!pushMode) {
@@ -988,12 +980,12 @@ function noteFrameFailure(msg: string): void {
 		// Tell the live session vision died, IN-BAND (Maddy review note #2,
 		// 2026-06-10): without this the agent keeps believing it can see the
 		// screen and may answer "what's on screen" from a stale/empty frame.
-		// transport.sendContent is the same drain path the work-tool results
-		// use, so the notice lands as a normal user turn.
+		// Live injection is the same path the work-tool results use, so the
+		// notice lands as a normal user turn.
 		try {
-			const t = sessionRef?.transport;
-			if (t?.sendContent) {
-				t.sendContent([{ role: 'user', text: '[System: the screen share / camera feed stopped — you can no longer see it. If the user asks what you see, tell them the view dropped and ask them to re-share; do not answer from a previous frame.]' }], true);
+			const session = sessionRef;
+			if (session?.injectText) {
+				void session.injectText('[System: the screen share / camera feed stopped — you can no longer see it. If the user asks what you see, tell them the view dropped and ask them to re-share; do not answer from a previous frame.]', { mode: 'live' });
 				console.log(`${ts()} [Vision] notified session that the feed dropped`);
 			}
 		} catch (e) {
