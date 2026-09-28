@@ -8,13 +8,13 @@
  * ## Audio chain (inbound — caller speaks)
  *
  *   Caller → Twilio → [mu-law 8kHz JSON WS] → Server (mulawTopcm16k)
- *     → [PCM 16kHz Buffer] → VoiceSession.handleAudioFromClient()
+ *     → [PCM 16kHz Buffer] → VoiceSession.feedAudioFromClient()
  *     → GeminiLiveTransport.sendAudio() → Gemini
  *
  * ## Audio chain (outbound — Gemini speaks)
  *
- *   Gemini → GeminiLiveTransport → VoiceSession.handleAudioOutput()
- *     → Server override (pcm24kToMulaw8k) → [mu-law 8kHz JSON WS] → Twilio → Caller
+ *   Gemini → GeminiLiveTransport → VoiceSession
+ *     → twilioSender (pcm24kToMulaw8k) → [mu-law 8kHz JSON WS] → Twilio → Caller
  *
  * ## Task chain (caller requests an action)
  *
@@ -60,7 +60,7 @@ import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
 
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
-import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
+import { VoiceSession, type ToolDefinition, type MainAgent, type RecoverUpstreamResult, type SessionClientSender } from 'bodhi-realtime-agent';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
@@ -269,7 +269,7 @@ function pcmToMulaw(sample: number): number {
 	return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
-// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.handleAudioFromClient()
+// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.feedAudioFromClient()
 function mulawTopcm16k(mulawBytes: Buffer): Buffer {
 	const numSamples = mulawBytes.length;
 	const out = Buffer.alloc(numSamples * 2 * 2);
@@ -284,7 +284,7 @@ function mulawTopcm16k(mulawBytes: Buffer): Buffer {
 }
 
 // [Outbound audio chain] Gemini PCM 24kHz → mu-law 8kHz for Twilio
-// Called from the handleAudioOutput override in createCallSession()
+// Called from the twilioSender in createCallSession()
 function pcm24kToMulaw8k(pcmBuf: Buffer): Buffer {
 	const numSamples = pcmBuf.length / 2;
 	const outLen = Math.floor(numSamples / 3);
@@ -304,7 +304,6 @@ interface CallSession {
 	purpose: string;
 	twilioWs: WebSocket;
 	voiceSession: VoiceSession;
-	bodhiPort: number;  // port for VoiceSession's ClientTransport (required but audio bypasses it)
 	callerNumber: string;
 	callerVerified: boolean;
 	isOwner: boolean;
@@ -340,7 +339,6 @@ interface CallSession {
 const activeCalls = new Map<string, CallSession>();
 let activePlaybackProc: ChildProcess | null = null; // ffmpeg process for /play-audio streaming
 const pendingMeetingJoins = new Set<string>(); // prevents duplicate near-simultaneous joins
-let nextBodhiPort = 9910; // Dynamic ports for per-call VoiceSessions
 
 // --- Goodbye detection ---
 // Phone calls need explicit hangup (unlike browser which just disconnects).
@@ -495,11 +493,10 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			// via its own archiveFile() call. (Per liususan091219's #1237
 			// review — avoids redundant result-archive logic here.)
 			archivePhoneFile(taskPath, 'tasks', taskId);
-			try {
-				(callSession.voiceSession as any).transport.sendContent([
-					{ role: 'user', text: `[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]` },
-				], true);
-			} catch {}
+			void callSession.voiceSession.injectText(
+				`[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]`,
+				{ mode: 'live' },
+			);
 		}
 	}, TASK_POLL_INTERVAL_MS);
 
@@ -696,9 +693,8 @@ function buildAgent(callSession: CallSession): MainAgent {
 }
 
 // --- Create VoiceSession for a call ---
-// Each Twilio call gets its own bodhi VoiceSession on a dynamic internal port.
-// Audio bypasses ClientTransport's WebSocket — we override handleAudioOutput()
-// and call handleAudioFromClient() directly for lower latency.
+// Each Twilio call gets its own bodhi VoiceSession. The server owns the Twilio socket:
+// output leaves through twilioSender, input enters through feedAudioFromClient().
 
 async function createCallSession(params: {
 	callSid: string;
@@ -713,8 +709,6 @@ async function createCallSession(params: {
 	passcode?: string;
 	parentCallSid?: string;
 }): Promise<CallSession> {
-	const bodhiPort = nextBodhiPort++;
-
 	// Per-call observability recorder (step 5b-2). The injected factory keeps the
 	// phone usage kind (`phone.call`, with callSid/isOwner/isMeeting) — the
 	// recorder's default would be the voice ticker, which would mis-bill phone
@@ -734,7 +728,6 @@ async function createCallSession(params: {
 	const callSession: CallSession = {
 		...params,
 		voiceSession: null as unknown as VoiceSession,
-		bodhiPort,
 		childCallSids: [],
 		hangingUp: false,
 		pendingTasks: 0,
@@ -761,14 +754,41 @@ async function createCallSession(params: {
 
 	const agent = buildAgent(callSession);
 
+	let _isRecordingMuted: (() => boolean) | null = null;
+	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
+
+	// [Outbound audio chain] Gemini PCM 24kHz → mu-law 8kHz media frames on the Twilio socket
+	const twilioSender: SessionClientSender = {
+		sendAudio(pcmBuf: Buffer) {
+			if (_isRecordingMuted?.()) return;
+			if (params.twilioWs.readyState === WebSocket.OPEN) {
+				const mulawBuf = pcm24kToMulaw8k(pcmBuf);
+				const CHUNK = 160;
+				for (let offset = 0; offset < mulawBuf.length; offset += CHUNK) {
+					const chunk = mulawBuf.subarray(offset, Math.min(offset + CHUNK, mulawBuf.length));
+					params.twilioWs.send(JSON.stringify({
+						event: 'media',
+						streamSid: params.streamSid,
+						media: { payload: chunk.toString('base64') },
+					}));
+				}
+			}
+		},
+		// A Twilio media stream carries audio only; session JSON frames have no reader on a call.
+		sendJson() {},
+	};
+
 	const session = new VoiceSession({
 		sessionId: `phone_${params.callSid}`,
 		userId: 'phone_user',
 		apiKey: GEMINI_API_KEY,
 		agents: [agent],
 		initialAgent: 'phone',
-		port: bodhiPort,
-		host: '127.0.0.1',
+		clientSender: twilioSender,
+		// No realtimeInputConfig on the wire: the server's own end-of-speech settings apply.
+		realtimeInputConfig: false,
+		// A lost Gemini connection parks the session; the upstreamLost handler below redials it.
+		upstreamLossPolicy: 'hold',
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
@@ -802,17 +822,17 @@ async function createCallSession(params: {
 				// After video play/pause, inject context reminder
 				if (['play_video', 'pause_video', 'resume_video', 'replay_video'].includes(toolName)) {
 					setTimeout(() => {
-						try {
-							if (existsSync('/tmp/sutando-playback-pause')) {
-								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PAUSED. ONLY call resume_video when user says "resume"/"continue", or play_video when user says "play". Do NOT resume on other speech.]' },
-								], true);
-							} else {
-								(session as any).transport.sendContent([
-									{ role: 'user', text: '[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]' },
-								], true);
-							}
-						} catch {}
+						if (existsSync('/tmp/sutando-playback-pause')) {
+							void session.injectText(
+								'[System: Video PAUSED. ONLY call resume_video when user says "resume"/"continue", or play_video when user says "play". Do NOT resume on other speech.]',
+								{ mode: 'live' },
+							);
+						} else {
+							void session.injectText(
+								'[System: Video PLAYING. Say NOTHING. ONLY call pause_video when user says "pause"/"stop"/"continue", or close_video when user says "close". Ignore ALL other speech.]',
+								{ mode: 'live' },
+							);
+						}
 					}, 300);
 				}
 			},
@@ -828,40 +848,15 @@ async function createCallSession(params: {
 	// session. Restored on hang-up (see endCall).
 	await attachVisionToCall(session);
 
-	// Start VoiceSession (creates ClientTransport WebSocket server on bodhiPort)
 	await session.start();
-	console.log(`${ts()} [Bodhi] VoiceSession started on port ${bodhiPort} for ${params.callSid}`);
-
-	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
-	// Bypasses ClientTransport's internal WebSocket for lower latency
-	const sessionAny = session as any;
-	let isReplaying = false; // suppress audio during reconnect replay
-	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
-	let _isRecordingMuted: (() => boolean) | null = null;
-	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
+	console.log(`${ts()} [Bodhi] VoiceSession started for ${params.callSid}`);
 
 	// Optional narration tee from screen-record skill
 	let _teeAudio: ((buf: Buffer) => void) | null = null;
 	import('../../../skills/screen-record/scripts/narration-tee.js').then(m => { _teeAudio = m.teeAudio; }).catch(() => {});
-
-	sessionAny.handleAudioOutput = (data: string) => {
-		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying || _isRecordingMuted?.()) return;
-		const pcmBuf = Buffer.from(data, 'base64');
-		_teeAudio?.(pcmBuf);
-		if (params.twilioWs.readyState === WebSocket.OPEN) {
-			const mulawBuf = pcm24kToMulaw8k(pcmBuf);
-			const CHUNK = 160;
-			for (let offset = 0; offset < mulawBuf.length; offset += CHUNK) {
-				const chunk = mulawBuf.subarray(offset, Math.min(offset + CHUNK, mulawBuf.length));
-				params.twilioWs.send(JSON.stringify({
-					event: 'media',
-					streamSid: params.streamSid,
-					media: { payload: chunk.toString('base64') },
-				}));
-			}
-		}
-	};
+	session.observeAudioOutput((pcmBuf) => {
+		if (!_isRecordingMuted?.()) _teeAudio?.(pcmBuf);
+	});
 
 	// Set up recording hooks (tool trigger, narration push, etc)
 	import('../../../src/browser-tools.js').then(bt => bt.setupRecordingHooks(session)).catch(() => {});
@@ -871,12 +866,6 @@ async function createCallSession(params: {
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
-		// Detect end of reconnect replay: when items catch up to pre-disconnect count
-		if (isReplaying && items.length >= turnCountBeforeDisconnect) {
-			console.log(`${ts()} [Phone] replay complete (${items.length}/${turnCountBeforeDisconnect} turns) — unmuting`);
-			isReplaying = false;
-			import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-		}
 		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastTranscriptText = callSession.transcript.length > 0
@@ -912,64 +901,53 @@ async function createCallSession(params: {
 		if (callSession.resultQueue.length > 0) {
 			const queued = callSession.resultQueue.splice(0);
 			for (const item of queued) {
-				try {
-					(callSession.voiceSession as any).transport.sendContent([
-						{ role: 'user', text: item.text },
-					], true);
-				} catch (e) {
-					console.log(`${ts()} [Task] inject failed: ${e}`);
-				}
+				void callSession.voiceSession.injectText(item.text, { mode: 'live' });
 			}
 		}
 	});
 
 	// Trigger client connected (so VoiceSession sends greeting and starts Gemini)
-	sessionAny.handleClientConnected();
-	// Suppress greeting on reconnect — mute the first few seconds of audio after reconnect
-	let firstGreetingSent = false;
-	const origSendGreeting = sessionAny.sendGreeting?.bind(sessionAny);
-	if (origSendGreeting) {
-		sessionAny.sendGreeting = (...args: any[]) => {
-			if (firstGreetingSent) {
-				console.log(`${ts()} [Phone] suppressed reconnect greeting`);
+	session.notifyClientConnected();
+
+	// Resume an in-progress narration once per completed reconnect, automatic or host-driven.
+	let reconnectPending = false;
+	const reconnected = () => {
+		if (!reconnectPending) return;
+		reconnectPending = false;
+		import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
+	};
+	session.eventBus.subscribe('session.stateChange', (e) => {
+		if (e.toState === 'RECONNECTING') reconnectPending = true;
+		else if (e.fromState === 'RECONNECTING' && e.toState === 'ACTIVE') reconnected();
+	});
+
+	// Redial a lost Gemini connection while the call is live. The Twilio client stays attached
+	// across recoverUpstream, which never greets, so the caller hears no second greeting.
+	const callIsLive = () => !callSession.hangingUp && activeCalls.has(callSession.callSid);
+	let redialTimer: ReturnType<typeof setTimeout> | null = null;
+	const armRedial = () => {
+		if (redialTimer || !callIsLive()) return;
+		redialTimer = setTimeout(() => {
+			redialTimer = null;
+			if (!callIsLive()) return;
+			console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
+			let recovery: RecoverUpstreamResult;
+			try {
+				recovery = session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
+			} catch (e) {
+				console.error(`${ts()} [Phone] reconnect not started: ${e instanceof Error ? e.message : e}`);
 				return;
 			}
-			firstGreetingSent = true;
-			return origSendGreeting(...args);
-		};
-	}
-
-	// Auto-reconnect when Gemini transport closes (e.g. 1008 crash).
-	// We bypass ClientTransport, so VoiceSession's built-in reconnect won't trigger.
-	// Override handleTransportClose (not transport.onClose) because transport.onClose
-	// gets re-bound when transport.connect() is called during reconnection.
-	const origHandleTransportClose = sessionAny.handleTransportClose.bind(sessionAny);
-	sessionAny.handleTransportClose = (code?: number, reason?: string) => {
-		console.log(`${ts()} [Phone] transport closed: code=${code} reason=${reason}`);
-		// Call original (transitions state to CLOSED)
-		origHandleTransportClose(code, reason);
-		// Trigger reconnect
-		if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-			setTimeout(() => {
-				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
-					isReplaying = true; // mute audio while Gemini replays history
-					turnCountBeforeDisconnect = session.conversationContext.items.length;
-					console.log(`${ts()} [Phone] replay suppression: ${turnCountBeforeDisconnect} turns to replay`);
-					sessionAny.handleClientConnected();
-					// Fallback: unmute after max(10s, 2s per turn) in case turn detection fails
-					const fallbackMs = Math.max(10000, turnCountBeforeDisconnect * 2000);
-					setTimeout(() => {
-						if (isReplaying) {
-							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
-							isReplaying = false;
-							import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-						}
-					}, fallbackMs);
-				}
-			}, 1500);
-		}
+			recovery.activated.then(reconnected, (e) => {
+				console.log(`${ts()} [Phone] reconnect failed: ${e instanceof Error ? e.message : e}`);
+				armRedial();
+			});
+		}, 1500);
 	};
+	session.eventBus.subscribe('session.upstreamLost', (e) => {
+		console.log(`${ts()} [Phone] Gemini connection lost: reason=${e.reason} code=${e.code} detail=${e.detail}`);
+		armRedial();
+	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded
 	callSession.cleanupNarration = () => {
@@ -1029,19 +1007,20 @@ async function createCallSession(params: {
 			}
 			console.log(`${ts()} [ChannelScan] picked up ${name} for ${callSession.callSid} (${body.length}B)`);
 			callSession.recorder.events.push({ event: `channel_result:${name}`, timestamp: new Date().toISOString() });
-			try {
-				(callSession.voiceSession as any).transport.sendContent(
-					[{ role: 'user', text: `[Channel result]\n${body}\n\nReport this result to the caller now.` }],
-					true,
-				);
-			} catch (e) {
-				console.log(`${ts()} [ChannelScan] inject failed for ${name}: ${e}`);
-			}
+			void injectOrQueue(callSession, `[Channel result]\n${body}\n\nReport this result to the caller now.`);
 			try { unlinkSync(full); } catch {}
 		}
 	}, 3000);
 
 	return callSession;
+}
+
+// Live-inject text into a call; text the session refuses (not connected, say) waits in the
+// call's result queue for the next turn.end drain instead of being dropped.
+async function injectOrQueue(target: CallSession, text: string): Promise<void> {
+	if (await target.voiceSession.injectText(text, { mode: 'live' })) return;
+	console.log(`${ts()} [Task] live injection refused for ${target.callSid} — queued for the next turn`);
+	target.resultQueue.push({ text });
 }
 
 // --- Call cleanup: finalize transcript, inject child results into parent, cascade hangups ---
@@ -1186,13 +1165,7 @@ function cleanupCall(callSid: string): void {
 				? session.transcript.map(t => `${t.role === 'sutando' ? 'Sutando' : 'Other person'}: ${t.text}`).join('\n')
 				: '(No conversation recorded.)';
 			console.log(`${ts()} [Concurrent] child ${callSid} ended — injecting into parent ${session.parentCallSid}`);
-			try {
-				(parent.voiceSession as any).transport.sendContent([
-					{ role: 'user', text: `[Concurrent call ended]\nThe call to ${session.callerNumber || 'the other person'} has ended:\n\n${transcriptText}\n\nReport the results directly. Say "they said..." not "I'll let the owner know...".` },
-				], true);
-			} catch (e) {
-				console.log(`${ts()} [Concurrent] inject failed: ${e}`);
-			}
+			void injectOrQueue(parent, `[Concurrent call ended]\nThe call to ${session.callerNumber || 'the other person'} has ended:\n\n${transcriptText}\n\nReport the results directly. Say "they said..." not "I'll let the owner know...".`);
 		}
 	}
 
@@ -1370,11 +1343,10 @@ const server = createServer(async (req, res) => {
 			const childSid = await twilioCall(body.to, twimlUrl);
 			parent.childCallSids.push(childSid);
 			console.log(`${ts()} [Concurrent] child ${childSid} → ${body.to} (parent: ${body.parentCallSid})`);
-			try {
-				(parent.voiceSession as any).transport.sendContent([
-					{ role: 'user', text: `[System: A concurrent call to ${body.to} is being made. Tell the caller the call is in progress.]` },
-				], true);
-			} catch (e) { console.log(`${ts()} [Concurrent] notify parent failed: ${e}`); }
+			void parent.voiceSession.injectText(
+				`[System: A concurrent call to ${body.to} is being made. Tell the caller the call is in progress.]`,
+				{ mode: 'live' },
+			);
 			json(res, 200, { callSid: childSid, to: body.to, parentCallSid: body.parentCallSid, status: 'calling' });
 
 		} else if (path === '/meeting-approve' && req.method === 'POST') {
@@ -1412,34 +1384,23 @@ const server = createServer(async (req, res) => {
 				},
 			};
 
-			// Register the work tool in bodhi's tool executor (so execute() fires)
-			// and update Gemini's tool declarations via transport
-			const sessionAny = session.voiceSession as any;
+			// Register the work tool (executable at once; Gemini sees the declaration on its next
+			// connect) and switch to the meeting instructions, applied on that connect too.
 			try {
-				if (sessionAny.toolExecutor) {
-					sessionAny.toolExecutor.register([workTool]);
-					console.log(`${ts()} [Meeting] Registered work tool in toolExecutor`);
-				}
-			} catch (e) { console.log(`${ts()} [Meeting] toolExecutor register failed: ${e}`); }
-
-			// Update system instructions + tools on the transport (applied on next Gemini reconnect)
-			const transport = (session.voiceSession as any).transport;
+				await session.voiceSession.registerTools([workTool]);
+				console.log(`${ts()} [Meeting] Registered work tool`);
+			} catch (e) { console.log(`${ts()} [Meeting] work tool registration failed: ${e}`); }
 			const newInstructions = 'You are Sutando, an AI assistant in a meeting. You have full capabilities — make calls, look things up, send messages, take screenshots, and perform tasks using the work tool. Be natural, warm, and conversational. Keep responses to 1-2 sentences. Known URLs: "sutando agent repo" = https://github.com/sonichi/sutando';
 			try {
-				transport.updateSystemInstruction(newInstructions);
-				// Also update tools on the transport for reconnect persistence
-				const currentTools = transport.config?.tools ?? [];
-				const hasWork = currentTools.some((t: any) => t.name === 'work');
-				if (!hasWork) transport.updateTools([...currentTools, workTool]);
-				console.log(`${ts()} [Meeting] Updated transport instructions + tools`);
-			} catch (e) { console.log(`${ts()} [Meeting] transport update failed: ${e}`); }
+				await session.voiceSession.updateInstructions(newInstructions);
+				console.log(`${ts()} [Meeting] Updated session instructions`);
+			} catch (e) { console.log(`${ts()} [Meeting] instruction update failed: ${e}`); }
 
 			// Force a Gemini session update now (not just on reconnect)
-			try {
-				transport.sendContent([
-					{ role: 'user', text: '[System: The meeting owner has approved task delegation. You now have the work tool. When someone asks you to do something — take a screenshot, make a call, look something up — use the work tool. You are no longer limited to notes. Do NOT say you cannot do something — use the work tool instead.]' },
-				], true);
-			} catch (e) { console.log(`${ts()} [Meeting] approve notify failed: ${e}`); }
+			await session.voiceSession.injectText(
+				'[System: The meeting owner has approved task delegation. You now have the work tool. When someone asks you to do something — take a screenshot, make a call, look something up — use the work tool. You are no longer limited to notes. Do NOT say you cannot do something — use the work tool instead.]',
+				{ mode: 'live' },
+			);
 
 			json(res, 200, { callSid: body.callSid, status: 'approved', meetingId: session.meetingId });
 
@@ -1755,11 +1716,10 @@ wss.on('connection', (ws: WebSocket) => {
 						if (cp.parentCallSid) {
 							const parent = activeCalls.get(cp.parentCallSid);
 							if (parent) {
-								try {
-									(parent.voiceSession as any).transport.sendContent([
-										{ role: 'user', text: `[Concurrent call connected to ${recipientNumber || 'the other person'}. Transcript will follow when it ends.]` },
-									], true);
-								} catch (e) { console.log(`${ts()} [Concurrent] notify parent failed: ${e}`); }
+								void parent.voiceSession.injectText(
+									`[Concurrent call connected to ${recipientNumber || 'the other person'}. Transcript will follow when it ends.]`,
+									{ mode: 'live' },
+								);
 							}
 						}
 					} catch (err) {
@@ -1782,10 +1742,10 @@ wss.on('connection', (ws: WebSocket) => {
 
 
 					try {
-						(callSession.voiceSession as any).handleAudioFromClient(pcm16k);
+						callSession.voiceSession.feedAudioFromClient(pcm16k);
 					} catch (e) {
 						if (mediaEventCount % 100 === 0) {
-							console.error(`${ts()} [WS] handleAudioFromClient error:`, e);
+							console.error(`${ts()} [WS] feedAudioFromClient error:`, e);
 						}
 					}
 					break;
