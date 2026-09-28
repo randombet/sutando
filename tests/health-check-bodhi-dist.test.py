@@ -86,6 +86,12 @@ class TestBodhiDistArtifactSelection(unittest.TestCase):
         p.write_text(text)
         return p
 
+    def _assert_remediation(self, detail: str):
+        """The repair is the lockfile install, never a git-URL reinstall."""
+        self.assertIn("`npm ci`", detail)
+        self.assertIn("`npm run build:bundle`", detail)
+        self.assertNotIn("github:", detail)
+
     def test_bundled_install_is_scanned(self):
         """The regression: a bundled install has no node_modules, and the
         bundle must be scanned rather than reported as 'not found'."""
@@ -106,6 +112,7 @@ class TestBodhiDistArtifactSelection(unittest.TestCase):
         r = self.hc.check_bodhi_dist()
         self.assertEqual(r["status"], "warn")
         self.assertIn("no bodhi artifact found", r["detail"])
+        self._assert_remediation(r["detail"])
 
     def test_stale_audio_in_bundle_still_fails(self):
         """A check that passes everywhere is worthless — the whole point of
@@ -114,12 +121,14 @@ class TestBodhiDistArtifactSelection(unittest.TestCase):
         r = self.hc.check_bodhi_dist()
         self.assertEqual(r["status"], "fail", r["detail"])
         self.assertIn("sendAudio", r["detail"])
+        self._assert_remediation(r["detail"])
 
     def test_stale_file_in_bundle_still_fails(self):
         self._write_bundle(GEMINI_STALE_FILE)
         r = self.hc.check_bodhi_dist()
         self.assertEqual(r["status"], "fail", r["detail"])
         self.assertIn("sendFile", r["detail"])
+        self._assert_remediation(r["detail"])
 
     def test_unrecognizable_artifact_names_the_file(self):
         """No sendAudio at all (e.g. a truncated or wrong bundle) must warn

@@ -6308,8 +6308,8 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
-    then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
+    Fix when this check fails: `npm ci` (then `npm run build:bundle` for a
+    bundled install), then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
     differs by deployment and the node_modules copy is not always the one
@@ -6339,7 +6339,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "warn"
         check["detail"] = (
             "no bodhi artifact found (checked node_modules and dist/voice-agent.js) — "
-            "run `npm install`, or `npm run build` for a bundled install"
+            "run `npm ci` (then `npm run build:bundle` for a bundled install)"
         )
         return check
     try:
@@ -6383,7 +6383,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm ci` (then `npm run build:bundle` for a bundled install)."
         )
     return check
 
