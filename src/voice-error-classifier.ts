@@ -105,6 +105,30 @@ export function classifyTransportClose(
 	};
 }
 
+/** Wrap a transport's property-form `onClose` so every close is classified BEFORE
+ *  bodhi's own handler runs: its reconnector reads the fatal backoff this sets. */
+export function wireCloseClassifier(
+	transport: { onClose?: ((code?: number, reason?: string) => void) | null },
+	onClassified: (c: ClassifiedClose) => void,
+	logError: (m: string) => void,
+): void {
+	const origOnClose = typeof transport.onClose === 'function'
+		? transport.onClose.bind(transport)
+		: null;
+	transport.onClose = (code?: number, reason?: string) => {
+		try {
+			onClassified(classifyTransportClose(code, reason));
+		} catch (e) {
+			logError(`classifier threw: ${(e as Error)?.message ?? e}`);
+		}
+		if (origOnClose) {
+			try { origOnClose(code, reason); } catch (e) {
+				logError(`origOnClose threw: ${(e as Error)?.message ?? e}`);
+			}
+		}
+	};
+}
+
 // ---------------------------------------------------------------------------
 // `agent.state` protocol mapping (design 1a′; impl plan WS1 Step 12,
 // amendment R8).

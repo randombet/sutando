@@ -7,16 +7,17 @@
 #   - sutando #259 (duplicate tool declaration dedup + SDK bump) — Chi
 #
 # Then runs:
-#   1. npm install github:sonichi/bodhi_realtime_agent  (pulls new bodhi SHA)
-#   2. Verifies the installed bodhi dist contains all 3 fixes
+#   1. npm ci  (with --install; installs the pinned bodhi-realtime-agent)
+#   2. Verifies the installed bodhi-realtime-agent is >= 0.4.0 and its Gemini
+#      sendAudio uses the audio key
 #   3. Verifies sutando's tools deduplicate correctly
 #   4. Verifies .env is still pinned to 2.5 (so this run is safe to run even
 #      before the user is ready to flip 3.1 on)
 #   5. Prints the manual next-steps checklist
 #
 # Usage: bash src/verify-gemini-31.sh [--install]
-#   --install  run `npm install github:sonichi/bodhi_realtime_agent` first
-#              (only needed once after bodhi fork main advances)
+#   --install  run `npm ci` first
+#              (only needed after the bodhi-realtime-agent pin changes)
 
 set -e
 
@@ -36,56 +37,47 @@ echo "========================================"
 
 if [ "${1:-}" = "--install" ]; then
   echo ""
-  echo "Pulling latest bodhi fork..."
-  npm install github:sonichi/bodhi_realtime_agent 2>&1 | tail -3
+  echo "Installing pinned dependencies (npm ci)..."
+  npm ci 2>&1 | tail -3
 fi
 
-# 1. Bodhi dist — sendClientContent text path (PR #1)
+# 1. Installed bodhi-realtime-agent: version floor and the Gemini sendAudio wire key.
+# Only the Gemini sendAudio calls sendRealtimeInput; OpenAI's sendAudio has a flat `audio` field.
 echo ""
-echo "Bodhi fork PR #1 (sendClientContent → sendRealtimeInput text path):"
-if grep -q 'sendClientContent(turns, _turnComplete' node_modules/bodhi-realtime-agent/dist/index.js; then
-  # The narrowed method signature with _turnComplete (underscore-prefixed unused
-  # parameter) is a reliable marker for PR #1.
-  pass "sendClientContent narrowed to text-only routing to sendRealtimeInput"
+echo "bodhi-realtime-agent (>= 0.4.0, Gemini sendAudio audio key):"
+BODHI_DIR=node_modules/bodhi-realtime-agent
+BODHI_VERSION=$(node -e '
+  const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+  if (p.name === "bodhi-realtime-agent") console.log(p.version);
+' "$BODHI_DIR/package.json" 2>/dev/null || true)
+if [ -z "$BODHI_VERSION" ]; then
+  fail "bodhi-realtime-agent is not installed in $BODHI_DIR"
+elif node -e '
+  const m = /^(\d+)\.(\d+)\.(\d+)(-.+)?$/.exec(process.argv[1]);
+  const cmp = m ? Number(m[1]) || Number(m[2]) - 4 || Number(m[3]) : -1;
+  process.exit(cmp > 0 || (cmp === 0 && !m[4]) ? 0 : 1);
+' "$BODHI_VERSION"; then
+  pass "bodhi-realtime-agent $BODHI_VERSION installed"
 else
-  fail "sendClientContent still uses the old shape — PR #1 not applied in this bodhi build"
+  fail "bodhi-realtime-agent $BODHI_VERSION is older than 0.4.0"
 fi
-
-# 2. Bodhi dist — sendAudio audio key (PR #2)
-# Grep for the Gemini transport's sendAudio specifically. The OpenAI realtime
-# transport also has a sendAudio which uses `audio: base64Data` as a flat
-# wire field — that would false-positive a naive match.
-echo ""
-echo "Bodhi fork PR #2 (sendAudio media→audio):"
 GEMINI_SENDAUDIO=$(awk '
-  /sendAudio\(base64Data\) {/ { capture=1; depth=0 }
-  capture { print; if (/{/) depth++; if (/}/) { depth--; if (depth==0) exit } }
-' node_modules/bodhi-realtime-agent/dist/index.js | grep -A10 'this.session.sendRealtimeInput' || true)
+  /sendAudio\(base64Data\) [{]/ { capture=1; depth=0; body="" }
+  capture {
+    body = body $0 "\n"
+    depth += gsub(/[{]/, "{") - gsub(/[}]/, "}")
+    if (depth == 0) {
+      if (body ~ /sendRealtimeInput/) { printf "%s", body; exit }
+      capture=0
+    }
+  }
+' "$BODHI_DIR/dist/index.js" 2>/dev/null || true)
 if echo "$GEMINI_SENDAUDIO" | grep -q 'audio: { data'; then
-  pass "sendAudio uses the audio key"
+  pass "Gemini sendAudio uses the audio key"
 elif echo "$GEMINI_SENDAUDIO" | grep -q 'media: { data'; then
-  fail "sendAudio still uses the deprecated media key — bodhi #2 not merged/installed"
+  fail "Gemini sendAudio still uses the deprecated media key"
 else
-  warn "could not positively identify sendAudio wire format"
-fi
-
-# 3. Bodhi dist — sendFile branching (PR #3)
-# Same story — grep specifically for the Gemini transport's sendFile.
-echo ""
-echo "Bodhi fork PR #3 (sendFile mimeType branching):"
-GEMINI_SENDFILE=$(awk '
-  /sendFile\(base64Data, mimeType\) {/ { capture=1; depth=0 }
-  capture { print; if (/{/) depth++; if (/}/) { depth--; if (depth==0) exit } }
-' node_modules/bodhi-realtime-agent/dist/index.js)
-if echo "$GEMINI_SENDFILE" | grep -q 'mimeType.startsWith("image/")'; then
-  pass "sendFile branches on image/* → video key"
-elif echo "$GEMINI_SENDFILE" | grep -q 'media: { data'; then
-  fail "sendFile still uses deprecated single media key — bodhi #3 not merged/installed"
-else
-  warn "could not positively identify sendFile routing"
-fi
-if echo "$GEMINI_SENDFILE" | grep -q 'mimeType.startsWith("audio/")'; then
-  pass "sendFile branches on audio/* → audio key"
+  fail "could not find the Gemini sendAudio in $BODHI_DIR/dist/index.js"
 fi
 
 # 4. Sutando duplicate tool declaration dedup (PR #259)
@@ -159,8 +151,8 @@ echo ""
 if [ "$FAIL" -gt 0 ]; then
   echo "NOT READY for 3.1 rollout. Resolve the failures above before unpinning .env."
   echo ""
-  echo "Most common fix: run 'npm install github:sonichi/bodhi_realtime_agent' to"
-  echo "pull the latest bodhi fork after PRs #2 and #3 merge there."
+  echo "Most common fix: run 'npm ci' to install the bodhi-realtime-agent version"
+  echo "pinned in package-lock.json (0.4.0 or newer), then restart voice-agent."
   exit 1
 fi
 

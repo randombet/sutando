@@ -1,6 +1,8 @@
 /** Pure predicate + state machine, no deps — importable so tests exercise THIS
  *  code rather than a copy that can pass while the real sanitizer drifts. */
 
+import type { AssistantOutputInterceptor } from 'bodhi-realtime-agent';
+
 /** Matches a turn that opens with a fabricated control/metadata directive. */
 export const FABRICATED_OUTPUT_RE = /^\s*(\[System:|System:|\[Silence\.?\]|<ctrl\d+>)/i;
 
@@ -125,4 +127,40 @@ export function wireSanitizerToTransport(deps: SanitizerWiring): boolean {
 	deps.subscribe('turn.interrupted', resetTurn);
 	deps.log?.('[OutputSanitizer] wired into transport.onOutputTranscription (per-turn buffered)');
 	return true;
+}
+
+export interface SanitizerInterceptorDeps {
+	onBlocked?: (buffered: string) => void;
+	log?: (message: string) => void;
+}
+
+/** The session's outputInterceptor, plus the turn reset for event backstops. */
+export interface SanitizerInterceptor extends AssistantOutputInterceptor {
+	transcript(chunk: string, forward: (text: string) => void): void;
+	audio(chunkBase64: string): boolean;
+	beforeTranscriptFlush(): void;
+	resetTurn(): void;
+}
+
+/** The same sanitizer as the session's outputInterceptor: bodhi runs
+ *  beforeTranscriptFlush ahead of every flush, so held clean text joins its own turn. */
+export function createSanitizerInterceptor(deps: SanitizerInterceptorDeps): SanitizerInterceptor {
+	let suppressAudio = false;
+	let forwardHeld: ((text: string) => void) | null = null;
+	const sanitizer = createOutputSanitizer({
+		forward: (t) => forwardHeld?.(t),
+		setSuppressAudio: (on) => { suppressAudio = on; },
+		onBlocked: deps.onBlocked,
+	});
+	const resetTurn = (): void => sanitizer.resetTurn();
+	deps.log?.('[OutputSanitizer] wired as the session output interceptor (per-turn buffered)');
+	return {
+		transcript: (chunk, forward) => {
+			forwardHeld = forward;
+			sanitizer.handleChunk(chunk);
+		},
+		audio: () => !suppressAudio,
+		beforeTranscriptFlush: resetTurn,
+		resetTurn,
+	};
 }

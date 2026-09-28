@@ -131,20 +131,9 @@ function findFfmpegWithSubtitles(): string | null {
 	return null;
 }
 
-/** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
+/** Send text as live input the model answers, as if the user had just said it. */
 function injectText(session: any, text: string) {
-	try {
-		const transport = session?.transport;
-		if (typeof transport?.session?.sendRealtimeInput === 'function') {
-			transport.session.sendRealtimeInput({ text });
-		} else if (typeof transport?.sendContent === 'function') {
-			transport.sendContent([{ role: 'user', text }], true);
-		} else {
-			console.warn(`${ts()} [InjectText] No supported text injection method on transport`);
-		}
-	} catch (err) {
-		console.error(`${ts()} [InjectText] Error:`, err);
-	}
+	void session.injectText(text, { mode: 'live' });
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)

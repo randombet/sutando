@@ -5,6 +5,8 @@
 // conversationContext without rebasing the transcript cursor makes the
 // turn.end logger skip every item that accumulates after the clear).
 
+import type { VoiceSession } from 'bodhi-realtime-agent';
+
 /** State for the stale-repeat goodbye guard. */
 export interface GoodbyeGuardState {
   lastText: string | null;
@@ -36,39 +38,30 @@ export function shouldFireGoodbye(
 /**
  * Clear a dead session's Gemini resumption handle before a fresh reconnect
  * (field incident 2026-08-14): when Gemini invalidates a session it closes
- * 1008 "Requested entity was not found", bodhi transitions ACTIVE→CLOSED —
- * but nothing clears `transport.config.resumptionHandle`, and the CLOSED→
- * fresh-connect path replays it in `sessionResumption: { handle }`. Gemini
- * completes setup, then kills each new connection the same way (observed
- * survival staircase: 9 min → 18 s → 0.9 s). Clearing costs nothing here:
- * this path already rebuilds context via text injection, never via resume;
- * mid-session GoAway resume (the legitimate handle use) does not run
- * through it. Returns true when a stale handle was actually cleared.
- * Pin-workaround: belongs in bodhi's handleTransportClose (Tranche B).
+ * 1008 "Requested entity was not found", and a redial that replays the dead
+ * handle in `sessionResumption: { handle }` completes setup, then is killed
+ * the same way (observed survival staircase: 9 min → 18 s → 0.9 s). Clearing
+ * costs nothing here: this path already rebuilds context via text injection,
+ * never via resume; mid-session GoAway resume (the legitimate handle use) does
+ * not run through it. bodhi's clearResumption() drops both the session's and
+ * the transport's copy. Returns true when a stale handle was actually cleared.
  */
-export function clearStaleResumptionHandle(session: unknown): boolean {
-  let cleared = false;
+export function clearStaleResumptionHandle(
+  session: Pick<VoiceSession, 'clearResumption'> | null | undefined,
+): boolean {
   try {
-    const s = session as {
-      transport?: { config?: { resumptionHandle?: string } };
-      sessionManager?: { clearResumptionHandle?: () => void };
-    };
-    if (s?.transport?.config?.resumptionHandle) {
-      s.transport.config.resumptionHandle = undefined;
-      cleared = true;
-    }
-    s?.sessionManager?.clearResumptionHandle?.();
+    return session?.clearResumption() ?? false;
   } catch {
-    /* a missing seam must never break the reconnect path */
+    /* a failing seam must never break the reconnect path */
+    return false;
   }
-  return cleared;
 }
 
 export interface ConversationClearHelper {
   /** The turn.end logger's cursor into conversationContext.items. */
   cursor: { index: number };
-  /** Empty the items array IN PLACE (it is getter-backed — reassignment
-   *  throws) and rebase the cursor with it. Returns items cleared. */
+  /** Reset the session's conversation context (bodhi persists the items
+   *  first) and rebase the cursor with it. Returns items cleared. */
   clear(reason: string): number;
 }
 
@@ -78,7 +71,7 @@ export interface ConversationClearHelper {
  * move together, always.
  */
 export function createConversationClearHelper(
-  getItems: () => unknown,
+  getSession: () => Pick<VoiceSession, 'resetConversationContext'> | null | undefined,
   log: (line: string) => void = () => {},
 ): ConversationClearHelper {
   const cursor = { index: 0 };
@@ -87,11 +80,7 @@ export function createConversationClearHelper(
     clear(reason: string): number {
       let cleared = 0;
       try {
-        const items = getItems();
-        if (Array.isArray(items) && items.length > 0) {
-          cleared = items.length;
-          items.length = 0;
-        }
+        cleared = getSession()?.resetConversationContext(reason).cleared ?? 0;
       } catch (e) {
         log(`[clear-items] ${reason}: could not clear conversationContext: ${e}`);
       }

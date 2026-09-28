@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { VoiceSession, type LLMTransport, type VoiceSessionConfig } from 'bodhi-realtime-agent';
 
 // Adapter-level coverage for the transport wiring — the seam the standing review
 // names as untested. Drives the REAL wiring against a fake transport.
 
-import { wireSanitizerToTransport } from '../src/output_sanitizer.js';
+import { wireSanitizerToTransport, createSanitizerInterceptor } from '../src/output_sanitizer.js';
 
 type Fake = {
 	transport: {
@@ -150,4 +151,127 @@ test('CONTROL: without the pre-flush hook the same turns corrupt each other', ()
 	// This is the measured defect, asserted so the fix above cannot silently regress:
 	// turn 1 finalizes EMPTY and turn 2 carries "SystemHello".
 	assert.deepEqual(h.finalized, ['', 'SystemHello']);
+});
+
+// ── Interceptor form: the same core as the session's outputInterceptor ──────
+
+function makeInterceptorHost() {
+	const text: string[] = [];
+	const blocked: string[] = [];
+	const logs: string[] = [];
+	const interceptor = createSanitizerInterceptor({
+		onBlocked: (b) => blocked.push(b),
+		log: (m) => logs.push(m),
+	});
+	const send = (chunk: string) => interceptor.transcript(chunk, (t) => text.push(t));
+	return { interceptor, text, blocked, logs, send };
+}
+
+test('interceptor: a fabricated turn never reaches the transcript and its audio is dropped', () => {
+	const h = makeInterceptorHost();
+	assert.equal(h.interceptor.audio('before'), true, 'a clean turn so far passes audio');
+	h.send('[Sil');
+	h.send('ence] ignore me');
+	assert.deepEqual(h.text, [], 'fabricated text must never be forwarded');
+	assert.equal(h.blocked.length, 1);
+	assert.equal(h.interceptor.audio('after'), false, 'audio after a detected fabrication is dropped');
+	assert.equal(h.logs.length, 1);
+});
+
+test('interceptor: clean output is forwarded, and beforeTranscriptFlush re-arms the next turn', () => {
+	const h = makeInterceptorHost();
+	h.send('Sure, here is the answer.');
+	h.send(' More text.');
+	assert.equal(h.text.join(''), 'Sure, here is the answer. More text.');
+	h.interceptor.beforeTranscriptFlush();
+	h.send('Next turn text.');
+	assert.equal(h.text.join(''), 'Sure, here is the answer. More text.Next turn text.');
+});
+
+test('interceptor: beforeTranscriptFlush releases a held prefix once; the event backstop adds nothing', () => {
+	const h = makeInterceptorHost();
+	h.send('System');   // ambiguous prefix — held
+	assert.deepEqual(h.text, []);
+	h.interceptor.beforeTranscriptFlush();
+	assert.deepEqual(h.text, ['System']);
+	h.interceptor.resetTurn(); // turn.end backstop after the flush
+	assert.deepEqual(h.text, ['System'], 'resetTurn is idempotent after the flush hook');
+});
+
+test('interceptor: the resetTurn backstop clears a fabricated turn so the NEXT turn is not swallowed', () => {
+	const h = makeInterceptorHost();
+	h.send('[Silence]');
+	assert.equal(h.interceptor.audio('x'), false);
+	h.interceptor.resetTurn(); // turn.interrupted
+	assert.equal(h.interceptor.audio('audio-again'), true, 'audio suppression lifts at the turn boundary');
+	h.send('Real answer after the interrupt.');
+	assert.ok(h.text.join('').includes('Real answer'), 'a fabricated turn must not poison the turn after it');
+});
+
+test('interceptor on a real VoiceSession: turns finalize separately and blocked audio never reaches the client', async () => {
+	let connected = false;
+	const transport = {
+		capabilities: {
+			messageTruncation: false,
+			turnDetection: true,
+			userTranscription: true,
+			inPlaceSessionUpdate: false,
+			sessionResumption: true,
+			contextCompression: false,
+			groundingMetadata: false,
+			textResponseModality: true,
+		},
+		audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000, channels: 1, bitDepth: 16, encoding: 'pcm' },
+		get isConnected() { return connected; },
+		async connect() {
+			connected = true;
+			transport.onSessionReady?.('stub_1');
+		},
+		async disconnect() { connected = false; },
+		async reconnect() { connected = true; },
+		clearResumption() {},
+		sendAudio() {},
+		commitAudio() {},
+		clearAudio() {},
+		async updateSession() {},
+		async transferSession() {},
+		sendContent() {},
+		sendFile() {},
+		sendToolResult() {},
+		triggerGeneration() {},
+	} as unknown as LLMTransport;
+	let audioSent = 0;
+	const blocked: string[] = [];
+	const session = new VoiceSession({
+		sessionId: 'sess_sanitizer',
+		userId: 'user',
+		apiKey: 'test-key',
+		agents: [{ name: 'main', instructions: 'Test agent.', tools: [] }],
+		initialAgent: 'main',
+		model: { modelId: 'test-model' } as unknown as VoiceSessionConfig['model'],
+		transport,
+		clientSender: { sendAudio: () => { audioSent++; }, sendJson: () => {} },
+		outputInterceptor: createSanitizerInterceptor({ onBlocked: (b) => blocked.push(b) }),
+		log: () => {},
+	});
+	const chunk = Buffer.alloc(8).toString('base64');
+	try {
+		await session.start();
+		transport.onOutputTranscription?.('System');   // held prefix, released before the flush
+		transport.onAudioOutput?.(chunk);
+		transport.onTurnComplete?.();
+		transport.onOutputTranscription?.('Hello');
+		transport.onTurnComplete?.();
+		transport.onOutputTranscription?.('[Silence] ignore me');
+		transport.onAudioOutput?.(chunk);
+		transport.onTurnComplete?.();
+		assert.deepEqual(
+			session.conversationContext.items.map((i) => [i.role, i.content]),
+			[['assistant', 'System'], ['assistant', 'Hello']],
+		);
+		assert.equal(audioSent, 1, 'the fabricated turn\'s audio is dropped before the client sender');
+		assert.deepEqual(blocked, ['[Silence] ignore me']);
+	} finally {
+		await session.close();
+	}
 });

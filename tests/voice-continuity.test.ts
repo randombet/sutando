@@ -1,5 +1,6 @@
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { VoiceSession, type LLMTransport, type VoiceSessionConfig } from 'bodhi-realtime-agent';
 import {
 	initialGoodbyeGuard,
 	shouldFireGoodbye,
@@ -46,32 +47,39 @@ describe('P7 D7.3 stale-repeat goodbye guard', () => {
 });
 
 describe('P7 D7.3 centralized conversation clear (G-P7-8)', () => {
-	it('empties items IN PLACE and rebases the cursor together', () => {
-		const items: string[] = ['a', 'b', 'c'];
+	it('resets through the session seam and rebases the cursor together', () => {
+		const reasons: string[] = [];
 		const logs: string[] = [];
-		const h = createConversationClearHelper(() => items, (m) => logs.push(m));
+		const session = {
+			resetConversationContext: (reason: string) => { reasons.push(reason); return { cleared: 3 }; },
+		};
+		const h = createConversationClearHelper(() => session, (m) => logs.push(m));
 		h.cursor.index = 3;
 		const cleared = h.clear('test');
 		assert.equal(cleared, 3);
-		assert.equal(items.length, 0, 'mutated in place (getter-backed array)');
+		assert.deepEqual(reasons, ['test'], 'one reset, carrying the reason');
 		assert.equal(h.cursor.index, 0, 'cursor rebased WITH the clear');
 		assert.ok(logs.some((l) => l.includes('cleared 3')));
 	});
 
-	it('rebases the cursor even when items are unreadable — a stale cursor against an emptied array is the bug', () => {
+	it('rebases the cursor even when the reset throws — a stale cursor against an emptied context is the bug', () => {
+		const logs: string[] = [];
 		const h = createConversationClearHelper(
-			() => {
-				throw new Error('no session yet');
-			},
-			() => {},
+			() => ({
+				resetConversationContext: () => {
+					throw new Error('reset failed');
+				},
+			}),
+			(m) => logs.push(m),
 		);
 		h.cursor.index = 7;
 		assert.equal(h.clear('early'), 0);
 		assert.equal(h.cursor.index, 0);
+		assert.ok(logs.some((l) => l.includes('could not clear')));
 	});
 
-	it('non-array items: clears nothing, still rebases', () => {
-		const h = createConversationClearHelper(() => undefined, () => {});
+	it('no session yet: clears nothing, still rebases', () => {
+		const h = createConversationClearHelper(() => null, () => {});
 		h.cursor.index = 2;
 		assert.equal(h.clear('none'), 0);
 		assert.equal(h.cursor.index, 0);
@@ -79,30 +87,109 @@ describe('P7 D7.3 centralized conversation clear (G-P7-8)', () => {
 });
 
 describe('stale resumption-handle clearing (1008 \'Requested entity was not found\' staircase)', () => {
-	it('clears BOTH handle copies before a fresh reconnect and reports it', () => {
-		let smCleared = 0;
-		const session = {
-			transport: { config: { resumptionHandle: 'dead-handle-123' } },
-			sessionManager: { clearResumptionHandle: () => { smCleared += 1; } },
-		};
+	it('clears through the session seam and reports a cleared handle', () => {
+		let calls = 0;
+		const session = { clearResumption: () => { calls += 1; return true; } };
 		assert.equal(clearStaleResumptionHandle(session), true);
-		assert.equal(session.transport.config.resumptionHandle, undefined, 'transport copy cleared');
-		assert.equal(smCleared, 1, 'sessionManager copy cleared');
+		assert.equal(calls, 1);
 	});
 
-	it('no stale handle → false, still syncs the sessionManager copy', () => {
-		let smCleared = 0;
-		const session = {
-			transport: { config: {} },
-			sessionManager: { clearResumptionHandle: () => { smCleared += 1; } },
-		};
-		assert.equal(clearStaleResumptionHandle(session), false);
-		assert.equal(smCleared, 1);
+	it('no stale handle → false', () => {
+		assert.equal(clearStaleResumptionHandle({ clearResumption: () => false }), false);
 	});
 
-	it('missing seams never throw (a broken shape must not break reconnect)', () => {
+	it('a missing or throwing seam never throws (a broken seam must not break reconnect)', () => {
 		assert.equal(clearStaleResumptionHandle(null), false);
-		assert.equal(clearStaleResumptionHandle({}), false);
-		assert.equal(clearStaleResumptionHandle({ transport: {} }), false);
+		assert.equal(clearStaleResumptionHandle(undefined), false);
+		assert.equal(clearStaleResumptionHandle({ clearResumption: () => { throw new Error('boom'); } }), false);
+	});
+});
+
+// The same helpers against a real VoiceSession (stub transport, host-owned client channel).
+const sessions: VoiceSession[] = [];
+
+function createStubTransport(): LLMTransport {
+	let connected = false;
+	const transport = {
+		capabilities: {
+			messageTruncation: false,
+			turnDetection: true,
+			userTranscription: true,
+			inPlaceSessionUpdate: false,
+			sessionResumption: true,
+			contextCompression: false,
+			groundingMetadata: false,
+			textResponseModality: true,
+		},
+		audioFormat: { inputSampleRate: 16000, outputSampleRate: 24000, channels: 1, bitDepth: 16, encoding: 'pcm' },
+		get isConnected() { return connected; },
+		async connect() {
+			connected = true;
+			transport.onSessionReady?.('stub_1');
+		},
+		async disconnect() { connected = false; },
+		async reconnect() { connected = true; },
+		clearResumption() {},
+		sendAudio() {},
+		commitAudio() {},
+		clearAudio() {},
+		async updateSession() {},
+		async transferSession() {},
+		sendContent() {},
+		sendFile() {},
+		sendToolResult() {},
+		triggerGeneration() {},
+	} as unknown as LLMTransport;
+	return transport;
+}
+
+function createSession(): { session: VoiceSession; transport: LLMTransport } {
+	const transport = createStubTransport();
+	const config: VoiceSessionConfig = {
+		sessionId: 'sess_continuity',
+		userId: 'user',
+		apiKey: 'test-key',
+		agents: [{ name: 'main', instructions: 'Test agent.', tools: [] }],
+		initialAgent: 'main',
+		model: { modelId: 'test-model' } as unknown as VoiceSessionConfig['model'],
+		transport,
+		clientSender: { sendAudio: () => {}, sendJson: () => {} },
+		log: () => {},
+	};
+	const session = new VoiceSession(config);
+	sessions.push(session);
+	return { session, transport };
+}
+
+describe('continuity helpers on a real VoiceSession', () => {
+	after(async () => {
+		for (const s of sessions) await s.close().catch(() => {});
+	});
+
+	it('the clear empties the session conversation and rebases the cursor', () => {
+		const { session } = createSession();
+		session.conversationContext.addUserMessage('hello');
+		session.conversationContext.addAssistantMessage('Goodbye!');
+		const h = createConversationClearHelper(() => session);
+		h.cursor.index = session.conversationContext.items.length;
+		assert.equal(h.clear('end_session'), 2);
+		assert.equal(session.conversationContext.items.length, 0);
+		assert.equal(h.cursor.index, 0);
+		session.conversationContext.addUserMessage('next');
+		assert.deepEqual(
+			session.conversationContext.items.slice(h.cursor.index).map((i) => i.content),
+			['next'],
+			'the turn.end logger sees the first item after the clear',
+		);
+	});
+
+	it('the resumption clear drops a saved handle once', async () => {
+		const { session, transport } = createSession();
+		await session.start();
+		transport.onResumptionUpdate?.('dead-handle-123', true);
+		assert.equal(session.sessionManager.resumptionHandle, 'dead-handle-123');
+		assert.equal(clearStaleResumptionHandle(session), true);
+		assert.equal(session.sessionManager.resumptionHandle, null);
+		assert.equal(clearStaleResumptionHandle(session), false, 'nothing left to clear');
 	});
 });

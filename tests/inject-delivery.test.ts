@@ -1,6 +1,7 @@
 import { describe, it, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { deliverWithRetry } from '../src/inject-delivery.js';
+import { injectSilentContext } from '../src/browser-tools.js';
 
 // Behavior anchor for the retry-then-fallback control flow extracted from the
 // web result-watcher (live-agent-runtime.ts). Must preserve: two attempts at
@@ -58,4 +59,47 @@ describe('deliverWithRetry', () => {
 		assert.equal(attempts, 0);
 		assert.equal(exhausted, 1);
 	});
+
+	it('a quiet dispatch that resolves false is retried; the second, succeeding, stops without the fallback', async () => {
+		const modes: unknown[] = [];
+		const session = { injectText: async (_text: string, opts: { mode: string }) => (modes.push(opts.mode), modes.length >= 2) };
+		let exhausted = 0;
+		deliverWithRetry({ attempt: () => injectSilentContext(session, '[System: hi]'), onExhausted: () => { exhausted++; } });
+		mock.timers.tick(1500);
+		await settle();
+		assert.deepEqual(modes, ['quiet']);
+		mock.timers.tick(1500); // the retry runs only because the first dispatch resolved false
+		await settle();
+		assert.deepEqual(modes, ['quiet', 'quiet']);
+		assert.equal(exhausted, 0);
+		mock.timers.tick(5000);
+		await settle();
+		assert.equal(modes.length, 2);
+		assert.equal(exhausted, 0);
+	});
+
+	it('a rejected attempt counts as a failed one', async () => {
+		let attempts = 0, exhausted = 0;
+		deliverWithRetry({ attempt: () => (attempts++, Promise.reject(new Error('boom'))), onExhausted: () => { exhausted++; } });
+		mock.timers.tick(1500);
+		await settle();
+		mock.timers.tick(1500);
+		await settle();
+		assert.equal(attempts, 2);
+		assert.equal(exhausted, 1);
+	});
+
+	it('a synchronous true still stops at once, without waiting on a microtask', () => {
+		let attempts = 0, exhausted = 0;
+		deliverWithRetry({ attempt: () => (attempts++, true), onExhausted: () => { exhausted++; } });
+		mock.timers.tick(1500);
+		mock.timers.tick(5000);
+		assert.equal(attempts, 1);
+		assert.equal(exhausted, 0);
+	});
 });
+
+// Lets an awaited attempt settle; setImmediate is not among the mocked timers.
+function settle(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}

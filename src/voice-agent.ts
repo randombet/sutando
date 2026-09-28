@@ -64,7 +64,7 @@ import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
-import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
+import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper } from './voice-continuity.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -77,6 +77,7 @@ import {
 	clearTerminalClassification,
 	formatVoiceOfflineNotification,
 	formatVoiceRecoveryNotification,
+	wireCloseClassifier,
 	type ClassifiedClose,
 } from './voice-error-classifier.js';
 import {
@@ -98,7 +99,7 @@ import {
 	type RecoverySessionSurface,
 } from './voice-silence-recovery-coordinator.js';
 import {
-	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
+	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial, hostOwnsUpstreamRecovery,
 } from './voice-redial-scheduler.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
@@ -206,10 +207,6 @@ const ACTIVE_SILENCE_MODE = parseActiveSilenceMode(process.env.VOICE_ACTIVE_SILE
 const ACTIVE_SILENCE_TICKS = parseActiveSilenceTicks(process.env.VOICE_ACTIVE_SILENCE_TICKS);
 let voiceRecoveryCoordinator: VoiceSilenceRecoveryCoordinator | null = null;
 let voiceRecoveryLedger: WatchdogLedger | null = null;
-/** True while the legacy CLOSED guard is inside its cast-call reconnect —
- *  bodhi fires onClientConnected synchronously in there, and that fake
- *  attach must not mint a coordinator client epoch. */
-let legacyReconnectInFlight = false;
 
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -649,17 +646,16 @@ const endSession: ToolDefinition = {
 		// Death spiral observed live 2026-04-09 at 22:57 — 3 self-initiated
 		// end_session calls in 36 seconds. sessionManager.reset() only
 		// clears the state machine; conversationContext persists separately.
-		// (`items` is a GETTER returning bodhi's underlying _items array by
-		// reference — mutate in place via length = 0, never reassign. The
-		// helper also rebases the turn.end transcript cursor: P7 D7.3.)
+		// (The helper resets it through bodhi's resetConversationContext and
+		// also rebases the turn.end transcript cursor: P7 D7.3.)
 		itemsClear.clear('end_session');
 		// Also force-close client WS after 4s as fallback
 		setTimeout(() => {
 			console.log(`${ts()} [end_session] Force-closing client WS`);
 			try {
-				const ct = (voiceSessionRef as any)?.clientTransport;
-				console.log(`${ts()} [end_session] clientTransport exists: ${!!ct}, client exists: ${!!ct?.client}, readyState: ${ct?.client?.readyState}`);
-				ct?.client?.close(4000, 'goodbye');
+				const health = voiceSessionRef?.getClientSocketHealth();
+				console.log(`${ts()} [end_session] session exists: ${!!voiceSessionRef}, client exists: ${!!health}, readyState: ${health?.readyState}`);
+				voiceSessionRef?.closeClientConnection(4000, 'goodbye');
 			} catch (e) { console.log(`${ts()} [end_session] Close error: ${e}`); }
 		}, 4000);
 		return { status: 'ending' };
@@ -684,8 +680,7 @@ let voiceSessionRef: VoiceSession | null = null;
 // that accumulates after it). Used by end_session, the goodbye detector, and
 // the sessionEnding turn.end sweep.
 const itemsClear = createConversationClearHelper(
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	() => (voiceSessionRef as any)?.conversationContext?.items,
+	() => voiceSessionRef,
 	(m) => console.log(`${ts()} ${m}`),
 );
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
@@ -706,7 +701,7 @@ function resetSessionGateState(): void {
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 
-import { wireSanitizerToTransport } from './output_sanitizer.js';
+import { createSanitizerInterceptor } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -819,8 +814,7 @@ const mainAgent: MainAgent = {
 			setTimeout(() => {
 				try {
 					itemsClear.clear('voice_goodbye');
-					const ct = (voiceSessionRef as any)?.clientTransport;
-					ct?.client?.close(4000, 'goodbye');
+					voiceSessionRef?.closeClientConnection(4000, 'goodbye');
 				} catch {}
 			}, 3000);
 		} catch (e) {
@@ -880,6 +874,24 @@ async function main() {
 	// push into recorder.events/toolCalls/transcript exactly as they pushed
 	// into the old module-level arrays.
 	const recorder = createSessionRecorder('voice', SESSION_ID);
+	// A logical session ends on a real close (onSessionEnd) or on an upstream loss,
+	// which parks the session instead of closing it.
+	const endLogicalSession = (sessionId: string, reason: string): void => {
+		recorder.events.push({ event: `session_ended:${reason}`, timestamp: new Date().toISOString() });
+		console.log(`${ts()} [Session] Ended: ${sessionId} (${reason})`);
+		clearActiveArtifact();
+		recorder.flush();
+	};
+	// A client attach or a redial after a flush starts the next logical session.
+	const rollOverFlushedRecorder = (): void => {
+		if (!recorder.wasFlushed) return;
+		resetSessionGateState();
+		recorder.reset();
+		recorder.events.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
+		// onSessionStart fires only on the first ACTIVE, so restart the usage ticker here.
+		recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
+		console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
+	};
 	const voiceToolIdMap = new Map<string, string>();
 
 	// Authoritative voice-connection state. web-client reads this file
@@ -954,38 +966,39 @@ async function main() {
 	let redialTimer: ReturnType<typeof setTimeout> | null = null;
 	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
 	let lastReconnectAt = 0;
+	// Shared by F5 and the 30s tick. The recorder rollover a client attach runs is
+	// repeated here: the parked upstream's loss flushed the recorder.
+	const redialParkedUpstream = (s: VoiceSession): void => {
+		s.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
+		rollOverFlushedRecorder();
+	};
 	const fireEventRedial = (): void => {
 		redialTimer = null;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const s = sessionRef as any;
+		const s = sessionRef;
 		if (!s) return;
 		const now = Date.now();
-		const state = String(s.sessionManager?.state ?? 'unknown');
+		const state = String(s.sessionManager.state ?? 'unknown');
 		const clientConnected = Boolean(s.clientConnected);
 		if (!shouldEventDial({ state, clientConnected, now, nextDialAt: redialState.nextDialAt, fatalBackoffUntil: voiceFatalBackoffUntil })) {
 			// Blocked by the fatal gate alone → re-arm for when it lifts.
 			// Any other veto drops the dial: the next lifecycle event or the
 			// 30s tick takes over.
-			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'CLOSED' && clientConnected) {
+			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'UPSTREAM_LOST' && clientConnected) {
 				armRedialTimer(voiceFatalBackoffUntil - now + 100);
 			}
 			return;
 		}
 		// While the armed coordinator owns the episode, F5 stands down: its
-		// dial would be an uncounted attempt, and the fake attach below must
-		// not mint a coordinator client epoch. Lifecycle events resume F5
+		// dial would be an uncounted attempt. Lifecycle events resume F5
 		// naturally once the episode resolves.
 		if (voiceRecoveryCoordinator?.ownsRecovery ?? false) return;
 		redialState = noteDialed(redialState);
 		lastReconnectAt = now;
 		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
 		try {
-			legacyReconnectInFlight = true;
-			s.handleClientConnected();
+			redialParkedUpstream(s);
 		} catch (err) {
 			console.error(`${ts()} [Redial] reconnect trigger failed:`, (err as Error)?.message ?? err);
-		} finally {
-			legacyReconnectInFlight = false;
 		}
 	};
 	const armRedialTimer = (delayMs: number): void => {
@@ -1087,11 +1100,19 @@ async function main() {
 		// construction, since typeof on a const in its TDZ still throws.
 		getSessionDiagnostics: () => {
 			try {
-				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
+				return typeof session !== 'undefined' ? session.getDiagnostics() : null;
 			} catch {
 				return null;
 			}
 		},
+	});
+
+	// Native audio streams transcript and audio concurrently, so suppression reaches only
+	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
+	const outputSanitizer = createSanitizerInterceptor({
+		onBlocked: (buffered) =>
+			console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
+		log: (m) => console.log(`${ts()} ${m}`),
 	});
 
 	const session = new VoiceSession({
@@ -1106,16 +1127,38 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		outputInterceptor: outputSanitizer,
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
+			// The client's audio_health heartbeat is engine telemetry: the ledger consumes it.
+			if (audioHealth.interceptHeartbeat(message)) return;
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 			// Frames the core does not own are offered to optional skills' handlers.
 			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
 		},
+		// Runs before bodhi's attach bootstrap and its UPSTREAM_LOST redial.
 		onClientConnected: () => {
-			if (legacyReconnectInFlight) return; // not a real attach edge
+			cancelIdleTeardown();
+			// A dead session's resumption handle must not poison the attach redial
+			// (1008 "Requested entity was not found" staircase).
+			if (session.sessionManager.state === 'UPSTREAM_LOST' && session.clearResumption()) {
+				console.log(`${ts()} [Resume] cleared stale resumption handle from dead session before fresh connect`);
+			}
+			// P7 D7.1: new client connection = new (pending) ledger epoch; the
+			// epoch value is minted on first heartbeat sight (nonce mapping).
+			audioHealth.onClientConnected();
+			// Z3 fence: a REAL connection invalidates any pending probe/verifier
+			// idle-restore, which must never tear the upstream down under this client.
+			probeIdleRestore.fence();
+			// onSessionStart fires only on the first ACTIVE, so an attach after a
+			// flush starts the next logical session here.
+			rollOverFlushedRecorder();
+			writeVoiceState(true);
 			voiceRecoveryCoordinator?.handleClientConnected();
+			// Step 12: immediate `agent.state` frame on every accepted real connection
+			// (repeats ride the upstream-transition subscription); also the A9 attach transition.
+			emitAgentState({ immediate: true });
 		},
 		onClientDisconnected: () => {
 			// An origin belongs to the client that announced it; the next client announces its own.
@@ -1123,13 +1166,38 @@ async function main() {
 			setVoiceSessionOrigin(null);
 			clientFrames.disconnected();
 			voiceRecoveryCoordinator?.handleClientDisconnected();
+			// No listener left, so frames only burn capture + quota. Reason is
+			// terminal: a browser push driver must tear down, not re-arm.
+			const stopped = stopVisionStreaming('no-client');
+			if (stopped.status === 'stopped') {
+				console.log(`${ts()} [Vision] stopped on client disconnect (${stopped.frames} frame(s))`);
+			}
+			// A detach never triggers onSessionEnd, so metrics are flushed here.
+			recorder.flush();
+			writeVoiceState(false);
+			// P7 D7.1: final ledger row for the departing epoch — written NOW
+			// (the crash-evidence rule: end-of-session-only flushes lose it).
+			audioHealth.onClientDisconnected();
+			audioHealth.persistTick('final', false);
+			scheduleIdleTeardown();
+			// Step 12/A9: client detach is a lifecycle transition (and may
+			// flip upstream backoff→idle now that no client is attached).
+			emitAgentState();
 		},
-		// Whenever the coordinator owns the episode (restarting, waiting-retry,
-		// terminal, or a recovered origin), bodhi's attach auto-actions —
-		// greeting, context replay and especially the CLOSED auto-reconnect —
-		// would be uncounted bypasses of the attempt budget. The synthetic hold
-		// already gates the injection paths post-recovery; this gates the dial.
-		suppressClientAutoActions: () => voiceRecoveryCoordinator?.ownsRecovery ?? false,
+		// A reattach after the first completed turn gets the recent conversation as
+		// quiet context instead of a second greeting.
+		reattachGreeting: 'until-first-turn',
+		reattachContextReplay: true,
+		// A lost upstream parks in UPSTREAM_LOST instead of closing, so the process
+		// can redial it (attach, F5, the 30s tick, the coordinator).
+		upstreamLossPolicy: 'hold',
+		// The coordinator's episode, or a terminal close's fatal backoff, owns recovery:
+		// bodhi's own reconnect and attach redial would bypass its budget or the backoff.
+		suppressClientAutoActions: () => hostOwnsUpstreamRecovery({
+			coordinatorOwnsRecovery: voiceRecoveryCoordinator?.ownsRecovery ?? false,
+			fatalBackoffUntil: voiceFatalBackoffUntil,
+			now: Date.now(),
+		}),
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
 		// context occupancy and connection lineage (design §1.1/§1.4).
 		// The per-modality breakdown rides the same message (design §1.4) but is
@@ -1163,6 +1231,9 @@ async function main() {
 		...(VOICE_SESSION_TUNING.mediaResolution !== undefined
 			? { mediaResolution: VOICE_SESSION_TUNING.mediaResolution }
 			: {}),
+		// Keeps the previous wire shape: no realtimeInputConfig is sent, so the server's
+		// own end-of-speech settings apply instead of bodhi's default VAD tuning.
+		realtimeInputConfig: false,
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1199,12 +1270,7 @@ async function main() {
 				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
 				console.log(`${ts()} [Session] Started: ${e.sessionId}`);
 			},
-			onSessionEnd: (e) => {
-				recorder.events.push({ event: `session_ended:${e.reason}`, timestamp: new Date().toISOString() });
-				console.log(`${ts()} [Session] Ended: ${e.sessionId} (${e.reason})`);
-				clearActiveArtifact();
-				recorder.flush();
-			},
+			onSessionEnd: (e) => endLogicalSession(e.sessionId, e.reason),
 			// P7 D7.3: bodhi's turn-latency hook was half-blind AND unconsumed
 			// (G-P7-12) — the ledger keeps the last value for [Health] and the
 			// persisted snapshot.
@@ -1295,9 +1361,8 @@ async function main() {
 		console.warn(`${ts()} [SilenceRecovery] armed requested but VOICE_ACTIVE_SILENCE_TICKS=0 disables the watchdog — staying in shadow`);
 	}
 
-	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
-	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
-	// count). Coverage is honestly session-only until the bodhi pin.
+	// P7 D7.1: the ledger observes audio ingress (count + ingress-RMS speech tracker)
+	// and egress; its audio_health heartbeat is intercepted in onClientCommand.
 	audioHealth.wrapSession(session);
 	// P7 D7.4: vision defers frames while the canonical speech evidence is
 	// active (pause-during-speech rides the same tracker as the matrix).
@@ -1328,8 +1393,8 @@ async function main() {
 	}
 	const sendAgentStateFrame = (frame: AgentStateV1): void => {
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(session as any).clientTransport?.sendJsonToClient?.(frame);
+			// Spread: an interface has no index signature, and a host frame needs one.
+			session.sendJsonToClient({ ...frame });
 		} catch (err) {
 			console.error(`${ts()} [AgentState] frame send failed: ${(err as Error)?.message ?? err}`);
 		}
@@ -1381,10 +1446,8 @@ async function main() {
 	// HTTP control endpoint so the web-client Watch button can drive the
 	// same controller (proxied through web-client to stay same-origin).
 	setVisionSession(session);
-	// updateTools is on the private transport (GeminiLiveTransport), not VoiceSession.
 	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
+	setSessionToolUpdater((tools) => { void session.replaceTools(tools); }, mainAgentTools);
 	startVisionControlServer();
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
@@ -1398,9 +1461,6 @@ async function main() {
 			console.error(`${ts()} [VoiceFailure] no transport on session — classifier not wired`);
 			return;
 		}
-		const origOnClose = typeof transport.onClose === 'function'
-			? transport.onClose.bind(transport)
-			: null;
 		// Shared with the recovery hook, which needs to know a banner was shown.
 		const notifiedCategories = voiceNotifiedCategories;
 		const handleClose = (c: ClassifiedClose): void => {
@@ -1445,19 +1505,7 @@ async function main() {
 				platformNotify(safe, 'Sutando — voice offline');
 			} catch {}
 		};
-		transport.onClose = (code?: number, reason?: string) => {
-			if (origOnClose) {
-				try { origOnClose(code, reason); } catch (e) {
-					console.error(`${ts()} [VoiceFailure] origOnClose threw: ${(e as Error)?.message ?? e}`);
-				}
-			}
-			try {
-				const c = classifyTransportClose(code, reason);
-				handleClose(c);
-			} catch (e) {
-				console.error(`${ts()} [VoiceFailure] classifier threw: ${(e as Error)?.message ?? e}`);
-			}
-		};
+		wireCloseClassifier(transport, handleClose, (m) => console.error(`${ts()} [VoiceFailure] ${m}`));
 		console.log(`${ts()} [VoiceFailure] classifier wired into transport.onClose`);
 	})();
 
@@ -1480,36 +1528,17 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
-	// Native audio streams transcript and audio concurrently, so suppression reaches only
-	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
-	(() => {
-		// Wiring lives in output_sanitizer.ts so it has a test seam: this adapter
-		// path had none, which is the standing review blocker on this PR.
-		wireSanitizerToTransport({
-			transport: (session as any).transport,
-			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
-			beforeTranscriptFlush: (reset) => {
-				// bodhi flushes the transcript 2-4 lines BEFORE publishing turn.end
-				// (dist/index.js:3019/3106/3177), so a subscriber runs too late.
-				const tm = (session as any).transcriptManager;
-				if (!tm || typeof tm.flush !== 'function') return;
-				const origFlush = tm.flush.bind(tm);
-				tm.flush = () => { try { reset(); } catch {} origFlush(); };
-			},
-			onBlocked: (buffered) =>
-				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
-			log: (m) => console.log(`${ts()} ${m}`),
-		});
-	})();
+	// The output sanitizer releases held text before each transcript flush; resetTurn is
+	// idempotent, so these turn-boundary subscriptions stay as a backstop.
+	session.eventBus.subscribe('turn.end', () => outputSanitizer.resetTurn());
+	session.eventBus.subscribe('turn.interrupted', () => outputSanitizer.resetTurn());
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
 		const { teeAudio } = await import('../skills/screen-record/scripts/narration-tee.js');
-		const origHandleAudioOutput = (session as any).handleAudioOutput.bind(session);
-		(session as any).handleAudioOutput = (data: string) => {
-			origHandleAudioOutput(data);
-			try { teeAudio(Buffer.from(data, 'base64')); } catch {}
-		};
+		session.observeAudioOutput((pcm) => {
+			try { teeAudio(pcm); } catch {}
+		});
 		console.log(`${ts()} [NarrationTee] wired into voice agent audio output`);
 	} catch (e) {
 		console.log(`${ts()} [NarrationTee] not available: ${e instanceof Error ? e.message : e}`);
@@ -1693,10 +1722,8 @@ async function main() {
 	// produces a phantom assistant turn (sometimes a tool call) with no user
 	// input. Symptoms observed: phantom save_meeting_note polluting markdown
 	// notes, phantom open_url opening browser tabs, phantom work tool calls
-	// writing fake task files. CLOSED state is a fixed point when
-	// clientConnected=false (the existing health monitor only reconnects
-	// CLOSED→CONNECTING when a client is present), so once we transition there
-	// no phantoms can fire until the next legitimate client reconnect.
+	// writing fake task files. A parked upstream (UPSTREAM_LOST) is redialed only
+	// for an attached client, so no phantoms fire until the next real attach.
 	// Tunable via env var per Mini's #602 review note. Defaults to 60s — sane
 	// for the voice / phone reconnect cadence we've observed; raise if a host
 	// has frequent ~70s connect/disconnect churn that re-opens too aggressively.
@@ -1708,12 +1735,10 @@ async function main() {
 	// attachment at fire time so a client that connected while the timer was
 	// pending is never torn down under.
 	const teardownIdleUpstream = async (via: string) => {
-		if ((session as any).clientConnected) return;
-		const transport = (session as any).transport;
-		if (!transport?.disconnect) return;
-		console.log(`${ts()} [VoiceSession] Idle (${via}) — closing Gemini transport (no phantoms while CLOSED)`);
+		if (session.clientConnected) return;
+		console.log(`${ts()} [VoiceSession] Idle (${via}) — parking the Gemini upstream (no phantoms while UPSTREAM_LOST)`);
 		try {
-			await transport.disconnect();
+			await session.parkUpstream('idle');
 		} catch (err) {
 			console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
 		}
@@ -1735,12 +1760,12 @@ async function main() {
 
 	// Amendment Z3 — verifier/probe idle restoration. The initial idle timer
 	// above is one-shot and rearmed only by the REAL-client disconnect
-	// wrapper; a probe/verifier that closes after that timer already fired
+	// hook; a probe/verifier that closes after that timer already fired
 	// would otherwise leave a woken upstream connected forever (no real
 	// client will ever rearm it). The isolated restore timer arms on
 	// probe-role close with no real client attached and restores the prior
-	// idle state (upstream → CLOSED); a later real connection fences it
-	// (handleClientConnected wrapper below). SEAM: until the Step-11 bodhi
+	// idle state (upstream → UPSTREAM_LOST); a later real connection fences it
+	// (the onClientConnected hook). SEAM: until the Step-11 bodhi
 	// pin exposes a probe/verifier-close hook, the only in-repo arm point is
 	// the `probeState` callback passed to the VoiceSession constructor —
 	// when bodhi's role close hook lands, wire it to `probeIdleRestore.arm()`
@@ -1752,81 +1777,9 @@ async function main() {
 		teardown: () => teardownIdleUpstream('probe-idle-restore'),
 	});
 
-	// Flush metrics on client disconnect — bodhi's handleClientDisconnected()
-	// doesn't trigger onSessionEnd, so metrics would never be written. Also
-	// arms the idle-teardown timer (see above).
-	const origDisconnect = (session as any).handleClientDisconnected?.bind(session);
-	if (origDisconnect) {
-		(session as any).handleClientDisconnected = () => {
-			origDisconnect();
-			// No listener left, so frames only burn capture + quota. Reason is
-			// terminal: a browser push driver must tear down, not re-arm.
-			const stopped = stopVisionStreaming('no-client');
-			if (stopped.status === 'stopped') {
-				console.log(`${ts()} [Vision] stopped on client disconnect (${stopped.frames} frame(s))`);
-			}
-			recorder.flush();
-			writeVoiceState(false);
-			// P7 D7.1: final ledger row for the departing epoch — written NOW
-			// (the crash-evidence rule: end-of-session-only flushes lose it).
-			audioHealth.onClientDisconnected();
-			audioHealth.persistTick('final', false);
-			scheduleIdleTeardown();
-			// Step 12/A9: client detach is a lifecycle transition (and may
-			// flip upstream backoff→idle now that no client is attached).
-			emitAgentState();
-		};
-	}
-
-	// Reset per-session state on client connect when a stale flush is sitting
-	// in the buffer. Bodhi's onSessionStart only fires on the first ACTIVE
-	// transition (index.js:1219 — `!this.startedAt` guard, never reset). So:
-	//   (a) 2nd+ user-connects within one process miss the onSessionStart reset
-	//   (b) a phantom server-idle session_end can flush `metricsWritten=true`
-	//       BEFORE the first real client ever connects (observed 2026-05-22:
-	//       server starts → 60s idle → bodhi auto-ends a 0/0 phantom session →
-	//       metricsWritten=true → real user connects 30min later → next
-	//       onSessionEnd's writeVoiceMetrics returns early → record lost)
-	// Both reduce to: whenever a client connects while metricsWritten=true,
-	// the previous logical session has already been flushed, so reset for
-	// the new one. (The very first connect on a fresh process with no idle
-	// phantom has metricsWritten=false and skips the reset — onSessionStart
-	// already did it.) Also cancels any pending idle teardown.
-	const origConnect = (session as any).handleClientConnected?.bind(session);
-	if (origConnect) {
-		(session as any).handleClientConnected = () => {
-			cancelIdleTeardown();
-			// A dead session's resumption handle must not poison the fresh
-			// connect (1008 "Requested entity was not found" staircase — see
-			// clearStaleResumptionHandle). Only the CLOSED path reconnects.
-			if (session.sessionManager.state === 'CLOSED' && clearStaleResumptionHandle(session)) {
-				console.log(`${ts()} [Resume] cleared stale resumption handle from dead session before fresh connect`);
-			}
-			// P7 D7.1: new client connection = new (pending) ledger epoch; the
-			// epoch value is minted on first heartbeat sight (nonce mapping).
-			audioHealth.onClientConnected();
-			// Z3 fence: a REAL connection invalidates any pending
-			// probe/verifier idle-restore — the restore must never tear the
-			// upstream down under this client.
-			probeIdleRestore.fence();
-			if (recorder.wasFlushed) {
-				resetSessionGateState();
-				recorder.reset();
-				recorder.events.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
-				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
-				// usage ticker here too — otherwise this reconnect session emits no usage.
-				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
-				console.log(`${ts()} [Session] Client connected after prior flush — reset metrics buffer`);
-			}
-			writeVoiceState(true);
-			origConnect();
-			// Step 12: immediate `agent.state` frame on every accepted real
-			// connection (after origConnect so `clientAttached` reads true),
-			// then repeats ride the upstream-transition subscription. Also
-			// publishes the A9 lifecycle attach transition.
-			emitAgentState({ immediate: true });
-		};
-	}
+	// onSessionEnd fires only on a real close; a parked upstream ends the logical
+	// session too, and its flush is what the attach rollover in onClientConnected keys on.
+	session.eventBus.subscribe('session.upstreamLost', (e) => endLogicalSession(e.sessionId, e.reason));
 
 	// Arm the initial teardown — voice-agent boots with no client; if none
 	// connects within IDLE_TEARDOWN_MS, close the upstream transport.
@@ -1835,7 +1788,7 @@ async function main() {
 	// Wire task status → web client
 	setTaskStatusCallback((taskId, status, text, result) => {
 		try {
-			(session as any).clientTransport?.sendJsonToClient?.({
+			session.sendJsonToClient({
 				type: 'task.status', taskId, status, text, result: result || '',
 			});
 		} catch {}
@@ -1886,33 +1839,14 @@ async function main() {
 			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
 			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
 		}
-		// Force CLOSED so the health monitor's handleClientConnected path recovers.
-		// VoiceSession leaves state at CONNECTING after a failed start() and exposes
-		// no public reset API (reconnect()/disconnect() are on the internal transport,
-		// not on VoiceSession). CONNECTING→CLOSED is valid per bodhi's state table
-		// (index.js:1164). CREATED→CLOSED is also valid. If the state is already
-		// CLOSED or ACTIVE for some reason, transitionTo throws — log it so the
-		// mismatch is visible (the health monitor only recovers from CLOSED).
-		// TODO: drop the hack once bodhi exposes a public session.reset().
-		try {
-			session.sessionManager.transitionTo('CLOSED');
-		} catch (e) {
-			console.error(`${ts()} [Startup] Could not transition to CLOSED (state=${session.sessionManager.state}): ${(e as Error)?.message ?? e}`);
-		}
-		// Belt-and-braces: the transitionTo above already emits via the
-		// stateChange subscription; when it throws (state already CLOSED)
-		// this still publishes the terminal classification (dedup makes a
-		// double call a no-op).
+		// A failed first dial leaves the session parked in UPSTREAM_LOST, which the next
+		// attach or the health tick redials; the park's frame predates the classification.
 		emitAgentState();
 	}
 
 	// Health monitor — runs regardless of whether initial start() succeeded.
-	// Serialization: bodhi's handleClientConnected() is synchronous and transitions
-	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
-	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
-	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
-	// throttle prevents a tight retry loop. (lastReconnectAt is declared with
-	// the F5 redial machinery above — the event-driven path shares it.)
+	// recoverUpstream() leaves UPSTREAM_LOST synchronously; a redial that fails parks
+	// again, and the 60s lastReconnectAt throttle (shared with F5) bounds the retries.
 	let connectingSince = 0;
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
@@ -1926,8 +1860,7 @@ async function main() {
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const serverBufferedAmount = (session as any).clientTransport?.client?.bufferedAmount ?? null;
+		const serverBufferedAmount = session.getClientSocketHealth()?.bufferedAmount ?? null;
 		// Log only on state changes or non-ACTIVE states — avoid 2,880 lines/day of
 		// "state=ACTIVE client=true" during healthy operation. P7 D7.1 inverts
 		// the suppression for anomalies: any tick where the ledger latched an
@@ -2012,11 +1945,8 @@ async function main() {
 			voiceFatalBackoffUntil = 0;
 			voiceRecoveryCoordinator?.handleFatalBackoffCleared();
 		}
-		// A connect that HANGS never returns to CLOSED, so the recovery guard below
-		// — which only fires from CLOSED — can never see it. Observed live: 23min
-		// in CONNECTING with a client attached, mic captured, nothing reaching the
-		// model. Force CLOSED so the next tick recovers; same transition the
-		// startup path already uses, and valid per bodhi's state table.
+		// bodhi bounds every dial (CONNECTING, or RECONNECTING for a reconnect or redial)
+		// and parks a failed one, so a verdict here is reported, never forced.
 		// The hang clock keys on STATE, not client attachment: a panel reload
 		// mid-hang must not restart the countdown (policy + tests live in
 		// voice-connect-watchdog.ts).
@@ -2026,37 +1956,24 @@ async function main() {
 		});
 		connectingSince = tick.connectingSince;
 		if (tick.forceClose) {
-			console.error(`${ts()} [Health] Stuck in CONNECTING for `
-				+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
-			try {
-				session.sessionManager.transitionTo('CLOSED');
-				connectingSince = 0;
-			} catch (err) {
-				// Clock stays armed: the throttles in shouldForceClosed bound retries.
-				console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
-					(err as Error)?.message ?? err);
-			}
+			console.error(`${ts()} [Health] Dial stuck in ${state} for `
+				+ `${Math.round((Date.now() - connectingSince) / 1000)}s — past bodhi's dial deadline`);
+			connectingSince = 0;
 		}
-		// Recover when session is CLOSED and a client is waiting. handleClientConnected
-		// is bodhi's internal entry point for this exact scenario (CLOSED + client
-		// present → transition to CONNECTING, reconnect fire-and-forget).
+		// Recover when the upstream is parked and a client is waiting.
 		// F5: this is now the SAFETY NET behind the event-driven redial —
 		// tickMayDial defers to a pending scheduled dial so the tick cannot
 		// preempt the backoff.
-		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
+		if (state === 'UPSTREAM_LOST' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
 			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
 			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
 			lastReconnectAt = Date.now();
 			redialState = noteDialed(redialState);
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
-				legacyReconnectInFlight = true;
-				(session as any).handleClientConnected();
+				redialParkedUpstream(session);
 			} catch (err) {
 				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
-			} finally {
-				legacyReconnectInFlight = false;
 			}
 		}
 		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no

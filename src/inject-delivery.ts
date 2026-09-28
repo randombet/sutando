@@ -18,8 +18,9 @@
  */
 
 export interface DeliverWithRetryOptions {
-	/** Try to deliver now. Return true if it landed (stop), false to keep retrying. */
-	attempt: () => boolean;
+	/** Try to deliver now. Return (or resolve) true if it landed (stop), false to keep
+	 *  retrying; a rejection counts as a failed attempt. */
+	attempt: () => boolean | Promise<boolean>;
 	/** Called once, after every scheduled attempt has failed. */
 	onExhausted: () => void;
 	/**
@@ -42,12 +43,18 @@ export function deliverWithRetry(opts: DeliverWithRetryOptions): void {
 	}
 	const step = (i: number): void => {
 		setTimeout(() => {
-			if (opts.attempt()) return;
-			if (i + 1 < delays.length) {
-				step(i + 1);
-			} else {
-				opts.onExhausted();
-			}
+			const settle = (landed: boolean): void => {
+				if (landed) return;
+				if (i + 1 < delays.length) {
+					step(i + 1);
+				} else {
+					opts.onExhausted();
+				}
+			};
+			// A synchronous result settles in this tick, as before; only a promise waits.
+			const result = opts.attempt();
+			if (result instanceof Promise) result.then(settle, () => settle(false));
+			else settle(result);
 		}, delays[i]);
 	};
 	step(0);

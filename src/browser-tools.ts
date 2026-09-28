@@ -23,36 +23,15 @@ import { withScheme } from './url-scheme.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-/** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
+/** Send text as live input the model answers, as if the user had just said it. */
 export function injectText(session: any, text: string) {
-	try {
-		const transport = session?.transport;
-		if (typeof transport?.session?.sendRealtimeInput === 'function') {
-			transport.session.sendRealtimeInput({ text });
-		} else if (typeof transport?.sendContent === 'function') {
-			transport.sendContent([{ role: 'user', text }], true);
-		} else {
-			console.warn(`${ts()} [InjectText] No supported text injection method on transport`);
-		}
-	} catch (err) {
-		console.error(`${ts()} [InjectText] Error:`, err);
-	}
+	void session.injectText(text, { mode: 'live' });
 }
 
-/** Send context through `transport.sendContent` with `turnComplete: false`. The pinned Gemini
- *  transport ignores that flag and sends realtime text, so a spoken reply is still possible. */
-export function injectSilentContext(session: any, text: string): boolean {
-	try {
-		const transport = session?.transport;
-		if (typeof transport?.sendContent === 'function') {
-			transport.sendContent([{ role: 'user', text }], false);
-			return true;
-		}
-		console.warn(`${ts()} [InjectSilent] transport has no sendContent — context dropped`);
-	} catch (err) {
-		console.error(`${ts()} [InjectSilent] Error:`, err);
-	}
-	return false;
+/** Add context without completing the turn, so the model does not reply to it.
+ *  Resolves false when nothing was sent, so the caller can retry. */
+export async function injectSilentContext(session: any, text: string): Promise<boolean> {
+	return await session.injectText(text, { mode: 'quiet' });
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)

@@ -15,6 +15,8 @@ import {
 	MAX_FPS,
 	startVisionControlServer,
 	stopVisionControlServer,
+	captureSendFrame,
+	registerVisionFrameHook,
 } from '../src/vision-tools.js';
 import type { AddressInfo } from 'node:net';
 
@@ -23,12 +25,15 @@ function fakeSession(state = 'ACTIVE') {
 	const sent: Array<{ b64: string; mime: string }> = [];
 	const session = {
 		sessionManager: { state },
-		transport: {
-			isConnected: true,
-			sendFile(b64: string, mime: string) {
-				sent.push({ b64, mime });
-			},
-			sendContent() {},
+		// False stands in for a session that is not listening (transcription mode).
+		listening: true,
+		sendRealtimeMedia(b64: string, mime: string): boolean {
+			if (!session.listening) return false;
+			sent.push({ b64, mime });
+			return true;
+		},
+		async injectText(): Promise<boolean> {
+			return true;
 		},
 	};
 	return { session, sent };
@@ -141,6 +146,37 @@ describe('P7 D7.4 vision egress controls', () => {
 		assert.equal(sent.length, 1);
 		assert.ok(getVisionEgressStats().deferredBudget >= 1);
 		stopStreaming();
+	});
+
+	it('a frame refused in transcription mode is dropped: no bucket charge, count, parked slot or hook', async () => {
+		const { session, sent } = fakeSession();
+		session.listening = false;
+		let hookCalls = 0;
+		const unhook = registerVisionFrameHook(() => { hookCalls++; });
+		try {
+			setVisionSession(session);
+			registerSource({ name: 'refused-source', capture: async () => ({ data: frameBuf(4), mimeType: 'image/jpeg' }) });
+			const before = getVisionEgressStats();
+			const r = await captureSendFrame('refused-source');
+			assert.equal(r.ok, true, 'a refused frame is not a capture failure');
+			assert.equal(sent.length, 0);
+			const after = getVisionEgressStats();
+			assert.equal(after.sent, before.sent, 'no delivery counted');
+			assert.equal(after.deferredGate, before.deferredGate, 'not deferred');
+			assert.equal(after.deferredBudget, before.deferredBudget, 'not deferred');
+			assert.equal(after.slotOccupied, false, 'dropped, not parked for a later drain');
+			assert.equal(getVisionState().frames, 0);
+			assert.equal(hookCalls, 0, 'post-send hooks fire only for a delivered frame');
+			// No bucket or send-interval charge: the next frame, sent at once, is not budget-deferred.
+			session.listening = true;
+			const r2 = await captureSendFrame('refused-source');
+			assert.equal(r2.ok, true);
+			assert.equal(sent.length, 1);
+			assert.equal(getVisionEgressStats().sent, before.sent + 1);
+			assert.equal(hookCalls, 1);
+		} finally {
+			unhook();
+		}
 	});
 
 	it('stopStream clears the parked frame — stale vision never leaks into the next session', () => {

@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import {
 	REDIAL_BASE_MS, REDIAL_CAP_MS, REDIAL_STABLE_MS, REDIAL_JITTER_FRAC,
 	initialRedialState, isLocalDisconnect, backoffDelayMs, noteLifecycle,
-	shouldEventDial, tickMayDial, noteDialed,
+	shouldEventDial, tickMayDial, noteDialed, hostOwnsUpstreamRecovery,
 	type RedialState, type RedialLifecycleEvent,
 } from '../src/voice-redial-scheduler.js';
 
@@ -201,7 +201,7 @@ describe('fatal-backoff gate', () => {
 	});
 
 	it('shouldEventDial refuses while the fatal gate is active (strict >, matching the tick)', () => {
-		const base = { state: 'CLOSED', clientConnected: true, now: 200_000, nextDialAt: 150_000, fatalBackoffUntil: 0 };
+		const base = { state: 'UPSTREAM_LOST', clientConnected: true, now: 200_000, nextDialAt: 150_000, fatalBackoffUntil: 0 };
 		assert.equal(shouldEventDial(base), true);
 		assert.equal(shouldEventDial({ ...base, fatalBackoffUntil: 200_000 }), false);
 		assert.equal(shouldEventDial({ ...base, fatalBackoffUntil: 199_999 }), true);
@@ -209,9 +209,9 @@ describe('fatal-backoff gate', () => {
 });
 
 describe('shouldEventDial — fire-time preconditions', () => {
-	const base = { state: 'CLOSED', clientConnected: true, now: 200_000, nextDialAt: 200_000, fatalBackoffUntil: 0 };
+	const base = { state: 'UPSTREAM_LOST', clientConnected: true, now: 200_000, nextDialAt: 200_000, fatalBackoffUntil: 0 };
 
-	it('dials when CLOSED, client attached, due, and no fatal gate', () => {
+	it('dials when UPSTREAM_LOST, client attached, due, and no fatal gate', () => {
 		assert.equal(shouldEventDial(base), true);
 	});
 
@@ -219,6 +219,8 @@ describe('shouldEventDial — fire-time preconditions', () => {
 		assert.equal(shouldEventDial({ ...base, nextDialAt: 0 }), false, 'nothing pending');
 		assert.equal(shouldEventDial({ ...base, now: 199_999 }), false, 'not yet due');
 		assert.equal(shouldEventDial({ ...base, state: 'CONNECTING' }), false, 'dial in flight');
+		assert.equal(shouldEventDial({ ...base, state: 'RECONNECTING' }), false, 'redial in flight');
+		assert.equal(shouldEventDial({ ...base, state: 'CLOSED' }), false, 'session closed for good');
 		assert.equal(shouldEventDial({ ...base, state: 'ACTIVE' }), false, 'session healthy');
 		assert.equal(shouldEventDial({ ...base, clientConnected: false }), false, 'nobody listening');
 	});
@@ -232,5 +234,19 @@ describe('tick fallback interaction', () => {
 	it('the tick may dial once the schedule is due or absent', () => {
 		assert.equal(tickMayDial({ now: 130_000, nextDialAt: 130_000 }), true);
 		assert.equal(tickMayDial({ now: 100_000, nextDialAt: 0 }), true, 'no schedule → tick behaves as before');
+	});
+});
+
+describe('hostOwnsUpstreamRecovery — the suppressClientAutoActions gate', () => {
+	const base = { coordinatorOwnsRecovery: false, fatalBackoffUntil: 0, now: 200_000 };
+
+	it('bodhi keeps its own recovery when nothing owns it', () => {
+		assert.equal(hostOwnsUpstreamRecovery(base), false);
+		assert.equal(hostOwnsUpstreamRecovery({ ...base, fatalBackoffUntil: 200_000 }), false, 'expired backoff');
+	});
+
+	it('an armed coordinator episode or a pending fatal backoff owns it', () => {
+		assert.equal(hostOwnsUpstreamRecovery({ ...base, coordinatorOwnsRecovery: true }), true);
+		assert.equal(hostOwnsUpstreamRecovery({ ...base, fatalBackoffUntil: 200_001 }), true);
 	});
 });
