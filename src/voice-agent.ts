@@ -646,9 +646,8 @@ const endSession: ToolDefinition = {
 		// Death spiral observed live 2026-04-09 at 22:57 — 3 self-initiated
 		// end_session calls in 36 seconds. sessionManager.reset() only
 		// clears the state machine; conversationContext persists separately.
-		// (`items` is a GETTER returning bodhi's underlying _items array by
-		// reference — mutate in place via length = 0, never reassign. The
-		// helper also rebases the turn.end transcript cursor: P7 D7.3.)
+		// (The helper resets it through bodhi's resetConversationContext and
+		// also rebases the turn.end transcript cursor: P7 D7.3.)
 		itemsClear.clear('end_session');
 		// Also force-close client WS after 4s as fallback
 		setTimeout(() => {
@@ -681,8 +680,7 @@ let voiceSessionRef: VoiceSession | null = null;
 // that accumulates after it). Used by end_session, the goodbye detector, and
 // the sessionEnding turn.end sweep.
 const itemsClear = createConversationClearHelper(
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	() => (voiceSessionRef as any)?.conversationContext?.items,
+	() => voiceSessionRef,
 	(m) => console.log(`${ts()} ${m}`),
 );
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
@@ -703,7 +701,7 @@ function resetSessionGateState(): void {
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
 
-import { wireSanitizerToTransport } from './output_sanitizer.js';
+import { createSanitizerInterceptor } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -1102,11 +1100,19 @@ async function main() {
 		// construction, since typeof on a const in its TDZ still throws.
 		getSessionDiagnostics: () => {
 			try {
-				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
+				return typeof session !== 'undefined' ? session.getDiagnostics() : null;
 			} catch {
 				return null;
 			}
 		},
+	});
+
+	// Native audio streams transcript and audio concurrently, so suppression reaches only
+	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
+	const outputSanitizer = createSanitizerInterceptor({
+		onBlocked: (buffered) =>
+			console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
+		log: (m) => console.log(`${ts()} ${m}`),
 	});
 
 	const session = new VoiceSession({
@@ -1121,6 +1127,7 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		outputInterceptor: outputSanitizer,
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
@@ -1224,6 +1231,9 @@ async function main() {
 		...(VOICE_SESSION_TUNING.mediaResolution !== undefined
 			? { mediaResolution: VOICE_SESSION_TUNING.mediaResolution }
 			: {}),
+		// Keeps the previous wire shape: no realtimeInputConfig is sent, so the server's
+		// own end-of-speech settings apply instead of bodhi's default VAD tuning.
+		realtimeInputConfig: false,
 		...(VOICE_SHADOW_STT
 			? {
 					shadowSttProvider: new GeminiBatchSTTProvider({
@@ -1436,10 +1446,8 @@ async function main() {
 	// HTTP control endpoint so the web-client Watch button can drive the
 	// same controller (proxied through web-client to stay same-origin).
 	setVisionSession(session);
-	// updateTools is on the private transport (GeminiLiveTransport), not VoiceSession.
 	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
+	setSessionToolUpdater((tools) => { void session.replaceTools(tools); }, mainAgentTools);
 	startVisionControlServer();
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
@@ -1520,36 +1528,17 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
-	// Native audio streams transcript and audio concurrently, so suppression reaches only
-	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
-	(() => {
-		// Wiring lives in output_sanitizer.ts so it has a test seam: this adapter
-		// path had none, which is the standing review blocker on this PR.
-		wireSanitizerToTransport({
-			transport: (session as any).transport,
-			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
-			beforeTranscriptFlush: (reset) => {
-				// bodhi flushes the transcript 2-4 lines BEFORE publishing turn.end
-				// (dist/index.js:3019/3106/3177), so a subscriber runs too late.
-				const tm = (session as any).transcriptManager;
-				if (!tm || typeof tm.flush !== 'function') return;
-				const origFlush = tm.flush.bind(tm);
-				tm.flush = () => { try { reset(); } catch {} origFlush(); };
-			},
-			onBlocked: (buffered) =>
-				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
-			log: (m) => console.log(`${ts()} ${m}`),
-		});
-	})();
+	// The output sanitizer releases held text before each transcript flush; resetTurn is
+	// idempotent, so these turn-boundary subscriptions stay as a backstop.
+	session.eventBus.subscribe('turn.end', () => outputSanitizer.resetTurn());
+	session.eventBus.subscribe('turn.interrupted', () => outputSanitizer.resetTurn());
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
 		const { teeAudio } = await import('../skills/screen-record/scripts/narration-tee.js');
-		const origHandleAudioOutput = (session as any).handleAudioOutput.bind(session);
-		(session as any).handleAudioOutput = (data: string) => {
-			origHandleAudioOutput(data);
-			try { teeAudio(Buffer.from(data, 'base64')); } catch {}
-		};
+		session.observeAudioOutput((pcm) => {
+			try { teeAudio(pcm); } catch {}
+		});
 		console.log(`${ts()} [NarrationTee] wired into voice agent audio output`);
 	} catch (e) {
 		console.log(`${ts()} [NarrationTee] not available: ${e instanceof Error ? e.message : e}`);
