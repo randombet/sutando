@@ -1,7 +1,7 @@
 // voice-audio-health — P7 D7.1 engine-side audio-progress ledger (Tranche A
 // interim). Wraps the session-layer seams only, so coverage is honestly
 // 'session-only': frames buffered by bodhi's ClientTransport during a
-// reconnect never pass handleAudioFromClient, and the matrix must downgrade
+// reconnect never reach the session's audio input observer, and the matrix must downgrade
 // rather than misfire on that blind window.
 //
 // §D7.0b budget: the two frame-path wraps (audio ingress, audio egress) do
@@ -12,7 +12,7 @@
 // itself is a try-enqueue into an injected one-slot mailbox — a busy slot
 // skips the sample (visible in `samplesSkipped`), it never queues.
 
-import type { ConnectionLifecycleEvent, UpstreamCounters } from 'bodhi-realtime-agent';
+import type { ConnectionLifecycleEvent, UpstreamCounters, VoiceSession } from 'bodhi-realtime-agent';
 
 /** Coverage is an ordered level, not a boolean: each level observes everything
  *  the previous one did. 'session+egress' sees what the agent handed the SDK;
@@ -193,9 +193,9 @@ export interface AudioHealthSnapshot {
 }
 
 export interface AudioHealthLedger {
-  /** Install the session-layer wraps (monkey-patch, same pattern as the
-   *  narration-tee's handleAudioOutput wrap). Idempotent per session. */
-  wrapSession(session: unknown): void;
+  /** Register the ingress and egress counters as the session's audio
+   *  observers. Idempotent per session. */
+  wrapSession(session: Pick<VoiceSession, 'observeAudioInput' | 'observeAudioOutput'>): void;
   /** New client connection = new (pending) epoch: reset per-epoch state.
    *  The epoch value itself is minted on first heartbeat sight. */
   onClientConnected(): void;
@@ -234,8 +234,11 @@ export interface AudioHealthLedger {
   ): void;
   /** Lineage derivation input (bodhi onConnectionLifecycle) — design §1.1. */
   noteLifecycleEvent(event: ConnectionLifecycleEvent): void;
-  /** Exposed for tests (the wrap routes here). */
+  /** Exposed for tests (interceptHeartbeat routes here). */
   ingestHeartbeat(msg: unknown): void;
+  /** Consumes a client audio_health frame; true means it must not be routed on.
+   *  A malformed heartbeat is still consumed and never throws. */
+  interceptHeartbeat(msg: unknown): boolean;
 }
 
 export interface AudioHealthOptions {
@@ -453,7 +456,7 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
 
   function noteIngress(data: unknown): void {
     // §D7.0b FRAME PATH: O(1) writes + one BOUNDED subsampled pass. `data`
-    // is the int16le PCM Buffer bodhi hands to handleAudioFromClient — but
+    // is the int16le PCM Buffer bodhi hands to its audio input observers — but
     // its length is client-controlled, so the pass caps at 8 KiB (≥ the
     // nominal 1364 B frame; a jumbo frame's tail adds nothing to a level
     // estimate).
@@ -504,11 +507,10 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
     }
   }
 
-  function noteEgress(base64: unknown): void {
-    // §D7.0b FRAME PATH: O(1). `base64` is the outbound audio string.
+  function noteEgress(pcm: Buffer): void {
+    // D7.0b FRAME PATH: O(1). `pcm` is the decoded outbound audio chunk.
     egressFrames++;
-    const s = base64 as { length?: number };
-    if (typeof s?.length === 'number') egressBytes += Math.floor((s.length * 3) / 4);
+    egressBytes += pcm.length;
     lastEgressAt = now();
     noteModelEventAt(lastEgressAt);
   }
@@ -608,41 +610,23 @@ export function createAudioHealthLedger(opts: AudioHealthOptions): AudioHealthLe
   }
 
   return {
-    wrapSession(session: unknown): void {
-      const s = session as Record<string, unknown> & object;
-      if (wrapped.has(s)) return;
-      wrapped.add(s);
-      const origAudio = (s.handleAudioFromClient as ((d: unknown) => void) | undefined)?.bind(s);
-      if (origAudio) {
-        s.handleAudioFromClient = (data: unknown) => {
-          noteIngress(data);
-          origAudio(data);
-        };
+    wrapSession(session: Pick<VoiceSession, 'observeAudioInput' | 'observeAudioOutput'>): void {
+      if (wrapped.has(session)) return;
+      wrapped.add(session);
+      session.observeAudioInput((pcm) => noteIngress(pcm));
+      session.observeAudioOutput((pcm) => noteEgress(pcm));
+    },
+
+    interceptHeartbeat(msg: unknown): boolean {
+      const m = msg as { t?: unknown } | null;
+      if (!m || m.t !== 'audio_health') return false;
+      // Health telemetry is engine-consumed, never routed into client-message handling.
+      try {
+        ingestHeartbeat(msg);
+      } catch {
+        /* a malformed frame must never break the message path */
       }
-      const origJson = (s.handleJsonFromClient as ((m: unknown) => void) | undefined)?.bind(s);
-      if (origJson) {
-        s.handleJsonFromClient = (message: unknown) => {
-          const m = message as { t?: unknown } | null;
-          if (m && m.t === 'audio_health') {
-            // Intercepted: health telemetry is engine-consumed, never routed
-            // into bodhi's client-message handling.
-            try {
-              ingestHeartbeat(message);
-            } catch {
-              /* a malformed frame must never break the message path */
-            }
-            return;
-          }
-          origJson(message);
-        };
-      }
-      const origOut = (s.handleAudioOutput as ((d: unknown) => void) | undefined)?.bind(s);
-      if (origOut) {
-        s.handleAudioOutput = (data: unknown) => {
-          noteEgress(data);
-          origOut(data);
-        };
-      }
+      return true;
     },
 
     onClientConnected(): void {

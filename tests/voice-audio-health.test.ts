@@ -7,6 +7,7 @@ import {
 	type HealthRow,
 } from '../src/voice-audio-health.js';
 import { evaluateMatrix } from '../src/voice-health-matrix.js';
+import type { AudioInputObserver, AudioOutputObserver } from 'bodhi-realtime-agent';
 
 /** Int16LE PCM buffer at a constant normalized amplitude. */
 function pcm(amplitude: number, samples = 682): Buffer {
@@ -40,19 +41,31 @@ function makeLedger(now: { t: number }, persist?: (row: HealthRow) => boolean) {
 	});
 }
 
-/** Fake session exposing the three wrapped seams. */
+/** Fake session with bodhi's two audio observer seams. Its ingress and egress
+ *  paths notify the observers the way the real session does. */
 function fakeSession() {
-	const calls = { audio: [] as unknown[], json: [] as unknown[], out: [] as unknown[] };
+	const calls = { audio: [] as unknown[], out: [] as unknown[] };
+	const observers = { input: new Set<AudioInputObserver>(), output: new Set<AudioOutputObserver>() };
 	return {
 		calls,
-		handleAudioFromClient(data: unknown) {
+		observers,
+		observeAudioInput(observer: AudioInputObserver) {
+			observers.input.add(observer);
+			return () => void observers.input.delete(observer);
+		},
+		observeAudioOutput(observer: AudioOutputObserver) {
+			observers.output.add(observer);
+			return () => void observers.output.delete(observer);
+		},
+		feedAudioFromClient(data: Buffer) {
+			for (const o of observers.input) o(data, { source: 'websocket', sampleRate: 16000 });
 			calls.audio.push(data);
 		},
-		handleJsonFromClient(msg: unknown) {
-			calls.json.push(msg);
-		},
-		handleAudioOutput(data: unknown) {
-			calls.out.push(data);
+		/** Native output arrives base64; observers see the decoded PCM. */
+		handleAudioOutput(base64: string) {
+			const pcm = Buffer.from(base64, 'base64');
+			for (const o of observers.output) o(pcm, { turnId: null, sampleRate: 24000, encoding: 'pcm' });
+			calls.out.push(base64);
 		},
 	};
 }
@@ -95,13 +108,14 @@ describe('P7 D7.1 parseHeartbeat', () => {
 });
 
 describe('P7 D7.1 engine ledger — wraps', () => {
-	it('audio wrap is transparent (same Buffer through) and counts delivered frames', () => {
+	it('audio input observer is transparent (same Buffer through) and counts delivered frames', () => {
 		const now = { t: 10_000 };
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
+		assert.equal(s.observers.input.size, 1, 'ingress counted through observeAudioInput');
 		const b = pcm(0.3);
-		s.handleAudioFromClient(b);
+		s.feedAudioFromClient(b);
 		assert.equal(s.calls.audio.length, 1);
 		assert.equal(s.calls.audio[0], b, 'exact same Buffer delivered');
 		const snap = led.getSnapshot(true);
@@ -110,34 +124,34 @@ describe('P7 D7.1 engine ledger — wraps', () => {
 		assert.equal(snap.coverage, 'session-only');
 	});
 
-	it('audio_health frames are intercepted (never routed into bodhi); other JSON passes through', () => {
+	it('audio_health frames are intercepted (never routed on); other JSON passes through', () => {
 		const now = { t: 10_000 };
 		const led = makeLedger(now);
-		const s = fakeSession();
-		led.wrapSession(s);
-		s.handleJsonFromClient(wireHb('n0n0n0n0'));
-		s.handleJsonFromClient({ type: 'text_input', text: 'hi' });
-		assert.equal(s.calls.json.length, 1, 'heartbeat swallowed');
-		assert.deepEqual(s.calls.json[0], { type: 'text_input', text: 'hi' });
+		assert.equal(led.interceptHeartbeat(wireHb('n0n0n0n0')), true, 'heartbeat swallowed');
+		assert.equal(led.interceptHeartbeat({ type: 'text_input', text: 'hi' }), false);
 		assert.equal(led.getSnapshot(true).heartbeatCount, 1);
 	});
 
 	it('a malformed heartbeat never breaks the message path', () => {
 		const led = makeLedger({ t: 0 });
-		const s = fakeSession();
-		led.wrapSession(s);
-		assert.doesNotThrow(() => s.handleJsonFromClient({ t: 'audio_health', n: 42, c: 'bogus' }));
+		let swallowed = false;
+		assert.doesNotThrow(() => {
+			swallowed = led.interceptHeartbeat({ t: 'audio_health', n: 42, c: 'bogus' });
+		});
+		assert.equal(swallowed, true, 'still intercepted, never routed on');
 	});
 
-	it('egress wrap counts frames/bytes and passes through; wrap is idempotent', () => {
+	it('egress observer counts frames/bytes and passes through; wrap is idempotent', () => {
 		const now = { t: 10_000 };
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
 		led.wrapSession(s); // second wrap must be a no-op
+		assert.equal(s.observers.input.size, 1, 'idempotent wrap: one input observer');
+		assert.equal(s.observers.output.size, 1, 'idempotent wrap: one output observer');
 		const b64 = Buffer.from('abcdef').toString('base64');
 		s.handleAudioOutput(b64);
-		assert.equal(s.calls.out.length, 1, 'idempotent wrap: exactly one delivery');
+		assert.equal(s.calls.out.length, 1, 'exactly one delivery');
 		const snap = led.getSnapshot(true);
 		assert.equal(snap.egressFrames, 1);
 		assert.equal(snap.egressBytes, 6);
@@ -185,7 +199,7 @@ describe('P7 D7.1 engine ledger — epoch minting (Tranche A nonce scheme)', () 
 		const led = makeLedger(now, () => accept);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		led.ingestHeartbeat(wireHb('nonceAAA'));
 		led.noteTurnLatency(1234);
 		led.persistTick('timer', true); // rejected → samplesSkipped 1
@@ -208,12 +222,12 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.3));
+		s.feedAudioFromClient(pcm(0.3));
 		let ev = led.getSpeechEvidence();
 		assert.equal(ev.active, true);
 		assert.equal(ev.onsetAt, 10_000);
 		now.t += 300;
-		s.handleAudioFromClient(pcm(0.25));
+		s.feedAudioFromClient(pcm(0.25));
 		now.t += 700; // no frames at all (stall) — lazy decay must end the evidence
 		ev = led.getSpeechEvidence();
 		assert.equal(ev.active, false, 'hangover elapsed with no above-floor frame');
@@ -225,9 +239,9 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.3));
+		s.feedAudioFromClient(pcm(0.3));
 		now.t += 300;
-		s.handleAudioFromClient(pcm(0.25));
+		s.feedAudioFromClient(pcm(0.25));
 		now.t += 20_000; // utterance long over; live onset erased by decay
 		const ev = led.getSpeechEvidence();
 		assert.equal(ev.active, false);
@@ -239,7 +253,7 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		const led = makeLedger({ t: 10_000 });
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.005));
+		s.feedAudioFromClient(pcm(0.005));
 		assert.equal(led.getSpeechEvidence().active, false);
 	});
 
@@ -248,9 +262,9 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.3)); // onset #1 at 10000
+		s.feedAudioFromClient(pcm(0.3)); // onset #1 at 10000
 		now.t = 10_700; // hangover elapsed with NO frames (stall)
-		s.handleAudioFromClient(pcm(0.3)); // must re-latch, not extend
+		s.feedAudioFromClient(pcm(0.3)); // must re-latch, not extend
 		const ev = led.getSpeechEvidence();
 		assert.equal(ev.active, true);
 		assert.equal(ev.onsetAt, 10_700, 'stale onset would corrupt speech→model latency');
@@ -261,7 +275,7 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.3)); // onset armed at 10000
+		s.feedAudioFromClient(pcm(0.3)); // onset armed at 10000
 		now.t = 11_840;
 		s.handleAudioOutput(Buffer.from('audio').toString('base64'));
 		assert.equal(led.getSnapshot(true).lastSpeechToModelMs, 1840);
@@ -277,7 +291,7 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		led.wrapSession(s);
 		const jumbo = Buffer.alloc(4 * 1024 * 1024); // 4 MiB of silence
 		const t0 = process.hrtime.bigint();
-		s.handleAudioFromClient(jumbo);
+		s.feedAudioFromClient(jumbo);
 		const us = Number(process.hrtime.bigint() - t0) / 1000;
 		assert.ok(us < 5000, `jumbo frame took ${us.toFixed(0)}µs — scan not bounded`);
 		assert.equal(led.getSnapshot(true).deliveredBytes, jumbo.length, 'bytes still fully accounted');
@@ -293,7 +307,7 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		assert.equal(led.getInputHealth(false), 'no-client');
 		assert.equal(led.getInputHealth(true), 'unknown', 'no evidence yet');
 		led.onClientConnected();
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		assert.equal(led.getInputHealth(true), 'ok');
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { og: [0, 1500] }));
 		assert.equal(led.getInputHealth(true), 'stalled', 'client-reported open gap');
@@ -316,7 +330,7 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		now.t += 6000; // would be an ingress stall if unmuted
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { mu: 1 }));
 		assert.equal(led.getInputHealth(true), 'ok', 'mute is a user choice');
@@ -329,13 +343,13 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { cs: 's' }));
 		assert.equal(led.getInputHealth(true), 'stalled', 'suspended ctx = no input');
 		// The same heartbeat 20 s later is stale — a detached client's
 		// retained evidence must not report stalled forever…
 		now.t += 20_000;
-		s.handleAudioFromClient(pcm(0.1)); // …and live PCM proves input works
+		s.feedAudioFromClient(pcm(0.1)); // …and live PCM proves input works
 		assert.equal(led.getInputHealth(true), 'ok');
 	});
 
@@ -344,7 +358,7 @@ describe('P7 D7.1 engine ledger — inputHealth + anomaly latching', () => {
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep: [[1, 'g', 0, 1200]], og: [0, 1500] }));
 		const a1 = led.anomalies(true);
 		assert.equal(a1.anomalous, true);
@@ -440,7 +454,7 @@ describe('P7 D7.1 engine ledger — persistence tick + [Health] segments', () =>
 		const s = fakeSession();
 		led.wrapSession(s);
 		led.onClientConnected();
-		s.handleAudioFromClient(pcm(0.3));
+		s.feedAudioFromClient(pcm(0.3));
 		led.ingestHeartbeat(wireHb('nnnnnnnn'));
 		now.t += 2000;
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { q: 1 }));
@@ -484,7 +498,7 @@ describe('P7 round-3 ledger fixes', () => {
 		led.wrapSession(s);
 		led.onClientConnected();
 		led.ingestHeartbeat(wireHb('nonceAAA'));
-		s.handleAudioFromClient(pcm(0.1));
+		s.feedAudioFromClient(pcm(0.1));
 		led.noteTurnLatency(1234);
 		now.t += 10;
 		led.ingestHeartbeat(wireHb('nonceZZZ'));
@@ -499,7 +513,7 @@ describe('P7 round-3 ledger fixes', () => {
 		const led = makeLedger(now);
 		const s = fakeSession();
 		led.wrapSession(s);
-		s.handleAudioFromClient(pcm(0.3)); // speech onset armed at 10000
+		s.feedAudioFromClient(pcm(0.3)); // speech onset armed at 10000
 		now.t = 10_900;
 		led.noteModelEvent(); // e.g. turn.start — text/tool-first turn
 		const snap = led.getSnapshot(true);
