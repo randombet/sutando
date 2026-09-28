@@ -9,10 +9,8 @@ export const DEFAULT_STUCK_CONNECTING_MS = 120_000;
 
 /** Lower bound for a positive override. bodhi bounds a dial at 30s
  *  (DEFAULT_CONNECT_TIMEOUT_MS; 45s on the reconnect path) — a threshold
- *  below that inverts the backstop into a dial-killer, and the forced CLOSED
- *  cannot bump bodhi's private dial generation, so a late dial RESOLUTION
- *  would land in a session already declared dead. 60s = 2x the dial bound;
- *  `0` remains the explicit disable and is never clamped. */
+ *  below that would report dials still inside their own bound as stuck.
+ *  60s = 2x the dial bound; `0` remains the explicit disable and is never clamped. */
 export const MIN_STUCK_CONNECTING_MS = 60_000;
 
 /** Parse the VOICE_STUCK_CONNECTING_MS override. `0` disables the watchdog —
@@ -36,16 +34,17 @@ export function parseStuckConnectingMs(
 	return n;
 }
 
-/** How long a session may sit in CONNECTING with a client attached before the
- *  health monitor forces CLOSED. 0 disables; 120s is 4 monitor ticks. */
+/** How long a dial may stay in flight with a client attached before the health
+ *  monitor reports it stuck. 0 disables; 120s is 4 monitor ticks. */
 export const STUCK_CONNECTING_MS = parseStuckConnectingMs(process.env.VOICE_STUCK_CONNECTING_MS);
 
-/** Whether a CONNECTING session has hung long enough to force CLOSED.
- *
- *  bodhi transitions CLOSED->CONNECTING inline, so a connect that FAILS FAST
- *  flips back and the existing CLOSED guard recovers it. One that HANGS stays
- *  CONNECTING, where that guard can never see it.
- */
+/** CONNECTING is the first dial; RECONNECTING an automatic reconnect or a redial. */
+function isDialInFlight(state: string): boolean {
+	return state === 'CONNECTING' || state === 'RECONNECTING';
+}
+
+/** Whether a dial in flight has hung past the threshold. bodhi bounds every dial
+ *  and parks a failed one in UPSTREAM_LOST, so a verdict means that bound did not hold. */
 export function shouldForceClosed(o: {
 	state: string; clientConnected: boolean; connectingSince: number;
 	now: number; lastReconnectAt: number; fatalBackoffUntil: number;
@@ -53,7 +52,7 @@ export function shouldForceClosed(o: {
 }): boolean {
 	const threshold = o.thresholdMs ?? STUCK_CONNECTING_MS;
 	if (threshold === 0) return false;   // explicitly disabled
-	if (o.state !== 'CONNECTING' || !o.clientConnected || o.connectingSince === 0) return false;
+	if (!isDialInFlight(o.state) || !o.clientConnected || o.connectingSince === 0) return false;
 	if (o.now - o.connectingSince <= threshold) return false;
 	if (o.now - o.lastReconnectAt <= 60_000) return false;
 	return o.now > o.fatalBackoffUntil;
@@ -65,15 +64,14 @@ export function shouldForceClosed(o: {
  *  session is still hung, and a user reloading the panel (the one
  *  self-recovery action they have) would otherwise restart the countdown and
  *  push recovery out indefinitely. Attachment is checked at FIRE time instead,
- *  via shouldForceClosed. The caller owns the transition and should zero the
- *  clock only after it succeeds, so a failed force keeps the clock armed.
+ *  via shouldForceClosed. The caller reports a verdict and then re-arms the clock.
  */
 export function nextConnectingTick(o: {
 	connectingSince: number; state: string; clientConnected: boolean;
 	now: number; lastReconnectAt: number; fatalBackoffUntil: number;
 	thresholdMs?: number;
 }): { connectingSince: number; forceClose: boolean } {
-	if (o.state !== 'CONNECTING') return { connectingSince: 0, forceClose: false };
+	if (!isDialInFlight(o.state)) return { connectingSince: 0, forceClose: false };
 	if (o.connectingSince === 0) return { connectingSince: o.now, forceClose: false };
 	return { connectingSince: o.connectingSince, forceClose: shouldForceClosed(o) };
 }

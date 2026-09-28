@@ -43,6 +43,10 @@ check('...not from any other state',
 	shouldForceClosed({ ...base, state: 'ACTIVE' }), false);
 check('...not from CLOSED, which the existing guard already handles',
 	shouldForceClosed({ ...base, state: 'CLOSED' }), false);
+check('...not from UPSTREAM_LOST, where nothing is dialing',
+	shouldForceClosed({ ...base, state: 'UPSTREAM_LOST' }), false);
+check('a reconnect or redial hung in RECONNECTING counts as a dial in flight',
+	shouldForceClosed({ ...base, state: 'RECONNECTING' }), true);
 
 // 3. connectingSince === 0 is "not yet timing", not "stuck since the epoch".
 //    Treating 0 as a real timestamp would fire on the very first tick.
@@ -119,6 +123,10 @@ check('leaving CONNECTING resets the clock',
 	nextConnectingTick({ ...tickBase, state: 'ACTIVE', connectingSince: t0 }).connectingSince, 0);
 check('...and never fires from another state',
 	nextConnectingTick({ ...tickBase, state: 'CLOSED', connectingSince: t0, now: t0 + T + 1 }).forceClose, false);
+check('a redial replacing the first dial (CONNECTING -> RECONNECTING) keeps the clock',
+	nextConnectingTick({ ...tickBase, state: 'RECONNECTING', connectingSince: t0, now: t0 + 60_000 }).connectingSince, t0);
+check('...and a park resets it',
+	nextConnectingTick({ ...tickBase, state: 'UPSTREAM_LOST', connectingSince: t0 }).connectingSince, 0);
 
 console.log(failed ? `FAILED: ${failed} check(s)` : 'voice stuck-CONNECTING watchdog: all checks passed');
 process.exit(failed ? 1 : 0);

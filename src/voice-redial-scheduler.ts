@@ -105,14 +105,22 @@ export function noteLifecycle(
 }
 
 /** Fire-time gate for the event-driven dial — same preconditions as the
- *  tick's CLOSED guard, minus its 60s throttle (fast redial is the point). */
+ *  tick's UPSTREAM_LOST guard, minus its 60s throttle (fast redial is the point). */
 export function shouldEventDial(o: {
 	state: string; clientConnected: boolean; now: number;
 	nextDialAt: number; fatalBackoffUntil: number;
 }): boolean {
 	if (o.nextDialAt === 0 || o.now < o.nextDialAt) return false;
-	if (o.state !== 'CLOSED' || !o.clientConnected) return false;
+	if (o.state !== 'UPSTREAM_LOST' || !o.clientConnected) return false;
 	return o.now > o.fatalBackoffUntil;
+}
+
+/** bodhi's `suppressClientAutoActions` gate: while it holds, a lost upstream parks
+ *  instead of auto-reconnecting and a client attach neither greets nor redials. */
+export function hostOwnsUpstreamRecovery(o: {
+	coordinatorOwnsRecovery: boolean; fatalBackoffUntil: number; now: number;
+}): boolean {
+	return o.coordinatorOwnsRecovery || o.now < o.fatalBackoffUntil;
 }
 
 /** The 30s tick's deference to the scheduler: never dial before a pending
